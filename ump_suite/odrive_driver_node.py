@@ -6,7 +6,7 @@ from std_msgs.msg import Int32
 import odrive
 from odrive.enums import AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_IDLE, CONTROL_MODE_VELOCITY_CONTROL
 
-from .ros_interfaces import TOPIC_MOTOR_TGT, TOPIC_MOTOR_JOG, TOPIC_MOTOR_LIVE
+from .ros_interfaces import TOPIC_MOTOR_TGT, TOPIC_MOTOR_DELTA, TOPIC_MOTOR_JOG, TOPIC_MOTOR_LIVE
 
 class ODriveDriverNode(Node):
     def __init__(self):
@@ -23,7 +23,9 @@ class ODriveDriverNode(Node):
         self.jog_dir = 0
 
         self.pub_live = self.create_publisher(Int32, TOPIC_MOTOR_LIVE, 10)
+
         self.sub_tgt = self.create_subscription(Int32, TOPIC_MOTOR_TGT, self.on_target, 10)
+        self.sub_delta = self.create_subscription(Int32, TOPIC_MOTOR_DELTA, self.on_delta, 10)
         self.sub_jog = self.create_subscription(Int32, TOPIC_MOTOR_JOG, self.on_jog, 10)
 
         self.axis = None
@@ -56,7 +58,18 @@ class ODriveDriverNode(Node):
             self.get_logger().error(f"ODrive not available: {e}")
 
     def on_target(self, msg: Int32):
+        self.jog_dir = 0
         self.motor_target = int(msg.data)
+
+    def on_delta(self, msg: Int32):
+        if not self.enabled or self.axis is None:
+            return
+        try:
+            cur = int(self.axis.encoder.shadow_count)
+            self.jog_dir = 0
+            self.motor_target = cur + int(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"ODrive delta command error: {e}")
 
     def on_jog(self, msg: Int32):
         d = int(msg.data)
@@ -108,6 +121,3 @@ def main():
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
-
-# Add focal length calibration support in this node later if necessary

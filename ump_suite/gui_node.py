@@ -20,8 +20,8 @@ except Exception:
     PIL_AVAILABLE = False
 
 from .ros_interfaces import (
-    TOPIC_UMP_TARGET, TOPIC_UMP_LIVE,
-    TOPIC_MOTOR_TGT, TOPIC_MOTOR_JOG, TOPIC_MOTOR_LIVE,
+    TOPIC_UMP_TARGET, TOPIC_UMP_DELTA, TOPIC_UMP_LIVE, TOPIC_UMP_SPEED,
+    TOPIC_MOTOR_TGT, TOPIC_MOTOR_DELTA, TOPIC_MOTOR_JOG, TOPIC_MOTOR_LIVE,
     SRV_ACQ_START, SRV_ACQ_STOP, SRV_ZERO
 )
 
@@ -33,6 +33,7 @@ MOTOR_MIN, MOTOR_MAX = -1_000_000, 1_000_000
 
 DEFAULT_AXIS_STEP = 100
 DEFAULT_SPEED_STEP = 50
+DEFAULT_MOTOR_STEP = 1000
 
 LIVE_POLL_MS = 50
 SEND_THROTTLE_MS = 60
@@ -50,22 +51,23 @@ class GuiNode(Node):
         super().__init__("gui_node")
 
         self.pub_ump_target = self.create_publisher(Int32MultiArray, TOPIC_UMP_TARGET, 10)
-        self.pub_motor_tgt  = self.create_publisher(Int32, TOPIC_MOTOR_TGT, 10)
-        self.pub_motor_jog  = self.create_publisher(Int32, TOPIC_MOTOR_JOG, 10)
+        self.pub_ump_delta = self.create_publisher(Int32MultiArray, TOPIC_UMP_DELTA, 10)
+        self.pub_ump_speed = self.create_publisher(Int32, TOPIC_UMP_SPEED, 10)
+
+        self.pub_motor_tgt = self.create_publisher(Int32, TOPIC_MOTOR_TGT, 10)
+        self.pub_motor_delta = self.create_publisher(Int32, TOPIC_MOTOR_DELTA, 10)
+        self.pub_motor_jog = self.create_publisher(Int32, TOPIC_MOTOR_JOG, 10)
 
         self.sub_ump_live = self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE, self._on_ump_live, 10)
         self.sub_motor_live = self.create_subscription(Int32, TOPIC_MOTOR_LIVE, self._on_motor_live, 10)
-
-        # Compressed image subscription (no cv_bridge)
         self.sub_cam = self.create_subscription(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self._on_cam_image, 10)
 
         self.cli_acq_start = self.create_client(Trigger, SRV_ACQ_START)
-        self.cli_acq_stop  = self.create_client(Trigger, SRV_ACQ_STOP)
-        self.cli_zero      = self.create_client(Trigger, SRV_ZERO)
+        self.cli_acq_stop = self.create_client(Trigger, SRV_ACQ_STOP)
+        self.cli_zero = self.create_client(Trigger, SRV_ZERO)
 
         self.latest_live_ump = [0, 0, 0, 0]
         self.latest_live_motor = 0
-
         self.latest_frame_bgr = None
 
     def _on_ump_live(self, msg: Int32MultiArray):
@@ -78,7 +80,7 @@ class GuiNode(Node):
     def _on_cam_image(self, msg: CompressedImage):
         try:
             data = np.frombuffer(msg.data, dtype=np.uint8)
-            frame = cv2.imdecode(data, cv2.IMREAD_COLOR)  # BGR
+            frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
             if frame is not None:
                 self.latest_frame_bgr = frame
         except Exception:
@@ -94,6 +96,9 @@ class GuiNode(Node):
             return False, "no response"
         return bool(fut.result().success), str(fut.result().message)
 
+    def publish_speed(self, speed: int):
+        self.pub_ump_speed.publish(Int32(data=int(speed)))
+
 
 class UMPGuiApp:
     def __init__(self, node: GuiNode):
@@ -105,13 +110,13 @@ class UMPGuiApp:
 
         self.axis_step = IntVar(value=DEFAULT_AXIS_STEP)
         self.speed_step = IntVar(value=DEFAULT_SPEED_STEP)
+        self.motor_step = IntVar(value=DEFAULT_MOTOR_STEP)
 
         self.x = IntVar(value=0)
         self.y = IntVar(value=0)
         self.z = IntVar(value=0)
         self.d = IntVar(value=0)
         self.speed = IntVar(value=1000)
-
         self.motor_target = IntVar(value=0)
 
         self.live_x = StringVar(value="—")
@@ -131,8 +136,9 @@ class UMPGuiApp:
 
         self.root.after(LIVE_POLL_MS, self._poll_live_to_gui)
         self.root.after(CAM_UPDATE_MS, self._update_camera_view)
-
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.node.publish_speed(int(self.speed.get()))
 
     def _build_ui(self):
         self.root.columnconfigure(0, weight=0)
@@ -148,30 +154,42 @@ class UMPGuiApp:
         self.right.columnconfigure(0, weight=1)
 
         ttk.Label(self.left, text="Sensapex UMP Controller + ODrive", font=("Segoe UI", 14, "bold")).grid(
-            row=0, column=0, columnspan=4, sticky=W, pady=(0, 8)
+            row=0, column=0, columnspan=6, sticky=W, pady=(0, 8)
         )
 
         ttk.Label(self.left, text="Axis step:").grid(row=1, column=0, sticky=W)
-        ttk.Entry(self.left, width=7, textvariable=self.axis_step, justify="right").grid(row=1, column=1, sticky=W, padx=(6, 12))
+        ttk.Entry(self.left, width=7, textvariable=self.axis_step, justify="right").grid(
+            row=1, column=1, sticky=W, padx=(6, 12)
+        )
 
         ttk.Label(self.left, text="Speed step:").grid(row=1, column=2, sticky=W)
-        ttk.Entry(self.left, width=7, textvariable=self.speed_step, justify="right").grid(row=1, column=3, sticky=W)
+        ttk.Entry(self.left, width=7, textvariable=self.speed, justify="right").grid(
+            row=1, column=3, sticky=W, padx=(6, 12)
+        )
 
-        ttk.Label(self.left, text="Target (centered / counts)", font=("Segoe UI", 10, "bold")).grid(row=2, column=3, sticky=W)
-        ttk.Label(self.left, text="Live (centered / counts)", font=("Segoe UI", 10, "bold")).grid(row=2, column=4, sticky=W)
+        ttk.Label(self.left, text="Motor step:").grid(row=1, column=4, sticky=W)
+        ttk.Entry(self.left, width=8, textvariable=self.motor_step, justify="right").grid(
+            row=1, column=5, sticky=W
+        )
 
-        self._make_axis_row(self.left, 3, "X", self.x, self.live_x, AXIS_MIN, AXIS_MAX)
-        self._make_axis_row(self.left, 4, "Y", self.y, self.live_y, AXIS_MIN, AXIS_MAX)
-        self._make_axis_row(self.left, 5, "Z", self.z, self.live_z, AXIS_MIN, AXIS_MAX)
-        self._make_axis_row(self.left, 6, "D", self.d, self.live_d, AXIS_MIN, AXIS_MAX)
+        ttk.Label(self.left, text="Buttons/keys send DELTAS. 'Send Now' sends ABSOLUTE target entries.").grid(
+            row=2, column=0, columnspan=6, sticky=W, pady=(0, 8)
+        )
 
-        self._make_speed_row(self.left, 7)
+        ttk.Label(self.left, text="Target (absolute)", font=("Segoe UI", 10, "bold")).grid(row=3, column=3, sticky=W)
+        ttk.Label(self.left, text="Live", font=("Segoe UI", 10, "bold")).grid(row=3, column=4, sticky=W)
+
+        self._make_axis_row(self.left, 4, "X", self.x, self.live_x, AXIS_MIN, AXIS_MAX)
+        self._make_axis_row(self.left, 5, "Y", self.y, self.live_y, AXIS_MIN, AXIS_MAX)
+        self._make_axis_row(self.left, 6, "Z", self.z, self.live_z, AXIS_MIN, AXIS_MAX)
+        self._make_axis_row(self.left, 7, "D", self.d, self.live_d, AXIS_MIN, AXIS_MAX)
+
         self._make_motor_row(self.left, 8)
 
         ttk.Button(self.left, text="Start Data Acquisition", command=self._acq_start).grid(row=9, column=0, sticky=W, pady=(10, 4))
         ttk.Button(self.left, text="Stop Data Acquisition", command=self._acq_stop).grid(row=9, column=1, sticky=W, pady=(10, 4))
         ttk.Label(self.left, textvariable=self.acq_status, foreground="#006400", font=("Segoe UI", 10, "bold")).grid(
-            row=9, column=2, columnspan=2, sticky=W, pady=(10, 4)
+            row=9, column=2, columnspan=4, sticky=W, pady=(10, 4)
         )
 
         ttk.Button(self.left, text="Send Now", command=self._send_now).grid(row=10, column=0, sticky=W, pady=(10, 4))
@@ -179,7 +197,7 @@ class UMPGuiApp:
         ttk.Button(self.left, text="Sync Target to Live", command=self._sync_targets_to_live).grid(row=10, column=2, sticky=W, pady=(10, 4))
         ttk.Button(self.left, text="Calibrate Zero Here", command=self._zero).grid(row=10, column=3, sticky=W, pady=(10, 4))
 
-        ttk.Label(self.left, textvariable=self.status, foreground="#333").grid(row=12, column=0, columnspan=4, sticky=W, pady=(8, 0))
+        ttk.Label(self.left, textvariable=self.status, foreground="#333").grid(row=11, column=0, columnspan=6, sticky=W, pady=(8, 0))
 
         ttk.Label(self.right, text=CAM_TEXT, font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky=W, pady=(0, 6))
         self.cam_label = ttk.Label(self.right)
@@ -187,8 +205,8 @@ class UMPGuiApp:
 
     def _make_axis_row(self, parent, row, name, var, live_var, vmin, vmax):
         ttk.Label(parent, text=name, width=8).grid(row=row, column=0, padx=(0, 6), sticky=W)
-        ttk.Button(parent, text="▲", command=lambda: self._bump_axis(var, +1, vmin, vmax)).grid(row=row, column=1, padx=2, sticky=W)
-        ttk.Button(parent, text="▼", command=lambda: self._bump_axis(var, -1, vmin, vmax)).grid(row=row, column=2, padx=2, sticky=W)
+        ttk.Button(parent, text="▲", command=lambda: self._send_axis_delta(name, +1)).grid(row=row, column=1, padx=2, sticky=W)
+        ttk.Button(parent, text="▼", command=lambda: self._send_axis_delta(name, -1)).grid(row=row, column=2, padx=2, sticky=W)
 
         entry = ttk.Entry(parent, width=10, textvariable=var, justify="right")
         entry.grid(row=row, column=3, padx=(6, 6), sticky=W)
@@ -205,37 +223,10 @@ class UMPGuiApp:
         entry.bind("<FocusOut>", on_commit)
         entry.bind("<Return>", on_commit)
 
-    def _make_speed_row(self, parent, row):
-        ttk.Label(parent, text="Speed", width=8).grid(row=row, column=0, padx=(0, 6), sticky=W)
-        ttk.Button(parent, text="▲", command=lambda: self._bump_speed(+1)).grid(row=row, column=1, padx=2, sticky=W)
-        ttk.Button(parent, text="▼", command=lambda: self._bump_speed(-1)).grid(row=row, column=2, padx=2, sticky=W)
-
-        entry = ttk.Entry(parent, width=10, textvariable=self.speed, justify="right")
-        entry.grid(row=row, column=3, padx=(6, 6), sticky=W)
-
-        def on_commit(_e=None):
-            try:
-                v = int(self.speed.get())
-            except Exception:
-                v = 1000
-            self.speed.set(clamp(v, SPEED_MIN, SPEED_MAX))
-            self._schedule_send()
-
-        entry.bind("<FocusOut>", on_commit)
-        entry.bind("<Return>", on_commit)
-
     def _make_motor_row(self, parent, row):
         ttk.Label(parent, text="Motor", width=8).grid(row=row, column=0, padx=(0, 6), sticky=W)
-
-        btn_up = ttk.Button(parent, text="▲")
-        btn_dn = ttk.Button(parent, text="▼")
-        btn_up.grid(row=row, column=1, padx=2, sticky=W)
-        btn_dn.grid(row=row, column=2, padx=2, sticky=W)
-
-        btn_up.bind("<ButtonPress-1>", lambda _e: self._motor_jog(+1))
-        btn_up.bind("<ButtonRelease-1>", lambda _e: self._motor_jog(0))
-        btn_dn.bind("<ButtonPress-1>", lambda _e: self._motor_jog(-1))
-        btn_dn.bind("<ButtonRelease-1>", lambda _e: self._motor_jog(0))
+        ttk.Button(parent, text="▲", command=lambda: self._send_motor_delta(+1)).grid(row=row, column=1, padx=2, sticky=W)
+        ttk.Button(parent, text="▼", command=lambda: self._send_motor_delta(-1)).grid(row=row, column=2, padx=2, sticky=W)
 
         entry = ttk.Entry(parent, width=10, textvariable=self.motor_target, justify="right")
         entry.grid(row=row, column=3, padx=(6, 6), sticky=W)
@@ -248,6 +239,7 @@ class UMPGuiApp:
                 v = 0
             self.motor_target.set(clamp(v, MOTOR_MIN, MOTOR_MAX))
             self.node.pub_motor_tgt.publish(Int32(data=int(self.motor_target.get())))
+            self.status.set(f"Sent ABS motor target: {int(self.motor_target.get())}")
 
         entry.bind("<FocusOut>", on_commit)
         entry.bind("<Return>", on_commit)
@@ -258,31 +250,51 @@ class UMPGuiApp:
     def _on_key_press(self, event):
         ks = (event.keysym or "").lower()
         mapping = {
-            "up": ("Z", +1), "down": ("Z", -1),
-            "a": ("X", -1), "d": ("X", +1),
-            "s": ("Y", -1), "w": ("Y", +1),
-            "less": ("D", -1), "comma": ("D", -1),
-            "greater": ("D", +1), "period": ("D", +1),
-            "left": ("Speed", -1), "right": ("Speed", +1),
+            "up": ("Z", +1),
+            "down": ("Z", -1),
+            "a": ("X", -1),
+            "d": ("X", +1),
+            "s": ("Y", -1),
+            "w": ("Y", +1),
+            "less": ("D", -1),
+            "comma": ("D", -1),
+            "greater": ("D", +1),
+            "period": ("D", +1),
         }
         if ks not in mapping:
             return
+
         name, delta = mapping[ks]
-        if name == "Speed":
-            self._bump_speed(delta)
-        else:
-            var = {"X": self.x, "Y": self.y, "Z": self.z, "D": self.d}[name]
-            self._bump_axis(var, delta, AXIS_MIN, AXIS_MAX)
+        self._send_axis_delta(name, delta)
 
-    def _bump_axis(self, var, delta, vmin, vmax):
+    def _send_axis_delta(self, axis_name, sign):
         step = int(self.axis_step.get())
-        var.set(clamp(int(var.get()) + delta * step, vmin, vmax))
-        self._schedule_send()
+        speed = clamp(int(self.speed.get()), SPEED_MIN, SPEED_MAX)
+        self.speed.set(speed)
+        self.node.publish_speed(speed)
 
-    def _bump_speed(self, delta):
-        step = int(self.speed_step.get())
-        self.speed.set(clamp(int(self.speed.get()) + delta * step, SPEED_MIN, SPEED_MAX))
-        self._schedule_send()
+        dx = dy = dz = dd = 0
+        if axis_name == "X":
+            dx = sign * step
+        elif axis_name == "Y":
+            dy = sign * step
+        elif axis_name == "Z":
+            dz = sign * step
+        elif axis_name == "D":
+            dd = sign * step
+        else:
+            return
+
+        msg = Int32MultiArray()
+        msg.data = [dx, dy, dz, dd]
+        self.node.pub_ump_delta.publish(msg)
+        self.status.set(f"Sent DELTA {axis_name}: {sign * step} @ speed {speed}")
+
+    def _send_motor_delta(self, sign):
+        step = int(self.motor_step.get())
+        delta = sign * step
+        self.node.pub_motor_delta.publish(Int32(data=int(delta)))
+        self.status.set(f"Sent DELTA motor: {delta}")
 
     def _schedule_send(self):
         if self._send_job_id is not None:
@@ -294,6 +306,7 @@ class UMPGuiApp:
         x, y, z, d = int(self.x.get()), int(self.y.get()), int(self.z.get()), int(self.d.get())
         speed = clamp(int(self.speed.get()), SPEED_MIN, SPEED_MAX)
         self.speed.set(speed)
+        self.node.publish_speed(speed)
 
         msg = Int32MultiArray()
         msg.data = [x, y, z, d, speed]
@@ -303,17 +316,23 @@ class UMPGuiApp:
         self.motor_target.set(mt)
         self.node.pub_motor_tgt.publish(Int32(data=mt))
 
-        self.status.set(f"Sent: X={x}, Y={y}, Z={z}, D={d} @ {speed}")
+        self.status.set(f"Sent ABS target: X={x}, Y={y}, Z={z}, D={d} @ {speed}, Motor={mt}")
 
     def _home(self):
-        self.x.set(0); self.y.set(0); self.z.set(0); self.d.set(0)
+        self.x.set(0)
+        self.y.set(0)
+        self.z.set(0)
+        self.d.set(0)
         self._send_now()
 
     def _sync_targets_to_live(self):
         lx, ly, lz, ld = self.node.latest_live_ump
-        self.x.set(lx); self.y.set(ly); self.z.set(lz); self.d.set(ld)
+        self.x.set(lx)
+        self.y.set(ly)
+        self.z.set(lz)
+        self.d.set(ld)
         self.motor_target.set(self.node.latest_live_motor)
-        self.status.set("Targets synced to live.")
+        self.status.set("Absolute target entries synced to live.")
 
     def _zero(self):
         ok, msg = self.node.call_trigger(self.node.cli_zero)
@@ -328,11 +347,6 @@ class UMPGuiApp:
         ok, msg = self.node.call_trigger(self.node.cli_acq_stop)
         self.acq_status.set("Data acquisition: STOPPED")
         self.status.set(f"Acq stop: {ok} ({msg})")
-
-    def _motor_jog(self, direction):
-        self.node.pub_motor_jog.publish(Int32(data=int(direction)))
-        if int(direction) == 0:
-            self.motor_target.set(self.node.latest_live_motor)
 
     def _poll_live_to_gui(self):
         lx, ly, lz, ld = self.node.latest_live_ump

@@ -32,6 +32,8 @@ setup(
             'odrive_driver_node = ump_suite.odrive_driver_node:main',
             'camera_node = ump_suite.camera_node:main',
             'logger_node = ump_suite.logger_node:main',
+            'sensapex_rollout = ump_suite.main:main_entry',
+            'sensapex_rollout_delta = ump_suite.main_delta:main_entry',
         ],
     },
 )
