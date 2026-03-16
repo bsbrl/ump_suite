@@ -31,9 +31,9 @@ AXIS_MIN, AXIS_MAX = -10000, 10000
 SPEED_MIN, SPEED_MAX = 10, 2000
 MOTOR_MIN, MOTOR_MAX = -1_000_000, 1_000_000
 
-DEFAULT_AXIS_STEP = 100
+DEFAULT_AXIS_STEP = 50
 DEFAULT_SPEED_STEP = 50
-DEFAULT_MOTOR_STEP = 200
+DEFAULT_MOTOR_STEP = 500
 
 LIVE_POLL_MS = 50
 SEND_THROTTLE_MS = 60
@@ -162,7 +162,7 @@ class UMPGuiApp:
             row=1, column=1, sticky=W, padx=(6, 12)
         )
 
-        ttk.Label(self.left, text="Speed step:").grid(row=1, column=2, sticky=W)
+        ttk.Label(self.left, text="Speed:").grid(row=1, column=2, sticky=W)
         ttk.Entry(self.left, width=7, textvariable=self.speed, justify="right").grid(
             row=1, column=3, sticky=W, padx=(6, 12)
         )

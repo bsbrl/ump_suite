@@ -41,7 +41,7 @@ def generate_launch_description():
             package="ump_suite",
             executable="logger_node",
             output="screen",
-            parameters=[{"log_interval_ms": 100}],
+            parameters=[{"log_interval_ms": 200}],
         ),
 
         Node(
