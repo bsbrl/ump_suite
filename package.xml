@@ -4,7 +4,7 @@
   <name>ump_suite</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="chowd207@umn.edu">Silex</maintainer>
+  <maintainer email="chowd207@umn.edu">RaianSilex</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>

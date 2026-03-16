@@ -18,8 +18,8 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='raianbsbrl',
-    maintainer_email='raianbsbrl@todo.todo',
+    maintainer='RaianSilex',
+    maintainer_email='chowd207@umn.edu',
     description='Sensapex UMP + ODrive + Blackfly (PySpin) ROS2 nodes + GUI + logging',
     license='TODO: License declaration',
     extras_require={
