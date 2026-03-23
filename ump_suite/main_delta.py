@@ -19,19 +19,19 @@ CONTROL_FREQUENCY_HZ = 3
 
 
 # Absolute workspace limits
-X_MIN, X_MAX = -10000, 10000
-Y_MIN, Y_MAX = -10000, 10000
-Z_MIN, Z_MAX = -10000, 10000
-D_MIN, D_MAX = -10000, 10000
-H_MIN, H_MAX = -1_000_000, 1_000_000
+X_MIN, X_MAX = 2750, 3600
+Y_MIN, Y_MAX = 4200, 5200
+Z_MIN, Z_MAX = 8250, 9100
+D_MIN, D_MAX = 5900, 6100
+H_MIN, H_MAX = -10000, 1000
 
 
 # Delta limits per step
-DX_MIN, DX_MAX = -300.0, 300.0
-DY_MIN, DY_MAX = -300.0, 300.0
-DZ_MIN, DZ_MAX = -300.0, 300.0
-DD_MIN, DD_MAX = -300.0, 300.0
-DH_MIN, DH_MAX = -5000.0, 5000.0
+DX_MIN, DX_MAX = -50.0, 50.0
+DY_MIN, DY_MAX = -50.0, 50.0
+DZ_MIN, DZ_MAX = -50.0, 50.0
+DD_MIN, DD_MAX = -50.0, 50.0
+DH_MIN, DH_MAX = -500.0, 500.0
 
 
 # Optional scaling on model deltas
@@ -123,7 +123,7 @@ class Args:
     resize_h: int = 224
     resize_w: int = 224
 
-    default_speed: int = 1000
+    default_speed: int = 100
 
     save_preview: bool = True
     preview_path: str = "sensapex_live.png"

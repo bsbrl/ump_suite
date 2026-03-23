@@ -22,14 +22,15 @@ CONTROL_FREQUENCY_HZ = 3
 
 
 # === Safety limits ===
-# Units: "centered counts" (same units as /ump/live and /ump/target in your ROS nodes).
-X_MIN, X_MAX = -10500, 10500
-Y_MIN, Y_MAX = -10000, 10000
-Z_MIN, Z_MAX = -7200, 7200
-D_MIN, D_MAX = -8500, 8500
+# Units: "centered counts" (same units as /ump/live and /ump/target in the ROS nodes).
+X_MIN, X_MAX = 4600, 5700
+Y_MIN, Y_MAX = 4900, 5500
+Z_MIN, Z_MAX = 8750, 8250
+D_MIN, D_MAX = 5900, 6100
 
-# Motor ticks safety (EDIT for your stage)
-H_MIN, H_MAX = -500_000, 500_000
+
+# Motor ticks safety (EDIT for the stage)
+H_MIN, H_MAX = -6000, 1000
 
 # Max step per control tick (prevents sudden jumps)
 MAX_DX = 250.0
@@ -135,7 +136,7 @@ class Args:
     resize_w: int = 224
 
     # Robot params
-    default_speed: int = 1000
+    default_speed: int = 100
 
     # Live preview (writes a file on robot pc)
     save_preview: bool = True
