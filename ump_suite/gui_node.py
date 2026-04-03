@@ -116,7 +116,7 @@ class UMPGuiApp:
         self.y = IntVar(value=0)
         self.z = IntVar(value=0)
         self.d = IntVar(value=0)
-        self.speed = IntVar(value=1000)
+        self.speed = IntVar(value=500)
         self.motor_target = IntVar(value=0)
 
         self.live_x = StringVar(value="—")

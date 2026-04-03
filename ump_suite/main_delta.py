@@ -19,13 +19,13 @@ CONTROL_FREQUENCY_HZ = 3
 
 
 # Absolute workspace limits
-X_MIN, X_MAX = 2750, 3600
-Y_MIN, Y_MAX = 4200, 5200
-Z_MIN, Z_MAX = 8250, 9100
-D_MIN, D_MAX = 5900, 6100
-H_MIN, H_MAX = -10000, 1000
+X_MIN, X_MAX = 2040, 3360
+Y_MIN, Y_MAX = 5180, 6120
+Z_MIN, Z_MAX = 8650, 8730
+D_MIN, D_MAX = 5845, 5850
+H_MIN, H_MAX = -200, 100
 
-
+    
 # Delta limits per step
 DX_MIN, DX_MAX = -50.0, 50.0
 DY_MIN, DY_MAX = -50.0, 50.0

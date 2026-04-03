@@ -23,14 +23,14 @@ CONTROL_FREQUENCY_HZ = 3
 
 # === Safety limits ===
 # Units: "centered counts" (same units as /ump/live and /ump/target in the ROS nodes).
-X_MIN, X_MAX = 4600, 5700
-Y_MIN, Y_MAX = 4900, 5500
-Z_MIN, Z_MAX = 8750, 8250
-D_MIN, D_MAX = 5900, 6100
+X_MIN, X_MAX = 2040, 3360
+Y_MIN, Y_MAX = 5180, 6120
+Z_MIN, Z_MAX = 8650, 8730
+D_MIN, D_MAX = 5845, 5850
 
 
 # Motor ticks safety (EDIT for the stage)
-H_MIN, H_MAX = -6000, 1000
+H_MIN, H_MAX = -200, 100
 
 # Max step per control tick (prevents sudden jumps)
 MAX_DX = 250.0
