@@ -19,8 +19,17 @@ def generate_launch_description():
         Node(
             package="ump_suite",
             executable="ump_driver_node",
+            name="ump_driver_node",
             output="screen",
-            parameters=[{"device_id": 1, "poll_ms": 50}],
+            parameters=[{"device_id": 1, "poll_ms": 50, "topic_prefix": "ump"}],
+        ),
+
+        Node(
+            package="ump_suite",
+            executable="ump_driver_node",
+            name="ump2_driver_node",
+            output="screen",
+            parameters=[{"device_id": 2, "poll_ms": 50, "topic_prefix": "ump2"}],
         ),
 
         Node(

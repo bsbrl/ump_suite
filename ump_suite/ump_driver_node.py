@@ -4,13 +4,6 @@ from std_msgs.msg import Int32MultiArray, Int32
 from std_srvs.srv import Trigger
 
 from sensapex import UMP
-from .ros_interfaces import (
-    TOPIC_UMP_TARGET,
-    TOPIC_UMP_DELTA,
-    TOPIC_UMP_LIVE,
-    TOPIC_UMP_SPEED,
-    SRV_ZERO,
-)
 
 CENTER_OFFSET = 10000
 
@@ -28,29 +21,37 @@ class UMPDriverNode(Node):
         self.declare_parameter("device_id", 1)
         self.declare_parameter("poll_ms", 50)
         self.declare_parameter("default_speed", 1000)
+        self.declare_parameter("topic_prefix", "ump")
 
         device_id = int(self.get_parameter("device_id").value)
         poll_ms = int(self.get_parameter("poll_ms").value)
         self.current_speed = int(self.get_parameter("default_speed").value)
+        prefix = self.get_parameter("topic_prefix").value
 
-        self.get_logger().info("Connecting to Sensapex UMP...")
+        topic_live   = f"/{prefix}/live"
+        topic_target = f"/{prefix}/target"
+        topic_delta  = f"/{prefix}/delta"
+        topic_speed  = f"/{prefix}/target_speed"
+        srv_zero     = f"/{prefix}/calibrate_zero"
+
+        self.get_logger().info(f"Connecting to Sensapex UMP device {device_id} (prefix: /{prefix})...")
         self.ump = UMP.get_ump()
         self.stage = self.ump.get_device(device_id)
         self.get_logger().info(f"Connected to UMP device {device_id}")
 
-        self.pub_live = self.create_publisher(Int32MultiArray, TOPIC_UMP_LIVE, 10)
+        self.pub_live = self.create_publisher(Int32MultiArray, topic_live, 10)
 
         self.sub_target = self.create_subscription(
-            Int32MultiArray, TOPIC_UMP_TARGET, self.on_target, 10
+            Int32MultiArray, topic_target, self.on_target, 10
         )
         self.sub_delta = self.create_subscription(
-            Int32MultiArray, TOPIC_UMP_DELTA, self.on_delta, 10
+            Int32MultiArray, topic_delta, self.on_delta, 10
         )
         self.sub_speed = self.create_subscription(
-            Int32, TOPIC_UMP_SPEED, self.on_speed, 10
+            Int32, topic_speed, self.on_speed, 10
         )
 
-        self.srv_zero = self.create_service(Trigger, SRV_ZERO, self.on_zero)
+        self.srv_zero = self.create_service(Trigger, srv_zero, self.on_zero)
         self.timer = self.create_timer(poll_ms / 1000.0, self.poll_live)
 
     def poll_live(self):

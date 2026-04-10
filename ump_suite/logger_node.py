@@ -12,6 +12,7 @@ import cv2
 
 from .ros_interfaces import (
     TOPIC_UMP_DELTA, TOPIC_UMP_LIVE,
+    TOPIC_UMP2_DELTA, TOPIC_UMP2_LIVE,
     TOPIC_MOTOR_DELTA, TOPIC_MOTOR_LIVE,
     TOPIC_CAM_IMAGE_COMPRESSED, TOPIC_CAM_REC_CMD,
     SRV_ACQ_START, SRV_ACQ_STOP,
@@ -24,10 +25,12 @@ class LoggerNode(Node):
         self.declare_parameter("log_interval_ms", 500)
 
         self.latest_live_ump = None
+        self.latest_live_ump2 = None
         self.latest_live_motor = None
         self.latest_image_msg = None
 
         self.pending_delta_ump = None     # [dx,dy,dz,dd]
+        self.pending_delta_ump2 = None    # [dx,dy,dz,dd]
         self.pending_delta_motor = None   # int
 
         self.acquiring = False
@@ -46,6 +49,12 @@ class LoggerNode(Node):
         )
         self.sub_ump_live = self.create_subscription(
             Int32MultiArray, TOPIC_UMP_LIVE, self.on_ump_live, 10
+        )
+        self.sub_ump2_delta = self.create_subscription(
+            Int32MultiArray, TOPIC_UMP2_DELTA, self.on_ump2_delta, 10
+        )
+        self.sub_ump2_live = self.create_subscription(
+            Int32MultiArray, TOPIC_UMP2_LIVE, self.on_ump2_live, 10
         )
         self.sub_motor_delta = self.create_subscription(
             Int32, TOPIC_MOTOR_DELTA, self.on_motor_delta, 10
@@ -70,6 +79,12 @@ class LoggerNode(Node):
 
     def on_ump_live(self, msg: Int32MultiArray):
         self.latest_live_ump = list(msg.data)
+
+    def on_ump2_delta(self, msg: Int32MultiArray):
+        self.pending_delta_ump2 = list(msg.data)
+
+    def on_ump2_live(self, msg: Int32MultiArray):
+        self.latest_live_ump2 = list(msg.data)
 
     def on_motor_delta(self, msg: Int32):
         self.pending_delta_motor = int(msg.data)
@@ -109,6 +124,8 @@ class LoggerNode(Node):
             "timestep",
             "current_x", "current_y", "current_z", "current_d", "current_motor",
             "delta_x", "delta_y", "delta_z", "delta_d", "delta_motor",
+            "current_x2", "current_y2", "current_z2", "current_d2",
+            "delta_x2", "delta_y2", "delta_z2", "delta_d2",
             "image_path",
         ])
 
@@ -171,6 +188,15 @@ class LoggerNode(Node):
         dm = int(self.pending_delta_motor) if self.pending_delta_motor is not None else 0
         self.pending_delta_motor = None
 
+        cx2, cy2, cz2, cd2 = (0, 0, 0, 0)
+        if self.latest_live_ump2 is not None and len(self.latest_live_ump2) >= 4:
+            cx2, cy2, cz2, cd2 = [int(v) for v in self.latest_live_ump2[:4]]
+
+        dx2, dy2, dz2, dd2 = (0, 0, 0, 0)
+        if self.pending_delta_ump2 is not None and len(self.pending_delta_ump2) >= 4:
+            dx2, dy2, dz2, dd2 = [int(v) for v in self.pending_delta_ump2[:4]]
+        self.pending_delta_ump2 = None
+
         image_path = ""
         if self.latest_image_msg is not None:
             try:
@@ -188,6 +214,8 @@ class LoggerNode(Node):
             self.timestep,
             cx, cy, cz, cd, cm,
             dx, dy, dz, dd, dm,
+            cx2, cy2, cz2, cd2,
+            dx2, dy2, dz2, dd2,
             image_path,
         ])
 
