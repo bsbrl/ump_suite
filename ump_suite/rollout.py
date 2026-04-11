@@ -1,8 +1,4 @@
-"""Shared building blocks for the OpenPI rollout scripts.
-
-`main.py` and `main_delta.py` both run a closed-loop policy on the Sensapex
-hardware. They differ only in how policy outputs are interpreted (absolute
-targets vs. per-step deltas), so the boring scaffolding lives here.
+"""Building blocks for the OpenPI rollout scripts.
 """
 
 import contextlib

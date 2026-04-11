@@ -13,7 +13,7 @@ import numpy as np
 import tyro
 from openpi_client import image_tools, websocket_client_policy
 
-from ._rollout_common import (
+from .rollout import (
     RolloutArgs,
     clamp,
     prevent_keyboard_interrupt,
