@@ -1,22 +1,55 @@
-import os
-import csv
+"""Dataset logger.
 
+When acquisition is running, this node periodically writes one CSV row per
+"timestep" containing:
+  * the latest live state of UMP1, UMP2 and the motor
+  * the most recent commanded *target* for each of them (latest, not consumed)
+  * the path of the camera frame that was saved on this tick
+
+It also forwards a record path to the camera node so that the matching mp4
+video file is captured for the same trial.
+"""
+
+import csv
+import os
+
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32MultiArray, Int32, String
-from std_srvs.srv import Trigger
 from sensor_msgs.msg import CompressedImage
-
-import numpy as np
-import cv2
+from std_msgs.msg import Int32, Int32MultiArray, String
+from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
-    TOPIC_UMP_DELTA, TOPIC_UMP_LIVE,
-    TOPIC_UMP2_DELTA, TOPIC_UMP2_LIVE,
-    TOPIC_MOTOR_DELTA, TOPIC_MOTOR_LIVE,
-    TOPIC_CAM_IMAGE_COMPRESSED, TOPIC_CAM_REC_CMD,
-    SRV_ACQ_START, SRV_ACQ_STOP,
+    SRV_ACQ_START,
+    SRV_ACQ_STOP,
+    TOPIC_CAM_IMAGE_COMPRESSED,
+    TOPIC_CAM_REC_CMD,
+    TOPIC_MOTOR_LIVE,
+    TOPIC_MOTOR_TGT,
+    TOPIC_UMP_LIVE,
+    TOPIC_UMP_TARGET,
+    TOPIC_UMP2_LIVE,
+    TOPIC_UMP2_TARGET,
 )
+
+
+CSV_HEADER = [
+    "timestep",
+    "current_x",  "current_y",  "current_z",  "current_d",  "current_motor",
+    "target_x",   "target_y",   "target_z",   "target_d",   "target_motor",
+    "current_x2", "current_y2", "current_z2", "current_d2",
+    "target_x2",  "target_y2",  "target_z2",  "target_d2",
+    "image_path",
+]
+
+
+def _xyzd(values):
+    """Coerce a 4+ element list into a length-4 int tuple, defaulting to zeros."""
+    if values is None or len(values) < 4:
+        return (0, 0, 0, 0)
+    return tuple(int(v) for v in values[:4])
 
 
 class LoggerNode(Node):
@@ -24,14 +57,18 @@ class LoggerNode(Node):
         super().__init__("logger_node")
         self.declare_parameter("log_interval_ms", 500)
 
+        # Latest live state.
         self.latest_live_ump = None
         self.latest_live_ump2 = None
         self.latest_live_motor = None
         self.latest_image_msg = None
 
-        self.pending_delta_ump = None     # [dx,dy,dz,dd]
-        self.pending_delta_ump2 = None    # [dx,dy,dz,dd]
-        self.pending_delta_motor = None   # int
+        # Latest commanded target. These are *not* cleared after each tick:
+        # if the user stops issuing commands, the most recent target keeps
+        # appearing in subsequent rows so target/current can always be diffed.
+        self.latest_target_ump = None
+        self.latest_target_ump2 = None
+        self.latest_target_motor = None
 
         self.acquiring = False
         self.trial_name = None
@@ -44,62 +81,56 @@ class LoggerNode(Node):
         self.log_file = None
         self.writer = None
 
-        self.sub_ump_delta = self.create_subscription(
-            Int32MultiArray, TOPIC_UMP_DELTA, self.on_ump_delta, 10
-        )
-        self.sub_ump_live = self.create_subscription(
-            Int32MultiArray, TOPIC_UMP_LIVE, self.on_ump_live, 10
-        )
-        self.sub_ump2_delta = self.create_subscription(
-            Int32MultiArray, TOPIC_UMP2_DELTA, self.on_ump2_delta, 10
-        )
-        self.sub_ump2_live = self.create_subscription(
-            Int32MultiArray, TOPIC_UMP2_LIVE, self.on_ump2_live, 10
-        )
-        self.sub_motor_delta = self.create_subscription(
-            Int32, TOPIC_MOTOR_DELTA, self.on_motor_delta, 10
-        )
-        self.sub_motor_live = self.create_subscription(
-            Int32, TOPIC_MOTOR_LIVE, self.on_motor_live, 10
-        )
-        self.sub_img = self.create_subscription(
-            CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self.on_img, 10
-        )
+        # Live state subscribers.
+        self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE,   self.on_ump_live,   10)
+        self.create_subscription(Int32MultiArray, TOPIC_UMP2_LIVE,  self.on_ump2_live,  10)
+        self.create_subscription(Int32,           TOPIC_MOTOR_LIVE, self.on_motor_live, 10)
+
+        # Target subscribers (snoop on whatever the GUI / VLA publishes).
+        self.create_subscription(Int32MultiArray, TOPIC_UMP_TARGET,  self.on_ump_target,  10)
+        self.create_subscription(Int32MultiArray, TOPIC_UMP2_TARGET, self.on_ump2_target, 10)
+        self.create_subscription(Int32,           TOPIC_MOTOR_TGT,   self.on_motor_target, 10)
+
+        self.create_subscription(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self.on_img, 10)
 
         self.pub_rec_cmd = self.create_publisher(String, TOPIC_CAM_REC_CMD, 10)
 
-        self.srv_start = self.create_service(Trigger, SRV_ACQ_START, self.on_start)
-        self.srv_stop = self.create_service(Trigger, SRV_ACQ_STOP, self.on_stop)
+        self.create_service(Trigger, SRV_ACQ_START, self.on_start)
+        self.create_service(Trigger, SRV_ACQ_STOP,  self.on_stop)
 
         interval = int(self.get_parameter("log_interval_ms").value) / 1000.0
-        self.timer = self.create_timer(interval, self.tick)
+        self.create_timer(interval, self.tick)
 
-    def on_ump_delta(self, msg: Int32MultiArray):
-        self.pending_delta_ump = list(msg.data)
-
+    # ── Subscriber callbacks ───────────────────────────────────────────────
     def on_ump_live(self, msg: Int32MultiArray):
         self.latest_live_ump = list(msg.data)
-
-    def on_ump2_delta(self, msg: Int32MultiArray):
-        self.pending_delta_ump2 = list(msg.data)
 
     def on_ump2_live(self, msg: Int32MultiArray):
         self.latest_live_ump2 = list(msg.data)
 
-    def on_motor_delta(self, msg: Int32):
-        self.pending_delta_motor = int(msg.data)
-
     def on_motor_live(self, msg: Int32):
         self.latest_live_motor = int(msg.data)
+
+    def on_ump_target(self, msg: Int32MultiArray):
+        # /ump/target carries [x,y,z,d,speed]; we only log [x,y,z,d].
+        self.latest_target_ump = list(msg.data)
+
+    def on_ump2_target(self, msg: Int32MultiArray):
+        self.latest_target_ump2 = list(msg.data)
+
+    def on_motor_target(self, msg: Int32):
+        self.latest_target_motor = int(msg.data)
 
     def on_img(self, msg: CompressedImage):
         self.latest_image_msg = msg
 
+    # ── Trial setup ────────────────────────────────────────────────────────
     def _setup_trial(self):
         os.makedirs("logs", exist_ok=True)
         os.makedirs("saved_frames", exist_ok=True)
         os.makedirs("saved_videos", exist_ok=True)
 
+        # Pick the next free trial number by inspecting `logs/`.
         existing = []
         for fn in os.listdir("logs"):
             if fn.startswith("trial_") and fn.endswith(".csv"):
@@ -109,7 +140,7 @@ class LoggerNode(Node):
         next_trial = max(existing, default=0) + 1
 
         self.trial_name = f"trial_{next_trial}"
-        self.log_path = os.path.join("logs", f"{self.trial_name}.csv")
+        self.log_path   = os.path.join("logs",         f"{self.trial_name}.csv")
         self.frames_dir = os.path.join("saved_frames", self.trial_name)
         self.video_path = os.path.join("saved_videos", f"{self.trial_name}.mp4")
         os.makedirs(self.frames_dir, exist_ok=True)
@@ -120,15 +151,9 @@ class LoggerNode(Node):
     def _open_csv(self):
         self.log_file = open(self.log_path, "w", newline="")
         self.writer = csv.writer(self.log_file)
-        self.writer.writerow([
-            "timestep",
-            "current_x", "current_y", "current_z", "current_d", "current_motor",
-            "delta_x", "delta_y", "delta_z", "delta_d", "delta_motor",
-            "current_x2", "current_y2", "current_z2", "current_d2",
-            "delta_x2", "delta_y2", "delta_z2", "delta_d2",
-            "image_path",
-        ])
+        self.writer.writerow(CSV_HEADER)
 
+    # ── Service handlers ───────────────────────────────────────────────────
     def on_start(self, _req, res):
         if self.acquiring:
             res.success = True
@@ -137,7 +162,6 @@ class LoggerNode(Node):
 
         self._setup_trial()
         self._open_csv()
-
         self.pub_rec_cmd.publish(String(data=self.video_path))
 
         self.acquiring = True
@@ -170,55 +194,46 @@ class LoggerNode(Node):
         self.get_logger().info(res.message)
         return res
 
+    # ── Per-tick logging ───────────────────────────────────────────────────
+    def _save_current_frame(self):
+        """Decode the latest JPEG and write it to disk; return its path or ''."""
+        if self.latest_image_msg is None:
+            return ""
+        try:
+            data = np.frombuffer(self.latest_image_msg.data, dtype=np.uint8)
+            frame_bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if frame_bgr is None:
+                return ""
+            fname = os.path.join(self.frames_dir, f"frame_{self.frame_index:06d}.png")
+            cv2.imwrite(fname, frame_bgr)
+            self.frame_index += 1
+            return fname
+        except Exception as e:
+            self.get_logger().warn(f"Frame save error: {e}")
+            return ""
+
     def tick(self):
         if not self.acquiring or self.writer is None:
             return
 
-        cx, cy, cz, cd = (0, 0, 0, 0)
-        if self.latest_live_ump is not None and len(self.latest_live_ump) >= 4:
-            cx, cy, cz, cd = [int(v) for v in self.latest_live_ump[:4]]
-
+        cx,  cy,  cz,  cd  = _xyzd(self.latest_live_ump)
+        cx2, cy2, cz2, cd2 = _xyzd(self.latest_live_ump2)
         cm = int(self.latest_live_motor) if self.latest_live_motor is not None else 0
 
-        dx, dy, dz, dd = (0, 0, 0, 0)
-        if self.pending_delta_ump is not None and len(self.pending_delta_ump) >= 4:
-            dx, dy, dz, dd = [int(v) for v in self.pending_delta_ump[:4]]
-        self.pending_delta_ump = None
+        tx,  ty,  tz,  td  = _xyzd(self.latest_target_ump)
+        tx2, ty2, tz2, td2 = _xyzd(self.latest_target_ump2)
+        tm = int(self.latest_target_motor) if self.latest_target_motor is not None else 0
 
-        dm = int(self.pending_delta_motor) if self.pending_delta_motor is not None else 0
-        self.pending_delta_motor = None
-
-        cx2, cy2, cz2, cd2 = (0, 0, 0, 0)
-        if self.latest_live_ump2 is not None and len(self.latest_live_ump2) >= 4:
-            cx2, cy2, cz2, cd2 = [int(v) for v in self.latest_live_ump2[:4]]
-
-        dx2, dy2, dz2, dd2 = (0, 0, 0, 0)
-        if self.pending_delta_ump2 is not None and len(self.pending_delta_ump2) >= 4:
-            dx2, dy2, dz2, dd2 = [int(v) for v in self.pending_delta_ump2[:4]]
-        self.pending_delta_ump2 = None
-
-        image_path = ""
-        if self.latest_image_msg is not None:
-            try:
-                data = np.frombuffer(self.latest_image_msg.data, dtype=np.uint8)
-                frame_bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                if frame_bgr is not None:
-                    fname = os.path.join(self.frames_dir, f"frame_{self.frame_index:06d}.png")
-                    cv2.imwrite(fname, frame_bgr)
-                    image_path = fname
-                    self.frame_index += 1
-            except Exception as e:
-                self.get_logger().warn(f"Frame save error: {e}")
+        image_path = self._save_current_frame()
 
         self.writer.writerow([
             self.timestep,
             cx, cy, cz, cd, cm,
-            dx, dy, dz, dd, dm,
+            tx, ty, tz, td, tm,
             cx2, cy2, cz2, cd2,
-            dx2, dy2, dz2, dd2,
+            tx2, ty2, tz2, td2,
             image_path,
         ])
-
         self.timestep += 1
 
         try:

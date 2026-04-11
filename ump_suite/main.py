@@ -1,170 +1,99 @@
+"""Closed-loop rollout where the policy emits *absolute* target poses.
+
+Pipeline per tick:
+    obs ──► policy.infer ──► clamp_action_5d ──► limit_step (vs. current state)
+                                           │
+                                           ▼
+                            optional EMA smoothing ──► env.step_absolute
+"""
 # ruff: noqa
-import contextlib
-import dataclasses
-import signal
 import time
-import sys
-import threading
 
 import numpy as np
 import tyro
+from openpi_client import image_tools, websocket_client_policy
 
-from openpi_client import image_tools
-from openpi_client import websocket_client_policy
-
+from ._rollout_common import (
+    RolloutArgs,
+    clamp,
+    prevent_keyboard_interrupt,
+    start_estop_listener,
+)
 from .sensapex_env import SensapexEnv
 
 
 # === Control rate ===
-# Dataset was collected around ~2.5 Hz and stored as 3 Hz for LeRobot.
+# Dataset was collected at ~2.5 Hz and stored as 3 Hz for LeRobot.
 # 10 Hz can cause overshoot/jitter on real hardware.
 CONTROL_FREQUENCY_HZ = 3
 
 
 # === Safety limits ===
-# Units: "centered counts" (same units as /ump/live and /ump/target in the ROS nodes).
+# Units are "centered counts" (same coordinates the ROS nodes use on
+# /ump/live and /ump/target).
 X_MIN, X_MAX = 4600, 5700
 Y_MIN, Y_MAX = 4900, 5500
 Z_MIN, Z_MAX = 8750, 8250
 D_MIN, D_MAX = 5900, 6100
 
-
-# Motor ticks safety (EDIT for the stage)
+# ODrive motor ticks safety window (edit per stage).
 H_MIN, H_MAX = -6000, 1000
 
-# Max step per control tick (prevents sudden jumps)
+# Max absolute step per control tick — caps single-tick jumps even if the
+# policy spits out a target far from where we are right now.
 MAX_DX = 250.0
 MAX_DY = 250.0
 MAX_DZ = 250.0
 MAX_DD = 250.0
 MAX_DH = 5000.0
 
-# Optional EMA smoothing (reduces jitter)
+# Optional first-order smoothing on the commanded action.
 USE_EMA_SMOOTHING = True
-EMA_ALPHA = 0.35  # higher = less smoothing, lower = more smoothing
-
-
-def _clamp(v, lo, hi):
-    return lo if v < lo else (hi if v > hi else v)
+EMA_ALPHA = 0.35  # 1.0 = no smoothing, →0 = heavy smoothing
 
 
 def clamp_action_5d(action_5d: np.ndarray) -> np.ndarray:
-    """Clamp absolute action [x,y,z,d,h_ticks] to safe workspace limits."""
+    """Clamp absolute action [x, y, z, d, h_ticks] to the safe workspace."""
     a = np.asarray(action_5d, dtype=np.float32).reshape(5,)
-    x, y, z, d, h = [float(v) for v in a]
-    x = _clamp(x, X_MIN, X_MAX)
-    y = _clamp(y, Y_MIN, Y_MAX)
-    z = _clamp(z, Z_MIN, Z_MAX)
-    d = _clamp(d, D_MIN, D_MAX)
-    h = _clamp(h, H_MIN, H_MAX)
-    return np.array([x, y, z, d, h], dtype=np.float32)
+    return np.array(
+        [
+            clamp(float(a[0]), X_MIN, X_MAX),
+            clamp(float(a[1]), Y_MIN, Y_MAX),
+            clamp(float(a[2]), Z_MIN, Z_MAX),
+            clamp(float(a[3]), D_MIN, D_MAX),
+            clamp(float(a[4]), H_MIN, H_MAX),
+        ],
+        dtype=np.float32,
+    )
 
 
 def limit_step(prev_state_5d: np.ndarray, target_action_5d: np.ndarray) -> np.ndarray:
-    """
-    prev_state_5d: current [x,y,z,d,h] from observation
-    target_action_5d: absolute desired [x,y,z,d,h]
-    returns: absolute command with per-step delta caps
-    """
-    prev = np.asarray(prev_state_5d, dtype=np.float32).reshape(5,)
-    tgt = np.asarray(target_action_5d, dtype=np.float32).reshape(5,)
+    """Cap each axis' per-tick movement so a far-away target ramps in safely."""
+    prev = np.asarray(prev_state_5d,    dtype=np.float32).reshape(5,)
+    tgt  = np.asarray(target_action_5d, dtype=np.float32).reshape(5,)
 
-    dx = _clamp(tgt[0] - prev[0], -MAX_DX, MAX_DX)
-    dy = _clamp(tgt[1] - prev[1], -MAX_DY, MAX_DY)
-    dz = _clamp(tgt[2] - prev[2], -MAX_DZ, MAX_DZ)
-    dd = _clamp(tgt[3] - prev[3], -MAX_DD, MAX_DD)
-    dh = _clamp(tgt[4] - prev[4], -MAX_DH, MAX_DH)
-
-    out = np.array(
-        [prev[0] + dx, prev[1] + dy, prev[2] + dz, prev[3] + dd, prev[4] + dh],
-        dtype=np.float32,
-    )
+    caps = (MAX_DX, MAX_DY, MAX_DZ, MAX_DD, MAX_DH)
+    out = np.empty(5, dtype=np.float32)
+    for i, cap in enumerate(caps):
+        out[i] = prev[i] + clamp(tgt[i] - prev[i], -cap, cap)
     return out
 
 
-def start_estop_listener():
-    """
-    Type:  q  then Enter   to stop rollout.
-    Works over SSH as long as stdin is attached.
-    """
-    flag = {"stop": False}
-
-    def _worker():
-        while True:
-            s = sys.stdin.readline()
-            if not s:
-                continue
-            if s.strip().lower() == "q":
-                flag["stop"] = True
-                break
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    return flag
-
-
-@contextlib.contextmanager
-def prevent_keyboard_interrupt():
-    interrupted = False
-    original_handler = signal.getsignal(signal.SIGINT)
-
-    def handler(signum, frame):
-        nonlocal interrupted
-        interrupted = True
-
-    signal.signal(signal.SIGINT, handler)
-    try:
-        yield
-    finally:
-        signal.signal(signal.SIGINT, original_handler)
-        if interrupted:
-            raise KeyboardInterrupt
-
-
-@dataclasses.dataclass
-class Args:
-    # Policy server (OpenPI server)
-    remote_host: str = "127.0.0.1"
-    remote_port: int = 8000
-
-    # Rollout
-    max_timesteps: int = 600
-    open_loop_horizon: int = 8
-
-    # Camera preprocessing
-    resize_h: int = 224
-    resize_w: int = 224
-
-    # Robot params
-    default_speed: int = 100
-
-    # Live preview (writes a file on robot pc)
-    save_preview: bool = True
-    preview_path: str = "sensapex_live.png"
-    preview_every_n_frames: int = 5
-
-    # Debug prints every N steps
-    debug_every: int = 10
-
-
-def main(args: Args):
-    # Connect env (ROS)
+def main(args: RolloutArgs):
     env = SensapexEnv(
         save_preview=args.save_preview,
         preview_path=args.preview_path,
         preview_every_n_frames=args.preview_every_n_frames,
         default_speed=args.default_speed,
     )
-
     if args.save_preview:
         print(f"[sensapex] Live preview will be saved to: {args.preview_path}")
 
-    # Connect to policy server
-    policy_client = websocket_client_policy.WebsocketClientPolicy(args.remote_host, args.remote_port)
+    policy_client = websocket_client_policy.WebsocketClientPolicy(
+        args.remote_host, args.remote_port
+    )
 
-    instruction = input("Enter instruction: ").strip()
-    if not instruction:
-        instruction = "Move the needle towards the bead"
+    instruction = input("Enter instruction: ").strip() or "Move the needle towards the bead"
 
     print("Running rollout...")
     print("  - Press Ctrl+C to stop early")
@@ -172,9 +101,8 @@ def main(args: Args):
 
     stop_flag = start_estop_listener()
 
-    actions_from_chunk_completed = 0
+    actions_completed_in_chunk = 0
     pred_action_chunk = None
-
     ema_action = None
     period = 1.0 / float(CONTROL_FREQUENCY_HZ)
 
@@ -182,7 +110,7 @@ def main(args: Args):
         start_time = time.time()
         try:
             if stop_flag["stop"]:
-                # Hold current position once then exit
+                # Hold the most recent state once, then exit.
                 obs = env.get_observation()
                 hold = obs.state.astype(np.float32).copy()
                 print("[E-STOP] Holding current position and exiting.")
@@ -190,35 +118,42 @@ def main(args: Args):
                 break
 
             obs = env.get_observation()
-            img = obs.image_rgb  # RGB uint8
-            state = obs.state.astype(np.float32)  # (5,) [x,y,z,d,h_ticks]
+            img = obs.image_rgb
+            state = obs.state.astype(np.float32)
 
-            # Query policy server when needed
-            if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
-                actions_from_chunk_completed = 0
-
-                request_data = {
-                    "observation/image": image_tools.resize_with_pad(img, args.resize_h, args.resize_w),
+            # Fetch a fresh chunk of actions from the policy whenever the
+            # previous chunk has been fully consumed.
+            need_new_chunk = (
+                actions_completed_in_chunk == 0
+                or actions_completed_in_chunk >= args.open_loop_horizon
+            )
+            if need_new_chunk:
+                actions_completed_in_chunk = 0
+                request = {
+                    "observation/image": image_tools.resize_with_pad(
+                        img, args.resize_h, args.resize_w
+                    ),
                     "observation/state": state,
                     "prompt": instruction,
                 }
-
                 with prevent_keyboard_interrupt():
-                    resp = policy_client.infer(request_data)
+                    resp = policy_client.infer(request)
 
                 if "actions" not in resp:
-                    raise RuntimeError(f"Policy response missing 'actions' key. Keys={list(resp.keys())}")
-
+                    raise RuntimeError(
+                        f"Policy response missing 'actions' key. Keys={list(resp.keys())}"
+                    )
                 pred_action_chunk = np.asarray(resp["actions"], dtype=np.float32)
-
                 if pred_action_chunk.ndim != 2 or pred_action_chunk.shape[1] != 5:
-                    raise RuntimeError(f"Expected actions shape (T,5), got {pred_action_chunk.shape}")
+                    raise RuntimeError(
+                        f"Expected actions shape (T,5), got {pred_action_chunk.shape}"
+                    )
 
-            # Execute one action from the chunk
-            action = pred_action_chunk[actions_from_chunk_completed]
-            actions_from_chunk_completed += 1
+            # Pop the next action from the open-loop chunk and run it through
+            # the safety + smoothing pipeline.
+            action = pred_action_chunk[actions_completed_in_chunk]
+            actions_completed_in_chunk += 1
 
-            # --- Safety + smoothing pipeline ---
             action = clamp_action_5d(action)
             action = limit_step(state, action)
 
@@ -226,21 +161,20 @@ def main(args: Args):
                 if ema_action is None:
                     ema_action = action.copy()
                 else:
-                    ema_action = (EMA_ALPHA * action) + ((1.0 - EMA_ALPHA) * ema_action)
+                    ema_action = EMA_ALPHA * action + (1.0 - EMA_ALPHA) * ema_action
                 cmd = ema_action
             else:
                 cmd = action
 
-            # Send to robot (absolute targets)
             env.step_absolute(cmd)
 
             if args.debug_every > 0 and (t % int(args.debug_every) == 0):
                 print(
-                    f"[t={t:04d}] state=[{state[0]:.0f},{state[1]:.0f},{state[2]:.0f},{state[3]:.0f},{state[4]:.0f}] "
+                    f"[t={t:04d}] "
+                    f"state=[{state[0]:.0f},{state[1]:.0f},{state[2]:.0f},{state[3]:.0f},{state[4]:.0f}] "
                     f"cmd=[{cmd[0]:.0f},{cmd[1]:.0f},{cmd[2]:.0f},{cmd[3]:.0f},{cmd[4]:.0f}]"
                 )
 
-            # Sleep to match control frequency
             elapsed = time.time() - start_time
             if elapsed < period:
                 time.sleep(period - elapsed)
@@ -253,8 +187,8 @@ def main(args: Args):
 
 
 def main_entry():
-    args: Args = tyro.cli(Args)
-    main(args)
+    main(tyro.cli(RolloutArgs))
+
 
 if __name__ == "__main__":
     main_entry()

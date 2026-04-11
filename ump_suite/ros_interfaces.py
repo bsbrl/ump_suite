@@ -1,30 +1,24 @@
-# ump_suite/ros_interfaces.py
+"""Topic and service names shared by every node in the package."""
 
-# UMP topics
-TOPIC_UMP_TARGET = "/ump/target"          # std_msgs/Int32MultiArray: [x,y,z,d,speed] absolute
-TOPIC_UMP_DELTA  = "/ump/delta"           # std_msgs/Int32MultiArray: [dx,dy,dz,dd]
-TOPIC_UMP_LIVE   = "/ump/live"            # std_msgs/Int32MultiArray: [x,y,z,d]
-TOPIC_UMP_SPEED  = "/ump/target_speed"    # std_msgs/Int32: speed used for delta commands
+# UMP 1 ── primary Sensapex micromanipulator
+TOPIC_UMP_TARGET = "/ump/target"          # Int32MultiArray [x,y,z,d,speed] absolute
+TOPIC_UMP_LIVE   = "/ump/live"            # Int32MultiArray [x,y,z,d]
 
-# Motor topics
-TOPIC_MOTOR_TGT   = "/motor/target_counts"   # std_msgs/Int32 absolute
-TOPIC_MOTOR_DELTA = "/motor/delta_counts"    # std_msgs/Int32 delta
-TOPIC_MOTOR_JOG   = "/motor/jog_dir"         # std_msgs/Int32: -1,0,+1
-TOPIC_MOTOR_LIVE  = "/motor/live_counts"     # std_msgs/Int32
+# UMP 2 ── secondary Sensapex micromanipulator
+TOPIC_UMP2_TARGET = "/ump2/target"
+TOPIC_UMP2_LIVE   = "/ump2/live"
 
-# Camera topics
-TOPIC_CAM_IMAGE_COMPRESSED = "/camera/image/compressed"   # sensor_msgs/CompressedImage
-TOPIC_CAM_FPS = "/camera/fps"                             # std_msgs/Float32
-TOPIC_CAM_REC_CMD = "/camera/record_cmd"                  # std_msgs/String
+# ODrive motor (single axis)
+TOPIC_MOTOR_TGT  = "/motor/target_counts"   # Int32 absolute encoder counts
+TOPIC_MOTOR_LIVE = "/motor/live_counts"     # Int32 current counts
 
-# UMP2 topics
-TOPIC_UMP2_TARGET = "/ump2/target"         # std_msgs/Int32MultiArray: [x,y,z,d,speed] absolute
-TOPIC_UMP2_DELTA  = "/ump2/delta"          # std_msgs/Int32MultiArray: [dx,dy,dz,dd]
-TOPIC_UMP2_LIVE   = "/ump2/live"           # std_msgs/Int32MultiArray: [x,y,z,d]
-TOPIC_UMP2_SPEED  = "/ump2/target_speed"   # std_msgs/Int32: speed used for delta commands
+# Camera (Blackfly via PySpin)
+TOPIC_CAM_IMAGE_COMPRESSED = "/camera/image/compressed"   # CompressedImage (jpeg)
+TOPIC_CAM_FPS              = "/camera/fps"                # Float32
+TOPIC_CAM_REC_CMD          = "/camera/record_cmd"         # String: path to start, "" to stop
 
-# Services
-SRV_ACQ_START = "/acq/start"              # std_srvs/Trigger
-SRV_ACQ_STOP  = "/acq/stop"               # std_srvs/Trigger
-SRV_ZERO      = "/ump/calibrate_zero"     # std_srvs/Trigger
-SRV_ZERO2     = "/ump2/calibrate_zero"    # std_srvs/Trigger
+# Services (all std_srvs/Trigger)
+SRV_ACQ_START = "/acq/start"
+SRV_ACQ_STOP  = "/acq/stop"
+SRV_ZERO      = "/ump/calibrate_zero"
+SRV_ZERO2     = "/ump2/calibrate_zero"
