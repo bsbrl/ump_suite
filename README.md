@@ -11,7 +11,7 @@ The package wraps every device behind a small ROS2 node, ships a Tk GUI for manu
 | Device | Driver / SDK | Node |
 |---|---|---|
 | Sensapex UMP (×2) | `sensapex` Python SDK + `libum.so` | [ump_driver_node.py](ump_suite/ump_driver_node.py) |
-| ODrive single-axis motor (height stage) | `odrive` Python SDK | [odrive_driver_node.py](ump_suite/odrive_driver_node.py) |
+| ODrive single-axis motor (focusing knob) | `odrive` Python SDK | [odrive_driver_node.py](ump_suite/odrive_driver_node.py) |
 | FLIR Blackfly S camera | PySpin (Spinnaker) | [camera_node.py](ump_suite/camera_node.py) |
 
 A copy of the Sensapex shared library used during development is bundled at [InstallationFiles/libum.so](InstallationFiles/libum.so).
@@ -256,4 +256,4 @@ Defined in [setup.py](setup.py):
 
 ## Maintainer
 
-Raian Chowdhury — `chowd207@umn.edu`
+Raian Haider Chowdhury — `chowd207@umn.edu`

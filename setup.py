@@ -18,7 +18,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='RaianSilex',
+    maintainer='Raian Haider Chowdhury',
     maintainer_email='chowd207@umn.edu',
     description='Sensapex UMP + ODrive + Blackfly (PySpin) ROS2 nodes + GUI + logging',
     license='TODO: License declaration',

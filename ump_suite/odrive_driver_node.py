@@ -1,4 +1,4 @@
-"""ROS2 driver for an ODrive single-axis motor used as the manipulator's height stage.
+"""ROS2 driver for an ODrive single-axis motor used as the manipulator's focusing knob.
 
 The driver accepts absolute target encoder counts on /motor/target_counts and
 publishes the current encoder counts on /motor/live_counts. Position control
