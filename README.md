@@ -1,6 +1,6 @@
 # ump_suite
 
-A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **Sensapex UMP micromanipulators**, an **ODrive**-driven height stage and a **FLIR Blackfly S** camera.
+A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **Sensapex UMP micromanipulators**, an **ODrive**-driven focusing knob and a **FLIR Blackfly S** camera.
 
 The package wraps every device behind a small ROS2 node, ships a Tk GUI for manual teleop, a logger that writes synchronized image / video / CSV trials, and a thin client that lets an [OpenPI](https://github.com/Physical-Intelligence/openpi) policy server drive the rig in closed loop.
 
