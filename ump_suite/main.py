@@ -1,10 +1,14 @@
 """Closed-loop rollout where the policy emits *absolute* target poses.
 
 Pipeline per tick:
-    obs ──► policy.infer ──► clamp_action_5d ──► limit_step (vs. current state)
+    obs ──► policy.infer ──► clamp_action_9d ──► limit_step (vs. current state)
                                            │
                                            ▼
                             optional EMA smoothing ──► env.step_absolute
+
+The rig carries **two** Sensapex micromanipulators plus a single ODrive
+motor, so every state / action vector is 9-dim:
+``[x1, y1, z1, d1, x2, y2, z2, d2, h_ticks]``.
 """
 # ruff: noqa
 import time
@@ -30,50 +34,71 @@ CONTROL_FREQUENCY_HZ = 3
 
 # === Safety limits ===
 # Units are "centered counts" (same coordinates the ROS nodes use on
-# /ump/live and /ump/target).
-X_MIN, X_MAX = 4600, 5700
-Y_MIN, Y_MAX = 4900, 5500
-Z_MIN, Z_MAX = 8750, 8250
-D_MIN, D_MAX = 5900, 6100
+# /ump/live, /ump/target, /ump2/live, /ump2/target).
+
+# --- UMP1 workspace box ---
+X1_MIN, X1_MAX = 4600, 5700
+Y1_MIN, Y1_MAX = 4900, 5500
+Z1_MIN, Z1_MAX = 8750, 8250
+D1_MIN, D1_MAX = 5900, 6100
+
+# --- UMP2 workspace box ---
+# NOTE: duplicated from UMP1 as placeholders — edit for your second stage.
+X2_MIN, X2_MAX = 4600, 5700
+Y2_MIN, Y2_MAX = 4900, 5500
+Z2_MIN, Z2_MAX = 8750, 8250
+D2_MIN, D2_MAX = 5900, 6100
 
 # ODrive motor ticks safety window (edit per stage).
 H_MIN, H_MAX = -6000, 1000
 
 # Max absolute step per control tick — caps single-tick jumps even if the
 # policy spits out a target far from where we are right now.
-MAX_DX = 250.0
-MAX_DY = 250.0
-MAX_DZ = 250.0
-MAX_DD = 250.0
-MAX_DH = 5000.0
+MAX_DX1 = 250.0
+MAX_DY1 = 250.0
+MAX_DZ1 = 250.0
+MAX_DD1 = 250.0
+MAX_DX2 = 250.0
+MAX_DY2 = 250.0
+MAX_DZ2 = 250.0
+MAX_DD2 = 250.0
+MAX_DH  = 5000.0
 
 # Optional first-order smoothing on the commanded action.
 USE_EMA_SMOOTHING = True
 EMA_ALPHA = 0.35  # 1.0 = no smoothing, →0 = heavy smoothing
 
 
-def clamp_action_5d(action_5d: np.ndarray) -> np.ndarray:
-    """Clamp absolute action [x, y, z, d, h_ticks] to the safe workspace."""
-    a = np.asarray(action_5d, dtype=np.float32).reshape(5,)
+def clamp_action_9d(action_9d: np.ndarray) -> np.ndarray:
+    """Clamp absolute action [x1,y1,z1,d1, x2,y2,z2,d2, h_ticks] to safe box."""
+    a = np.asarray(action_9d, dtype=np.float32).reshape(9,)
     return np.array(
         [
-            clamp(float(a[0]), X_MIN, X_MAX),
-            clamp(float(a[1]), Y_MIN, Y_MAX),
-            clamp(float(a[2]), Z_MIN, Z_MAX),
-            clamp(float(a[3]), D_MIN, D_MAX),
-            clamp(float(a[4]), H_MIN, H_MAX),
+            clamp(float(a[0]), X1_MIN, X1_MAX),
+            clamp(float(a[1]), Y1_MIN, Y1_MAX),
+            clamp(float(a[2]), Z1_MIN, Z1_MAX),
+            clamp(float(a[3]), D1_MIN, D1_MAX),
+            clamp(float(a[4]), X2_MIN, X2_MAX),
+            clamp(float(a[5]), Y2_MIN, Y2_MAX),
+            clamp(float(a[6]), Z2_MIN, Z2_MAX),
+            clamp(float(a[7]), D2_MIN, D2_MAX),
+            clamp(float(a[8]), H_MIN,  H_MAX),
         ],
         dtype=np.float32,
     )
 
 
-def limit_step(prev_state_5d: np.ndarray, target_action_5d: np.ndarray) -> np.ndarray:
+def limit_step(prev_state_9d: np.ndarray, target_action_9d: np.ndarray) -> np.ndarray:
     """Cap each axis' per-tick movement so a far-away target ramps in safely."""
-    prev = np.asarray(prev_state_5d,    dtype=np.float32).reshape(5,)
-    tgt  = np.asarray(target_action_5d, dtype=np.float32).reshape(5,)
+    prev = np.asarray(prev_state_9d,    dtype=np.float32).reshape(9,)
+    tgt  = np.asarray(target_action_9d, dtype=np.float32).reshape(9,)
 
-    caps = (MAX_DX, MAX_DY, MAX_DZ, MAX_DD, MAX_DH)
-    out = np.empty(5, dtype=np.float32)
+    caps = (
+        MAX_DX1, MAX_DY1, MAX_DZ1, MAX_DD1,
+        MAX_DX2, MAX_DY2, MAX_DZ2, MAX_DD2,
+        MAX_DH,
+    )
+    out = np.empty(9, dtype=np.float32)
     for i, cap in enumerate(caps):
         out[i] = prev[i] + clamp(tgt[i] - prev[i], -cap, cap)
     return out
@@ -144,9 +169,9 @@ def main(args: RolloutArgs):
                         f"Policy response missing 'actions' key. Keys={list(resp.keys())}"
                     )
                 pred_action_chunk = np.asarray(resp["actions"], dtype=np.float32)
-                if pred_action_chunk.ndim != 2 or pred_action_chunk.shape[1] != 5:
+                if pred_action_chunk.ndim != 2 or pred_action_chunk.shape[1] != 9:
                     raise RuntimeError(
-                        f"Expected actions shape (T,5), got {pred_action_chunk.shape}"
+                        f"Expected actions shape (T,9), got {pred_action_chunk.shape}"
                     )
 
             # Pop the next action from the open-loop chunk and run it through
@@ -154,7 +179,7 @@ def main(args: RolloutArgs):
             action = pred_action_chunk[actions_completed_in_chunk]
             actions_completed_in_chunk += 1
 
-            action = clamp_action_5d(action)
+            action = clamp_action_9d(action)
             action = limit_step(state, action)
 
             if USE_EMA_SMOOTHING:
@@ -171,8 +196,12 @@ def main(args: RolloutArgs):
             if args.debug_every > 0 and (t % int(args.debug_every) == 0):
                 print(
                     f"[t={t:04d}] "
-                    f"state=[{state[0]:.0f},{state[1]:.0f},{state[2]:.0f},{state[3]:.0f},{state[4]:.0f}] "
-                    f"cmd=[{cmd[0]:.0f},{cmd[1]:.0f},{cmd[2]:.0f},{cmd[3]:.0f},{cmd[4]:.0f}]"
+                    f"state=[{state[0]:.0f},{state[1]:.0f},{state[2]:.0f},{state[3]:.0f}|"
+                    f"{state[4]:.0f},{state[5]:.0f},{state[6]:.0f},{state[7]:.0f}|"
+                    f"{state[8]:.0f}] "
+                    f"cmd=[{cmd[0]:.0f},{cmd[1]:.0f},{cmd[2]:.0f},{cmd[3]:.0f}|"
+                    f"{cmd[4]:.0f},{cmd[5]:.0f},{cmd[6]:.0f},{cmd[7]:.0f}|"
+                    f"{cmd[8]:.0f}]"
                 )
 
             elapsed = time.time() - start_time

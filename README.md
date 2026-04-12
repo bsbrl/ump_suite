@@ -114,12 +114,12 @@ All commands are absolute targets — the bump buttons mutate the locally-held t
 
 [main.py](ump_suite/main.py) and [sensapex_env.py](ump_suite/sensapex_env.py) connect this rig to an [OpenPI](https://github.com/Physical-Intelligence/openpi) policy server.
 
-`SensapexEnv` spins its own `rclpy` node in a background thread, subscribes to `/camera/image/compressed`, `/ump/live` and `/motor/live_counts`, and exposes a synchronous interface:
+`SensapexEnv` spins its own `rclpy` node in a background thread, subscribes to `/camera/image/compressed`, `/ump/live`, `/ump2/live` and `/motor/live_counts`, and exposes a synchronous interface:
 
 ```python
 env = SensapexEnv(default_speed=100)
-obs = env.get_observation()      # SensapexObs(image_rgb, state=[x,y,z,d,h_ticks])
-env.step_absolute(action_5d)     # publishes /ump/target + /motor/target_counts
+obs = env.get_observation()      # SensapexObs(image_rgb, state=[x1,y1,z1,d1, x2,y2,z2,d2, h_ticks])
+env.step_absolute(action_9d)     # publishes /ump/target + /ump2/target + /motor/target_counts
 env.close()
 ```
 
@@ -128,9 +128,9 @@ env.close()
 1. Asks the user for an instruction.
 2. Each tick, grabs `(image, state)` from `SensapexEnv`.
 3. Whenever the open-loop chunk is exhausted, packages `image` (resized) + `state` + `prompt` and calls `policy_client.infer(...)` against the OpenPI websocket server.
-4. Pops the next 5-dim absolute action from the chunk and runs it through:
-   - `clamp_action_5d` — workspace safety box (`X_MIN/MAX`, `Y_MIN/MAX`, `Z_MIN/MAX`, `D_MIN/MAX`, `H_MIN/MAX`)
-   - `limit_step` — per-tick max delta on each axis (`MAX_DX/Y/Z/D/H`)
+4. Pops the next 9-dim absolute action from the chunk and runs it through:
+   - `clamp_action_9d` — per-stage workspace boxes (`X1_MIN/MAX`…`D1_MIN/MAX`, `X2_MIN/MAX`…`D2_MIN/MAX`, `H_MIN/MAX`)
+   - `limit_step` — per-tick max delta on each axis (`MAX_DX1/Y1/Z1/D1`, `MAX_DX2/Y2/Z2/D2`, `MAX_DH`)
    - optional first-order EMA smoothing (`USE_EMA_SMOOTHING`, `EMA_ALPHA`)
 5. Sends the result via `env.step_absolute(...)` and sleeps to hold `CONTROL_FREQUENCY_HZ` (default 3 Hz, matching the dataset).
 
