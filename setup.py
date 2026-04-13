@@ -29,6 +29,7 @@ setup(
         'console_scripts': [
             'gui_node = ump_suite.gui_node:main',
             'ump_driver_node = ump_suite.ump_driver_node:main',
+            'ump_dual_driver_node = ump_suite.ump_driver_node:main_dual',
             'odrive_driver_node = ump_suite.odrive_driver_node:main',
             'camera_node = ump_suite.camera_node:main',
             'logger_node = ump_suite.logger_node:main',

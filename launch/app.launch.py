@@ -20,20 +20,16 @@ CAMERA_BOOTSTRAP = (
 )
 
 
-def _ump_node(name, device_id, prefix):
-    return Node(
-        package="ump_suite",
-        executable="ump_driver_node",
-        name=name,
-        output="screen",
-        parameters=[{"device_id": device_id, "poll_ms": 50, "topic_prefix": prefix}],
-    )
-
-
 def generate_launch_description():
     return LaunchDescription([
-        _ump_node("ump_driver_node",  device_id=1, prefix="ump"),
-        _ump_node("ump2_driver_node", device_id=2, prefix="ump2"),
+        # Both UMP devices run in one process to share the Sensapex SDK
+        # singleton (UDP socket). Separate processes cause port conflicts
+        # and timeouts on the second device.
+        Node(
+            package="ump_suite",
+            executable="ump_dual_driver_node",
+            output="screen",
+        ),
 
         Node(
             package="ump_suite",

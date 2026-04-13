@@ -29,8 +29,8 @@ def center_to_device(v):
 
 
 class UMPDriverNode(Node):
-    def __init__(self):
-        super().__init__("ump_driver_node")
+    def __init__(self, node_name="ump_driver_node", *, parameter_overrides=None):
+        super().__init__(node_name, parameter_overrides=parameter_overrides or [])
 
         self.declare_parameter("device_id", 1)
         self.declare_parameter("poll_ms", 50)
@@ -98,4 +98,33 @@ def main():
         rclpy.spin(node)
     finally:
         node.destroy_node()
+        rclpy.shutdown()
+
+
+def main_dual():
+    """Run two UMP driver nodes in a single process so they share one SDK instance."""
+    rclpy.init()
+
+    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.parameter import Parameter
+
+    node1 = UMPDriverNode("ump_driver_node", parameter_overrides=[
+        Parameter("device_id", value=1),
+        Parameter("poll_ms", value=50),
+        Parameter("topic_prefix", value="ump"),
+    ])
+    node2 = UMPDriverNode("ump2_driver_node", parameter_overrides=[
+        Parameter("device_id", value=2),
+        Parameter("poll_ms", value=50),
+        Parameter("topic_prefix", value="ump2"),
+    ])
+
+    executor = MultiThreadedExecutor()
+    executor.add_node(node1)
+    executor.add_node(node2)
+    try:
+        executor.spin()
+    finally:
+        node1.destroy_node()
+        node2.destroy_node()
         rclpy.shutdown()
