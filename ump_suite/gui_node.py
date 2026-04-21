@@ -22,7 +22,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Int32, Int32MultiArray
+from std_msgs.msg import Bool, Int32, Int32MultiArray
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
@@ -33,6 +33,10 @@ from .ros_interfaces import (
     TOPIC_CAM_IMAGE_COMPRESSED,
     TOPIC_MOTOR_LIVE,
     TOPIC_MOTOR_TGT,
+    TOPIC_SOL1_CMD,
+    TOPIC_SOL1_STATE,
+    TOPIC_SOL2_CMD,
+    TOPIC_SOL2_STATE,
     TOPIC_UMP_LIVE,
     TOPIC_UMP_TARGET,
     TOPIC_UMP2_LIVE,
@@ -81,12 +85,16 @@ class GuiNode(Node):
         self.pub_ump_target  = self.create_publisher(Int32MultiArray, TOPIC_UMP_TARGET,  10)
         self.pub_ump2_target = self.create_publisher(Int32MultiArray, TOPIC_UMP2_TARGET, 10)
         self.pub_motor_tgt   = self.create_publisher(Int32,           TOPIC_MOTOR_TGT,   10)
+        self.pub_sol1_cmd    = self.create_publisher(Bool,            TOPIC_SOL1_CMD,    10)
+        self.pub_sol2_cmd    = self.create_publisher(Bool,            TOPIC_SOL2_CMD,    10)
 
         # Live state subscribers.
         self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE,   self._on_ump_live,   10)
         self.create_subscription(Int32MultiArray, TOPIC_UMP2_LIVE,  self._on_ump2_live,  10)
         self.create_subscription(Int32,           TOPIC_MOTOR_LIVE, self._on_motor_live, 10)
         self.create_subscription(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self._on_cam_image, 10)
+        self.create_subscription(Bool, TOPIC_SOL1_STATE, self._on_sol1_state, 10)
+        self.create_subscription(Bool, TOPIC_SOL2_STATE, self._on_sol2_state, 10)
 
         # Service clients.
         self.cli_acq_start = self.create_client(Trigger, SRV_ACQ_START)
@@ -99,6 +107,8 @@ class GuiNode(Node):
         self.latest_live_ump2 = [0, 0, 0, 0]
         self.latest_live_motor = 0
         self.latest_frame_bgr = None
+        self.latest_sol1_state = False
+        self.latest_sol2_state = False
 
     # ── Subscriber callbacks ───────────────────────────────────────────────
     def _on_ump_live(self, msg: Int32MultiArray):
@@ -111,6 +121,12 @@ class GuiNode(Node):
 
     def _on_motor_live(self, msg: Int32):
         self.latest_live_motor = int(msg.data)
+
+    def _on_sol1_state(self, msg: Bool):
+        self.latest_sol1_state = bool(msg.data)
+
+    def _on_sol2_state(self, msg: Bool):
+        self.latest_sol2_state = bool(msg.data)
 
     def _on_cam_image(self, msg: CompressedImage):
         try:
@@ -269,6 +285,9 @@ class UMPGuiApp:
         self.motor_target = IntVar(value=0)
         self.live_motor = StringVar(value="—")
 
+        self.sol1_state_text = StringVar(value="S1: —")
+        self.sol2_state_text = StringVar(value="S2: —")
+
         self._tkimg = None  # keep a ref so Tk doesn't garbage-collect the image
 
         self._build_ui()
@@ -308,22 +327,23 @@ class UMPGuiApp:
         )
         self._build_ump_frame(row=3, panel=self.panel2, title="UMP 2")
         self._build_motor_frame(row=4)
+        self._build_pressure_frame(row=5)
 
         ttk.Button(self.left, text="Start Data Acquisition", command=self._acq_start).grid(
-            row=5, column=0, sticky=W, pady=(4, 2)
+            row=6, column=0, sticky=W, pady=(4, 2)
         )
         ttk.Button(self.left, text="Stop Data Acquisition", command=self._acq_stop).grid(
-            row=6, column=0, sticky=W, pady=(2, 2)
+            row=7, column=0, sticky=W, pady=(2, 2)
         )
         ttk.Label(
             self.left,
             textvariable=self.acq_status,
             foreground="#006400",
             font=("Segoe UI", 10, "bold"),
-        ).grid(row=7, column=0, sticky=W, pady=(2, 4))
+        ).grid(row=8, column=0, sticky=W, pady=(2, 4))
 
         ttk.Label(self.left, textvariable=self.status, foreground="#333").grid(
-            row=8, column=0, sticky=W, pady=(4, 0)
+            row=9, column=0, sticky=W, pady=(4, 0)
         )
 
         # Camera preview on the right.
@@ -430,6 +450,37 @@ class UMPGuiApp:
         entry.bind("<FocusOut>", on_commit)
         entry.bind("<Return>", on_commit)
 
+    def _build_pressure_frame(self, row):
+        frame = ttk.LabelFrame(self.left, text="Pressure (Solenoids)", padding=8)
+        frame.grid(row=row, column=0, sticky=(N, S, E, W), pady=(0, 8))
+
+        ttk.Label(frame, text="Solenoid 1", width=10).grid(row=0, column=0, sticky=W)
+        ttk.Button(frame, text="ON",  command=lambda: self._set_solenoid(1, True)).grid(
+            row=0, column=1, padx=2, sticky=W
+        )
+        ttk.Button(frame, text="OFF", command=lambda: self._set_solenoid(1, False)).grid(
+            row=0, column=2, padx=2, sticky=W
+        )
+        ttk.Label(frame, textvariable=self.sol1_state_text, width=10, anchor="w").grid(
+            row=0, column=3, padx=(12, 0), sticky=W
+        )
+
+        ttk.Label(frame, text="Solenoid 2", width=10).grid(row=1, column=0, sticky=W, pady=(4, 0))
+        ttk.Button(frame, text="ON",  command=lambda: self._set_solenoid(2, True)).grid(
+            row=1, column=1, padx=2, pady=(4, 0), sticky=W
+        )
+        ttk.Button(frame, text="OFF", command=lambda: self._set_solenoid(2, False)).grid(
+            row=1, column=2, padx=2, pady=(4, 0), sticky=W
+        )
+        ttk.Label(frame, textvariable=self.sol2_state_text, width=10, anchor="w").grid(
+            row=1, column=3, padx=(12, 0), pady=(4, 0), sticky=W
+        )
+
+    def _set_solenoid(self, which, on):
+        pub = self.node.pub_sol1_cmd if which == 1 else self.node.pub_sol2_cmd
+        pub.publish(Bool(data=bool(on)))
+        self.status.set(f"Solenoid {which}: {'ON' if on else 'OFF'}")
+
     # ── Motor button actions ──────────────────────────────────────────────
     def _publish_motor_target(self):
         target = int(self.motor_target.get())
@@ -486,6 +537,8 @@ class UMPGuiApp:
         self.panel1.update_live_display()
         self.panel2.update_live_display()
         self.live_motor.set(f"{int(self.node.latest_live_motor):d}")
+        self.sol1_state_text.set(f"S1: {'ON' if self.node.latest_sol1_state else 'OFF'}")
+        self.sol2_state_text.set(f"S2: {'ON' if self.node.latest_sol2_state else 'OFF'}")
         self.root.after(LIVE_POLL_MS, self._poll_live_to_gui)
 
     def _update_camera_view(self):

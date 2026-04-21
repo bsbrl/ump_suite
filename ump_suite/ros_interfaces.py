@@ -12,6 +12,12 @@ TOPIC_UMP2_LIVE   = "/ump2/live"
 TOPIC_MOTOR_TGT  = "/motor/target_counts"   # Int32 absolute encoder counts
 TOPIC_MOTOR_LIVE = "/motor/live_counts"     # Int32 current counts
 
+# Pressure control (Arduino-driven solenoids)
+TOPIC_SOL1_CMD   = "/pressure/solenoid1/cmd"     # Bool: True=ON, False=OFF
+TOPIC_SOL2_CMD   = "/pressure/solenoid2/cmd"     # Bool: True=ON, False=OFF
+TOPIC_SOL1_STATE = "/pressure/solenoid1/state"   # Bool: echoed actual state
+TOPIC_SOL2_STATE = "/pressure/solenoid2/state"   # Bool: echoed actual state
+
 # Camera (Blackfly via PySpin)
 TOPIC_CAM_IMAGE_COMPRESSED = "/camera/image/compressed"   # CompressedImage (jpeg)
 TOPIC_CAM_FPS              = "/camera/fps"                # Float32

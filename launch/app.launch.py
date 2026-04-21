@@ -6,7 +6,8 @@ because PySpin needs the system Spinnaker libraries and a dedicated venv
 """
 
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -21,7 +22,15 @@ CAMERA_BOOTSTRAP = (
 
 
 def generate_launch_description():
+    pressure_port_arg = DeclareLaunchArgument(
+        "pressure_port",
+        default_value="/dev/ttyACM1",
+        description="Serial port for the pressure-control Arduino",
+    )
+
     return LaunchDescription([
+        pressure_port_arg,
+
         # Both UMP devices run in one process to share the Sensapex SDK
         # singleton (UDP socket). Separate processes cause port conflicts
         # and timeouts on the second device.
@@ -29,6 +38,16 @@ def generate_launch_description():
             package="ump_suite",
             executable="ump_dual_driver_node",
             output="screen",
+        ),
+
+        Node(
+            package="ump_suite",
+            executable="pressure_node",
+            output="screen",
+            parameters=[{
+                "port": LaunchConfiguration("pressure_port"),
+                "baud": 9600,
+            }],
         ),
 
         Node(

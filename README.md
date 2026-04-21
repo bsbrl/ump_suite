@@ -13,6 +13,7 @@ The package wraps every device behind a small ROS2 node, ships a Tk GUI for manu
 | Sensapex UMP (×2) | `sensapex` Python SDK + `libum.so` | [ump_driver_node.py](ump_suite/ump_driver_node.py) |
 | ODrive single-axis motor (focusing knob) | `odrive` Python SDK | [odrive_driver_node.py](ump_suite/odrive_driver_node.py) |
 | FLIR Blackfly S camera | PySpin (Spinnaker) | [camera_node.py](ump_suite/camera_node.py) |
+| Arduino + 2-channel relay (pressure solenoids) | `pyserial` | [pressure_node.py](ump_suite/pressure_node.py) |
 
 A copy of the Sensapex shared library used during development is bundled at [InstallationFiles/libum.so](InstallationFiles/libum.so).
 
@@ -28,6 +29,7 @@ ump_suite/
 │   ├── ump_driver_node.py       # Sensapex UMP driver (one per device)
 │   ├── odrive_driver_node.py    # ODrive height-stage driver
 │   ├── camera_node.py           # PySpin camera publisher + mp4 recorder
+│   ├── pressure_node.py         # Arduino serial bridge for pressure solenoids
 │   ├── logger_node.py           # CSV + frame + video dataset logger
 │   ├── gui_node.py              # Tk control panel
 │   ├── sensapex_env.py          # Synchronous ROS2 client used by VLA rollouts
@@ -49,6 +51,8 @@ All names live in [ros_interfaces.py](ump_suite/ros_interfaces.py).
 | `/camera/image/compressed` | `sensor_msgs/CompressedImage` | publish | JPEG preview from PySpin grabber |
 | `/camera/fps` | `std_msgs/Float32` | publish | Effective grabber FPS |
 | `/camera/record_cmd` | `std_msgs/String` | subscribe | Path = start mp4 recording, `""` = stop |
+| `/pressure/solenoid1/cmd`, `/pressure/solenoid2/cmd` | `std_msgs/Bool` | subscribe | `True` = energize relay, `False` = release |
+| `/pressure/solenoid1/state`, `/pressure/solenoid2/state` | `std_msgs/Bool` | publish | Echoed state from the Arduino after each command |
 | `/ump/calibrate_zero`, `/ump2/calibrate_zero` | `std_srvs/Trigger` | service | Calibrate zero at the current pose |
 | `/acq/start`, `/acq/stop` | `std_srvs/Trigger` | service | Begin / end a logged trial |
 
@@ -74,6 +78,17 @@ Recording is toggled by sending a path on `/camera/record_cmd` (empty string to 
 
 PySpin needs the system Spinnaker `.so` libraries plus a dedicated virtualenv, so the launch file starts the camera node via `ExecuteProcess` with the venv activated rather than as a normal `ament_python` executable. Edit the `CAMERA_BOOTSTRAP` string in [launch/app.launch.py](launch/app.launch.py) to match your setup.
 
+### `pressure_node`
+Talks to an Arduino (2-channel relay module, default active-LOW) over USB serial using `pyserial`. Subscribes to `/pressure/solenoid{1,2}/cmd` and writes `S11`/`S10`/`S21`/`S20` + newline, matching the firmware in [InstallationFiles/](InstallationFiles/) / the Arduino sketch on the device. A background reader thread parses the Arduino's `S1 ON/OFF` echoes and republishes them on `/pressure/solenoid{1,2}/state`. Both solenoids are released on shutdown.
+
+Parameters:
+
+| Name | Default | Notes |
+|---|---|---|
+| `port` | `/dev/ttyACM1` | Serial device. Override via launch arg `pressure_port:=/dev/ttyACM0`. |
+| `baud` | `9600` | Must match the Arduino sketch (`Serial.begin(9600)`). |
+| `reconnect_s` | `2.0` | Delay before retrying a closed port. |
+
 ### `logger_node`
 Builds a synchronized dataset:
 1. Subscribes to **live** topics (UMP1, UMP2, motor) and to **target** topics published by the GUI / policy.
@@ -95,7 +110,7 @@ image_path
 ```
 
 ### `gui_node`
-A Tkinter control panel split into a controls column and a live camera preview. Two `_UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D entries, ▲▼ bump buttons, axis step, speed, **Send Now**, **Home**, **Sync to Live**, **Calibrate Zero**), plus a row for the ODrive motor and Start / Stop buttons that call `/acq/start` and `/acq/stop`.
+A Tkinter control panel split into a controls column and a live camera preview. Two `_UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D entries, ▲▼ bump buttons, axis step, speed, **Send Now**, **Home**, **Sync to Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Solenoids)** frame with ON/OFF buttons and live state labels for each solenoid, and Start / Stop buttons that call `/acq/start` and `/acq/stop`.
 
 Keyboard shortcuts (UMP1 only):
 
@@ -177,6 +192,7 @@ The driver and rollout code import several non-`rosdep` packages:
 - `sensapex` — Sensapex Python SDK (point it at the bundled `libum.so` if needed)
 - `odrive` — ODrive Python SDK
 - `PySpin` — Spinnaker Python wheel (install into a dedicated venv, see below)
+- `pyserial` — Arduino pressure controller (`pip install pyserial` or `apt install python3-serial`)
 - `opencv-python`, `numpy`, `pillow`
 - `tyro`, `openpi-client` — only for the rollout scripts
 
@@ -200,7 +216,13 @@ Then update the `CAMERA_BOOTSTRAP` string at the top of [launch/app.launch.py](l
 ros2 launch ump_suite app.launch.py
 ```
 
-This starts both UMP drivers (`device_id=1` and `device_id=2`), the ODrive driver, the camera (via the bootstrap venv), the logger, and the GUI.
+This starts both UMP drivers (`device_id=1` and `device_id=2`), the ODrive driver, the camera (via the bootstrap venv), the pressure controller, the logger, and the GUI.
+
+Override the Arduino port if it enumerates somewhere other than `/dev/ttyACM1`:
+
+```bash
+ros2 launch ump_suite app.launch.py pressure_port:=/dev/ttyACM0
+```
 
 ### Collect a dataset trial
 
@@ -249,6 +271,7 @@ Defined in [setup.py](setup.py):
 | `ump_driver_node` | `ump_suite.ump_driver_node:main` |
 | `odrive_driver_node` | `ump_suite.odrive_driver_node:main` |
 | `camera_node` | `ump_suite.camera_node:main` |
+| `pressure_node` | `ump_suite.pressure_node:main` |
 | `logger_node` | `ump_suite.logger_node:main` |
 | `sensapex_rollout` | `ump_suite.main:main_entry` |
 
