@@ -18,7 +18,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Int32, Int32MultiArray, String
+from std_msgs.msg import Float32, Int32, Int32MultiArray, String
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
@@ -26,6 +26,7 @@ from .ros_interfaces import (
     SRV_ACQ_STOP,
     TOPIC_CAM_IMAGE_COMPRESSED,
     TOPIC_CAM_REC_CMD,
+    TOPIC_HEKA_RESISTANCE,
     TOPIC_MOTOR_LIVE,
     TOPIC_MOTOR_TGT,
     TOPIC_UMP_LIVE,
@@ -42,6 +43,7 @@ CSV_HEADER = [
     "current_x2", "current_y2", "current_z2", "current_d2",
     "target_x2",  "target_y2",  "target_z2",  "target_d2",
     "image_path",
+    "resistance_mohm",
 ]
 
 
@@ -62,6 +64,7 @@ class LoggerNode(Node):
         self.latest_live_ump2 = None
         self.latest_live_motor = None
         self.latest_image_msg = None
+        self.latest_resistance_mohm = None
 
         # Latest commanded target. These are *not* cleared after each tick:
         # if the user stops issuing commands, the most recent target keeps
@@ -92,6 +95,7 @@ class LoggerNode(Node):
         self.create_subscription(Int32,           TOPIC_MOTOR_TGT,   self.on_motor_target, 10)
 
         self.create_subscription(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self.on_img, 10)
+        self.create_subscription(Float32, TOPIC_HEKA_RESISTANCE, self.on_resistance, 10)
 
         self.pub_rec_cmd = self.create_publisher(String, TOPIC_CAM_REC_CMD, 10)
 
@@ -123,6 +127,9 @@ class LoggerNode(Node):
 
     def on_img(self, msg: CompressedImage):
         self.latest_image_msg = msg
+
+    def on_resistance(self, msg: Float32):
+        self.latest_resistance_mohm = float(msg.data)
 
     # ── Trial setup ────────────────────────────────────────────────────────
     def _setup_trial(self):
@@ -223,6 +230,11 @@ class LoggerNode(Node):
         tx,  ty,  tz,  td  = _xyzd(self.latest_target_ump)
         tx2, ty2, tz2, td2 = _xyzd(self.latest_target_ump2)
         tm = int(self.latest_target_motor) if self.latest_target_motor is not None else 0
+        resistance = (
+            float(self.latest_resistance_mohm)
+            if self.latest_resistance_mohm is not None
+            else ""
+        )
 
         image_path = self._save_current_frame()
 
@@ -233,6 +245,7 @@ class LoggerNode(Node):
             cx2, cy2, cz2, cd2,
             tx2, ty2, tz2, td2,
             image_path,
+            resistance,
         ])
         self.timestep += 1
 

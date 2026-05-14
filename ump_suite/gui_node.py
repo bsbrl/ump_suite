@@ -12,8 +12,11 @@ All commands are *absolute* targets. The arrow buttons and keys nudge the
 locally-stored target value by `axis_step` and then publish the full target.
 """
 
+import math
 import threading
+import time
 import tkinter as tk
+from collections import deque
 from tkinter import IntVar, StringVar, ttk
 from tkinter.constants import E, N, S, W
 
@@ -22,7 +25,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Bool, Int32, Int32MultiArray
+from std_msgs.msg import Bool, Float32, Int32, Int32MultiArray
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
@@ -31,6 +34,7 @@ from .ros_interfaces import (
     SRV_ZERO,
     SRV_ZERO2,
     TOPIC_CAM_IMAGE_COMPRESSED,
+    TOPIC_HEKA_RESISTANCE,
     TOPIC_MOTOR_LIVE,
     TOPIC_MOTOR_TGT,
     TOPIC_SOL1_CMD,
@@ -64,6 +68,8 @@ DEFAULT_MOTOR_STEP = 500
 LIVE_POLL_MS = 50
 SEND_THROTTLE_MS = 60
 CAM_UPDATE_MS = 30
+HEKA_PLOT_UPDATE_MS = 100
+HEKA_PLOT_WINDOW_S = 10.0
 
 CAM_TEXT = "Blackfly S Live"
 
@@ -81,6 +87,9 @@ class GuiNode(Node):
     def __init__(self):
         super().__init__("gui_node")
 
+        self._heka_lock = threading.Lock()
+        self.heka_resistance_history = deque()
+
         # Absolute target publishers (one per movable axis group).
         self.pub_ump_target  = self.create_publisher(Int32MultiArray, TOPIC_UMP_TARGET,  10)
         self.pub_ump2_target = self.create_publisher(Int32MultiArray, TOPIC_UMP2_TARGET, 10)
@@ -95,6 +104,7 @@ class GuiNode(Node):
         self.create_subscription(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self._on_cam_image, 10)
         self.create_subscription(Bool, TOPIC_SOL1_STATE, self._on_sol1_state, 10)
         self.create_subscription(Bool, TOPIC_SOL2_STATE, self._on_sol2_state, 10)
+        self.create_subscription(Float32, TOPIC_HEKA_RESISTANCE, self._on_heka_resistance, 10)
 
         # Service clients.
         self.cli_acq_start = self.create_client(Trigger, SRV_ACQ_START)
@@ -109,6 +119,7 @@ class GuiNode(Node):
         self.latest_frame_bgr = None
         self.latest_sol1_state = False
         self.latest_sol2_state = False
+        self.latest_heka_resistance = None
 
     # ── Subscriber callbacks ───────────────────────────────────────────────
     def _on_ump_live(self, msg: Int32MultiArray):
@@ -136,6 +147,35 @@ class GuiNode(Node):
                 self.latest_frame_bgr = frame
         except Exception:
             pass
+
+    def _on_heka_resistance(self, msg: Float32):
+        value = float(msg.data)
+        if not math.isfinite(value):
+            return
+
+        now = time.monotonic()
+        cutoff = now - HEKA_PLOT_WINDOW_S
+        with self._heka_lock:
+            self.latest_heka_resistance = value
+            self.heka_resistance_history.append((now, value))
+            while (
+                self.heka_resistance_history
+                and self.heka_resistance_history[0][0] < cutoff
+            ):
+                self.heka_resistance_history.popleft()
+
+    def get_heka_resistance_snapshot(self):
+        now = time.monotonic()
+        cutoff = now - HEKA_PLOT_WINDOW_S
+        with self._heka_lock:
+            while (
+                self.heka_resistance_history
+                and self.heka_resistance_history[0][0] < cutoff
+            ):
+                self.heka_resistance_history.popleft()
+            latest = self.latest_heka_resistance
+            points = list(self.heka_resistance_history)
+        return now, latest, points
 
     # ── Sync service call helper ───────────────────────────────────────────
     def call_trigger(self, client):
@@ -287,6 +327,7 @@ class UMPGuiApp:
 
         self.sol1_state_text = StringVar(value="S1: —")
         self.sol2_state_text = StringVar(value="S2: —")
+        self.heka_resistance_text = StringVar(value="Resistance: — MOhm")
 
         self._tkimg = None  # keep a ref so Tk doesn't garbage-collect the image
 
@@ -295,6 +336,7 @@ class UMPGuiApp:
 
         self.root.after(LIVE_POLL_MS, self._poll_live_to_gui)
         self.root.after(CAM_UPDATE_MS, self._update_camera_view)
+        self.root.after(HEKA_PLOT_UPDATE_MS, self._update_resistance_plot)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── Layout ─────────────────────────────────────────────────────────────
@@ -308,7 +350,8 @@ class UMPGuiApp:
 
         self.right = ttk.Frame(self.root, padding=6)
         self.right.grid(row=0, column=1, sticky=(N, S, E, W))
-        self.right.rowconfigure(1, weight=1)
+        self.right.rowconfigure(1, weight=3)
+        self.right.rowconfigure(3, weight=1)
         self.right.columnconfigure(0, weight=1)
 
         ttk.Label(
@@ -352,6 +395,20 @@ class UMPGuiApp:
         )
         self.cam_label = ttk.Label(self.right)
         self.cam_label.grid(row=1, column=0, sticky=(N, S, E, W))
+
+        ttk.Label(
+            self.right,
+            textvariable=self.heka_resistance_text,
+            font=("Segoe UI", 12, "bold"),
+        ).grid(row=2, column=0, sticky=W, pady=(10, 6))
+        self.heka_canvas = tk.Canvas(
+            self.right,
+            height=240,
+            background="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#b8c0cc",
+        )
+        self.heka_canvas.grid(row=3, column=0, sticky=(N, S, E, W))
 
     def _build_ump_frame(self, row, panel: _UmpPanel, title: str):
         frame = ttk.LabelFrame(self.left, text=title, padding=8)
@@ -547,8 +604,8 @@ class UMPGuiApp:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = PILImage.fromarray(frame_rgb)
 
-            w = self.right.winfo_width() or 640
-            h = max(50, (self.right.winfo_height() or 480) - 30)
+            w = self.cam_label.winfo_width() or self.right.winfo_width() or 640
+            h = max(50, self.cam_label.winfo_height() or 480)
 
             img = img.copy()
             img.thumbnail((w, h))
@@ -556,6 +613,127 @@ class UMPGuiApp:
             self.cam_label.configure(image=self._tkimg)
 
         self.root.after(CAM_UPDATE_MS, self._update_camera_view)
+
+    def _update_resistance_plot(self):
+        self._draw_resistance_plot()
+        self.root.after(HEKA_PLOT_UPDATE_MS, self._update_resistance_plot)
+
+    def _draw_resistance_plot(self):
+        canvas = self.heka_canvas
+        canvas.delete("all")
+
+        width = max(320, canvas.winfo_width())
+        height = max(180, canvas.winfo_height())
+        left, right, top, bottom = 72, 24, 20, 42
+        plot_w = max(1, width - left - right)
+        plot_h = max(1, height - top - bottom)
+
+        now, latest, points = self.node.get_heka_resistance_snapshot()
+        visible = [
+            (t, v)
+            for t, v in points
+            if 0.0 <= now - t <= HEKA_PLOT_WINDOW_S
+        ]
+
+        if latest is None:
+            self.heka_resistance_text.set("Resistance: — MOhm")
+        else:
+            self.heka_resistance_text.set(f"Resistance: {latest:.3f} MOhm")
+
+        if visible:
+            values = [v for _, v in visible]
+            ymin = min(values)
+            ymax = max(values)
+            if abs(ymax - ymin) < 1e-6:
+                pad = max(1.0, abs(ymax) * 0.05)
+            else:
+                pad = (ymax - ymin) * 0.12
+            ymin -= pad
+            ymax += pad
+        else:
+            ymin, ymax = 0.0, 1.0
+
+        def x_from_time(t):
+            age = now - t
+            return left + ((HEKA_PLOT_WINDOW_S - age) / HEKA_PLOT_WINDOW_S) * plot_w
+
+        def y_from_value(v):
+            return top + (1.0 - ((v - ymin) / (ymax - ymin))) * plot_h
+
+        grid_color = "#d6dbe3"
+        axis_color = "#222222"
+        text_color = "#333333"
+        line_color = "#0b6fb3"
+
+        for i in range(6):
+            frac = i / 5.0
+            x = left + frac * plot_w
+            canvas.create_line(x, top, x, top + plot_h, fill=grid_color)
+            seconds = int(round(HEKA_PLOT_WINDOW_S * (frac - 1.0)))
+            canvas.create_text(
+                x,
+                top + plot_h + 15,
+                text=str(seconds),
+                fill=text_color,
+                font=("Segoe UI", 9),
+            )
+
+        for i in range(5):
+            frac = i / 4.0
+            y = top + frac * plot_h
+            value = ymax - frac * (ymax - ymin)
+            canvas.create_line(left, y, left + plot_w, y, fill=grid_color)
+            canvas.create_text(
+                left - 8,
+                y,
+                text=f"{value:.2f}",
+                fill=text_color,
+                font=("Segoe UI", 9),
+                anchor="e",
+            )
+
+        canvas.create_line(left, top, left, top + plot_h, fill=axis_color, width=2)
+        canvas.create_line(
+            left,
+            top + plot_h,
+            left + plot_w,
+            top + plot_h,
+            fill=axis_color,
+            width=2,
+        )
+        canvas.create_text(
+            left + plot_w / 2,
+            height - 10,
+            text="Time (s)",
+            fill=text_color,
+            font=("Segoe UI", 10),
+        )
+        canvas.create_text(
+            16,
+            top + plot_h / 2,
+            text="Resistance (MOhm)",
+            fill=text_color,
+            font=("Segoe UI", 10),
+            angle=90,
+        )
+
+        if len(visible) >= 2:
+            coords = []
+            for t, v in visible:
+                coords.extend((x_from_time(t), y_from_value(v)))
+            canvas.create_line(*coords, fill=line_color, width=3, capstyle="round")
+        elif len(visible) == 1:
+            x = x_from_time(visible[0][0])
+            y = y_from_value(visible[0][1])
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=line_color, outline="")
+        else:
+            canvas.create_text(
+                left + plot_w / 2,
+                top + plot_h / 2,
+                text="Waiting for /heka/resistance_mohm",
+                fill="#6b7280",
+                font=("Segoe UI", 11),
+            )
 
     def _on_close(self):
         self.root.destroy()
