@@ -28,3 +28,7 @@ SRV_ACQ_START = "/acq/start"
 SRV_ACQ_STOP  = "/acq/stop"
 SRV_ZERO      = "/ump/calibrate_zero"
 SRV_ZERO2     = "/ump2/calibrate_zero"
+
+TOPIC_HEKA_RESISTANCE = "/heka/resistance_mohm"      # std_msgs/Float32
+TOPIC_HEKA_MONITOR_V = "/heka/monitor_v"            # std_msgs/Float32
+TOPIC_HEKA_MONITOR_STEP_V = "/heka/monitor_step_v"  # std_msgs/Float32

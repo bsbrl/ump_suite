@@ -76,4 +76,11 @@ def generate_launch_description():
             executable="gui_node",
             output="screen",
         ),
+
+        Node(
+            package="ump_suite",
+            executable="heka_udp_receiver_node",
+            output="screen",
+            parameters=[{"port": 5005}],
+        ),
     ])
