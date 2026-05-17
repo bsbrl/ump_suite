@@ -1,28 +1,46 @@
-"""Tk-based control panel for both Sensapex UMPs, the ODrive motor and the camera.
+"""
+Modern Qt control panel for the UMP suite.
 
-The window is split in two columns:
-  * left  – two UMP control panels, the motor row, and the data-acquisition controls
-  * right – the live camera preview
+The ROS surface is intentionally the same as the original Tk GUI:
+  * publishes absolute UMP1 / UMP2 targets
+  * publishes ODrive motor targets
+  * publishes solenoid commands
+  * subscribes to live robot, pressure, camera, and HEKA resistance topics
+  * calls acquisition and UMP zeroing services
 
-Two `_UmpPanel` instances handle UMP1 and UMP2; they encapsulate the per-stage
-Tk variables, publishers, and the small "send / bump / home / zero" actions.
-Keyboard shortcuts (WASD, arrows, comma/period) drive UMP1 only.
-
-All commands are *absolute* targets. The arrow buttons and keys nudge the
-locally-stored target value by `axis_step` and then publish the full target.
+Only the presentation layer changes. PyQt5 is used because it is available in
+the ROS environment on this machine and gives the app a more polished desktop
+feel without requiring a separate web server.
 """
 
 import math
+import sys
 import threading
 import time
-import tkinter as tk
 from collections import deque
-from tkinter import IntVar, StringVar, ttk
-from tkinter.constants import E, N, S, W
 
 import cv2
 import numpy as np
 import rclpy
+from PyQt5.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QFont, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QShortcut,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, Float32, Int32, Int32MultiArray
@@ -48,15 +66,6 @@ from .ros_interfaces import (
 )
 
 
-try:
-    from PIL import Image as PILImage
-    from PIL import ImageTk
-    PIL_AVAILABLE = True
-except Exception:
-    PIL_AVAILABLE = False
-
-
-# ── Limits & defaults ──────────────────────────────────────────────────────
 AXIS_MIN, AXIS_MAX = -10000, 10000
 SPEED_MIN, SPEED_MAX = 10, 2000
 MOTOR_MIN, MOTOR_MAX = -1_000_000, 1_000_000
@@ -71,16 +80,11 @@ CAM_UPDATE_MS = 30
 HEKA_PLOT_UPDATE_MS = 100
 HEKA_PLOT_WINDOW_S = 10.0
 
-CAM_TEXT = "Blackfly S Live"
-
 
 def clamp(v, vmin, vmax):
     return max(vmin, min(vmax, v))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ROS node
-# ─────────────────────────────────────────────────────────────────────────────
 class GuiNode(Node):
     """All ROS publishers/subscribers/clients used by the GUI."""
 
@@ -90,29 +94,35 @@ class GuiNode(Node):
         self._heka_lock = threading.Lock()
         self.heka_resistance_history = deque()
 
-        # Absolute target publishers (one per movable axis group).
-        self.pub_ump_target  = self.create_publisher(Int32MultiArray, TOPIC_UMP_TARGET,  10)
-        self.pub_ump2_target = self.create_publisher(Int32MultiArray, TOPIC_UMP2_TARGET, 10)
-        self.pub_motor_tgt   = self.create_publisher(Int32,           TOPIC_MOTOR_TGT,   10)
-        self.pub_sol1_cmd    = self.create_publisher(Bool,            TOPIC_SOL1_CMD,    10)
-        self.pub_sol2_cmd    = self.create_publisher(Bool,            TOPIC_SOL2_CMD,    10)
+        self.pub_ump_target = self.create_publisher(
+            Int32MultiArray, TOPIC_UMP_TARGET, 10
+        )
+        self.pub_ump2_target = self.create_publisher(
+            Int32MultiArray, TOPIC_UMP2_TARGET, 10
+        )
+        self.pub_motor_tgt = self.create_publisher(Int32, TOPIC_MOTOR_TGT, 10)
+        self.pub_sol1_cmd = self.create_publisher(Bool, TOPIC_SOL1_CMD, 10)
+        self.pub_sol2_cmd = self.create_publisher(Bool, TOPIC_SOL2_CMD, 10)
 
-        # Live state subscribers.
-        self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE,   self._on_ump_live,   10)
-        self.create_subscription(Int32MultiArray, TOPIC_UMP2_LIVE,  self._on_ump2_live,  10)
-        self.create_subscription(Int32,           TOPIC_MOTOR_LIVE, self._on_motor_live, 10)
-        self.create_subscription(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self._on_cam_image, 10)
+        self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE, self._on_ump_live, 10)
+        self.create_subscription(
+            Int32MultiArray, TOPIC_UMP2_LIVE, self._on_ump2_live, 10
+        )
+        self.create_subscription(Int32, TOPIC_MOTOR_LIVE, self._on_motor_live, 10)
+        self.create_subscription(
+            CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self._on_cam_image, 10
+        )
         self.create_subscription(Bool, TOPIC_SOL1_STATE, self._on_sol1_state, 10)
         self.create_subscription(Bool, TOPIC_SOL2_STATE, self._on_sol2_state, 10)
-        self.create_subscription(Float32, TOPIC_HEKA_RESISTANCE, self._on_heka_resistance, 10)
+        self.create_subscription(
+            Float32, TOPIC_HEKA_RESISTANCE, self._on_heka_resistance, 10
+        )
 
-        # Service clients.
         self.cli_acq_start = self.create_client(Trigger, SRV_ACQ_START)
-        self.cli_acq_stop  = self.create_client(Trigger, SRV_ACQ_STOP)
-        self.cli_zero      = self.create_client(Trigger, SRV_ZERO)
-        self.cli_zero2     = self.create_client(Trigger, SRV_ZERO2)
+        self.cli_acq_stop = self.create_client(Trigger, SRV_ACQ_STOP)
+        self.cli_zero = self.create_client(Trigger, SRV_ZERO)
+        self.cli_zero2 = self.create_client(Trigger, SRV_ZERO2)
 
-        # Latest values polled by the Tk main loop.
         self.latest_live_ump = [0, 0, 0, 0]
         self.latest_live_ump2 = [0, 0, 0, 0]
         self.latest_live_motor = 0
@@ -121,7 +131,6 @@ class GuiNode(Node):
         self.latest_sol2_state = False
         self.latest_heka_resistance = None
 
-    # ── Subscriber callbacks ───────────────────────────────────────────────
     def _on_ump_live(self, msg: Int32MultiArray):
         if len(msg.data) >= 4:
             self.latest_live_ump = [int(v) for v in msg.data[:4]]
@@ -177,468 +186,81 @@ class GuiNode(Node):
             points = list(self.heka_resistance_history)
         return now, latest, points
 
-    # ── Sync service call helper ───────────────────────────────────────────
     def call_trigger(self, client):
         if not client.wait_for_service(timeout_sec=1.0):
             return False, "service not available"
+
         fut = client.call_async(Trigger.Request())
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=2.0)
-        if fut.result() is None:
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not fut.done():
+            time.sleep(0.01)
+
+        if not fut.done() or fut.result() is None:
             return False, "no response"
         return bool(fut.result().success), str(fut.result().message)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-UMP panel
-# ─────────────────────────────────────────────────────────────────────────────
-class _UmpPanel:
-    """State + actions for one Sensapex UMP (UMP1 or UMP2).
+class StatusPill(QLabel):
+    """Small colored state badge used for solenoid and acquisition state."""
 
-    Owns its own Tk variables and the publisher it talks to. The `app`
-    reference is only used to update the shared status text and to schedule
-    throttled sends on the Tk root.
-    """
+    def __init__(self, text="--", parent=None):
+        super().__init__(text, parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumWidth(74)
+        self.set_on(False, text)
 
-    def __init__(
-        self,
-        app,
-        *,
-        label,
-        pub_target,
-        zero_client,
-        live_getter,
-    ):
-        self.app = app
-        self.label = label
-        self.pub_target = pub_target
-        self.zero_client = zero_client
-        self._live_getter = live_getter  # () -> [x, y, z, d]
-
-        self.axis_step = IntVar(value=DEFAULT_AXIS_STEP)
-        self.speed = IntVar(value=DEFAULT_SPEED)
-
-        self.x = IntVar(value=0)
-        self.y = IntVar(value=0)
-        self.z = IntVar(value=0)
-        self.d = IntVar(value=0)
-
-        self.live_x = StringVar(value="—")
-        self.live_y = StringVar(value="—")
-        self.live_z = StringVar(value="—")
-        self.live_d = StringVar(value="—")
-
-        self._send_job_id = None
-
-    # Order matches the on-screen rows. Used by the layout helpers.
-    def axis_iter(self):
-        return (
-            ("X", self.x, self.live_x),
-            ("Y", self.y, self.live_y),
-            ("Z", self.z, self.live_z),
-            ("D", self.d, self.live_d),
+    def set_on(self, on, text):
+        bg = "#dcfce7" if on else "#f1f5f9"
+        fg = "#166534" if on else "#475569"
+        border = "#86efac" if on else "#cbd5e1"
+        self.setText(text)
+        self.setStyleSheet(
+            f"""
+            QLabel {{
+                color: {fg};
+                background: {bg};
+                border: 1px solid {border};
+                border-radius: 12px;
+                padding: 3px 8px;
+                font-weight: 700;
+            }}
+            """
         )
 
-    def _resolved_speed(self):
-        """Clamp the speed entry, push it back to the var, and return it."""
-        speed = clamp(int(self.speed.get()), SPEED_MIN, SPEED_MAX)
-        self.speed.set(speed)
-        return speed
 
-    def _axis_var(self, axis_name):
-        return {"X": self.x, "Y": self.y, "Z": self.z, "D": self.d}[axis_name]
+class HekaPlot(QWidget):
+    """Lightweight rolling resistance plot drawn with QPainter."""
 
-    def bump_axis(self, axis_name, sign):
-        """Increment the local target by ±step on one axis, then publish."""
-        var = self._axis_var(axis_name)
-        new_val = clamp(int(var.get()) + sign * int(self.axis_step.get()), AXIS_MIN, AXIS_MAX)
-        var.set(new_val)
-        self.send_now()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.now = time.monotonic()
+        self.latest = None
+        self.points = []
+        self.setMinimumHeight(180)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-    def send_now(self):
-        self._send_job_id = None
-        x, y, z, d = (int(v.get()) for v in (self.x, self.y, self.z, self.d))
-        speed = self._resolved_speed()
+    def set_data(self, now, latest, points):
+        self.now = now
+        self.latest = latest
+        self.points = points
+        self.update()
 
-        msg = Int32MultiArray()
-        msg.data = [x, y, z, d, speed]
-        self.pub_target.publish(msg)
-        self.app.status.set(f"{self.label} target: X={x}, Y={y}, Z={z}, D={d} @ {speed}")
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), Qt.white)
 
-    def schedule_send(self):
-        # Coalesce rapid entry-box edits into one publish per SEND_THROTTLE_MS.
-        if self._send_job_id is None:
-            self._send_job_id = self.app.root.after(SEND_THROTTLE_MS, self.send_now)
-
-    def home(self):
-        for v in (self.x, self.y, self.z, self.d):
-            v.set(0)
-        self.send_now()
-
-    def sync_to_live(self):
-        lx, ly, lz, ld = self._live_getter()
-        self.x.set(lx); self.y.set(ly); self.z.set(lz); self.d.set(ld)
-        self.app.status.set(f"{self.label} targets synced to live.")
-
-    def update_live_display(self):
-        lx, ly, lz, ld = self._live_getter()
-        self.live_x.set(f"{lx:d}")
-        self.live_y.set(f"{ly:d}")
-        self.live_z.set(f"{lz:d}")
-        self.live_d.set(f"{ld:d}")
-
-    def calibrate_zero(self):
-        ok, msg = self.app.node.call_trigger(self.zero_client)
-        self.app.status.set(f"{self.label} Zero: {ok} ({msg})")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tk application
-# ─────────────────────────────────────────────────────────────────────────────
-class UMPGuiApp:
-    def __init__(self, node: GuiNode):
-        self.node = node
-
-        self.root = tk.Tk()
-        self.root.title("Sensapex UMP1 + UMP2 + Blackfly S + ODrive (ROS2)")
-        self.root.geometry("1200x950")
-
-        self.status = StringVar(value="Ready")
-        self.acq_status = StringVar(value="Data acquisition: STOPPED")
-
-        self.panel1 = _UmpPanel(
-            self,
-            label="UMP1",
-            pub_target=node.pub_ump_target,
-            zero_client=node.cli_zero,
-            live_getter=lambda: node.latest_live_ump,
-        )
-        self.panel2 = _UmpPanel(
-            self,
-            label="UMP2",
-            pub_target=node.pub_ump2_target,
-            zero_client=node.cli_zero2,
-            live_getter=lambda: node.latest_live_ump2,
-        )
-
-        # Motor / shared widgets.
-        self.motor_step = IntVar(value=DEFAULT_MOTOR_STEP)
-        self.motor_target = IntVar(value=0)
-        self.live_motor = StringVar(value="—")
-
-        self.sol1_state_text = StringVar(value="S1: —")
-        self.sol2_state_text = StringVar(value="S2: —")
-        self.heka_resistance_text = StringVar(value="Resistance: — MOhm")
-
-        self._tkimg = None  # keep a ref so Tk doesn't garbage-collect the image
-
-        self._build_ui()
-        self._bind_keys()
-
-        self.root.after(LIVE_POLL_MS, self._poll_live_to_gui)
-        self.root.after(CAM_UPDATE_MS, self._update_camera_view)
-        self.root.after(HEKA_PLOT_UPDATE_MS, self._update_resistance_plot)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    # ── Layout ─────────────────────────────────────────────────────────────
-    def _build_ui(self):
-        self.root.columnconfigure(0, weight=0)
-        self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(0, weight=1)
-
-        self.left = ttk.Frame(self.root, padding=12)
-        self.left.grid(row=0, column=0, sticky=(N, S, E, W))
-
-        self.right = ttk.Frame(self.root, padding=6)
-        self.right.grid(row=0, column=1, sticky=(N, S, E, W))
-        self.right.rowconfigure(1, weight=3)
-        self.right.rowconfigure(3, weight=1)
-        self.right.columnconfigure(0, weight=1)
-
-        ttk.Label(
-            self.left,
-            text="Sensapex UMP1 + UMP2 + ODrive Controller",
-            font=("Segoe UI", 14, "bold"),
-        ).grid(row=0, column=0, sticky=W, pady=(0, 8))
-        ttk.Label(
-            self.left,
-            text="Buttons/keys nudge the target by 'Axis step'. All commands are absolute.",
-            foreground="#555",
-        ).grid(row=1, column=0, sticky=W, pady=(0, 6))
-
-        self._build_ump_frame(
-            row=2, panel=self.panel1, title="UMP 1  (keys: WASD / arrows / <> )"
-        )
-        self._build_ump_frame(row=3, panel=self.panel2, title="UMP 2")
-        self._build_motor_frame(row=4)
-        self._build_pressure_frame(row=5)
-
-        ttk.Button(self.left, text="Start Data Acquisition", command=self._acq_start).grid(
-            row=6, column=0, sticky=W, pady=(4, 2)
-        )
-        ttk.Button(self.left, text="Stop Data Acquisition", command=self._acq_stop).grid(
-            row=7, column=0, sticky=W, pady=(2, 2)
-        )
-        ttk.Label(
-            self.left,
-            textvariable=self.acq_status,
-            foreground="#006400",
-            font=("Segoe UI", 10, "bold"),
-        ).grid(row=8, column=0, sticky=W, pady=(2, 4))
-
-        ttk.Label(self.left, textvariable=self.status, foreground="#333").grid(
-            row=9, column=0, sticky=W, pady=(4, 0)
-        )
-
-        # Camera preview on the right.
-        ttk.Label(self.right, text=CAM_TEXT, font=("Segoe UI", 12, "bold")).grid(
-            row=0, column=0, sticky=W, pady=(0, 6)
-        )
-        self.cam_label = ttk.Label(self.right)
-        self.cam_label.grid(row=1, column=0, sticky=(N, S, E, W))
-
-        ttk.Label(
-            self.right,
-            textvariable=self.heka_resistance_text,
-            font=("Segoe UI", 12, "bold"),
-        ).grid(row=2, column=0, sticky=W, pady=(10, 6))
-        self.heka_canvas = tk.Canvas(
-            self.right,
-            height=240,
-            background="#ffffff",
-            highlightthickness=1,
-            highlightbackground="#b8c0cc",
-        )
-        self.heka_canvas.grid(row=3, column=0, sticky=(N, S, E, W))
-
-    def _build_ump_frame(self, row, panel: _UmpPanel, title: str):
-        frame = ttk.LabelFrame(self.left, text=title, padding=8)
-        frame.grid(row=row, column=0, sticky=(N, S, E, W), pady=(0, 8))
-
-        ttk.Label(frame, text="Axis step:").grid(row=0, column=0, sticky=W)
-        ttk.Entry(frame, width=7, textvariable=panel.axis_step, justify="right").grid(
-            row=0, column=1, sticky=W, padx=(4, 12)
-        )
-        ttk.Label(frame, text="Speed:").grid(row=0, column=2, sticky=W)
-        ttk.Entry(frame, width=7, textvariable=panel.speed, justify="right").grid(
-            row=0, column=3, sticky=W, padx=(4, 0)
-        )
-
-        ttk.Label(frame, text="Target (absolute)", font=("Segoe UI", 9, "bold")).grid(
-            row=1, column=3, sticky=W, pady=(4, 0)
-        )
-        ttk.Label(frame, text="Live", font=("Segoe UI", 9, "bold")).grid(
-            row=1, column=4, sticky=W, pady=(4, 0)
-        )
-
-        for i, (axis_name, var, live_var) in enumerate(panel.axis_iter()):
-            self._build_axis_row(frame, row=2 + i, panel=panel, axis_name=axis_name,
-                                 var=var, live_var=live_var)
-
-        ttk.Button(frame, text="Send Now", command=panel.send_now).grid(
-            row=6, column=0, sticky=W, pady=(8, 0)
-        )
-        ttk.Button(frame, text="Home (0,0,0,0)", command=panel.home).grid(
-            row=6, column=1, sticky=W, pady=(8, 0)
-        )
-        ttk.Button(frame, text="Sync to Live", command=panel.sync_to_live).grid(
-            row=6, column=2, sticky=W, pady=(8, 0)
-        )
-        ttk.Button(frame, text="Calibrate Zero", command=panel.calibrate_zero).grid(
-            row=6, column=3, sticky=W, pady=(8, 0)
-        )
-
-    def _build_axis_row(self, parent, *, row, panel, axis_name, var, live_var):
-        ttk.Label(parent, text=axis_name, width=8).grid(row=row, column=0, padx=(0, 6), sticky=W)
-        ttk.Button(parent, text="▲", command=lambda: panel.bump_axis(axis_name, +1)).grid(
-            row=row, column=1, padx=2, sticky=W
-        )
-        ttk.Button(parent, text="▼", command=lambda: panel.bump_axis(axis_name, -1)).grid(
-            row=row, column=2, padx=2, sticky=W
-        )
-
-        entry = ttk.Entry(parent, width=10, textvariable=var, justify="right")
-        entry.grid(row=row, column=3, padx=(6, 6), sticky=W)
-        ttk.Label(parent, textvariable=live_var, width=12, anchor="e").grid(
-            row=row, column=4, padx=(12, 0), sticky=W
-        )
-
-        def on_commit(_e=None):
-            try:
-                v = int(var.get())
-            except Exception:
-                v = 0
-            var.set(clamp(v, AXIS_MIN, AXIS_MAX))
-            panel.schedule_send()
-
-        entry.bind("<FocusOut>", on_commit)
-        entry.bind("<Return>", on_commit)
-
-    def _build_motor_frame(self, row):
-        frame = ttk.LabelFrame(self.left, text="Motor (ODrive)", padding=8)
-        frame.grid(row=row, column=0, sticky=(N, S, E, W), pady=(0, 8))
-
-        ttk.Label(frame, text="Motor step:").grid(row=0, column=0, sticky=W)
-        ttk.Entry(frame, width=8, textvariable=self.motor_step, justify="right").grid(
-            row=0, column=1, sticky=W, padx=(4, 0)
-        )
-
-        ttk.Label(frame, text="Motor", width=8).grid(row=1, column=0, padx=(0, 6), sticky=W)
-        ttk.Button(frame, text="▲", command=lambda: self._bump_motor(+1)).grid(
-            row=1, column=1, padx=2, sticky=W
-        )
-        ttk.Button(frame, text="▼", command=lambda: self._bump_motor(-1)).grid(
-            row=1, column=2, padx=2, sticky=W
-        )
-
-        entry = ttk.Entry(frame, width=10, textvariable=self.motor_target, justify="right")
-        entry.grid(row=1, column=3, padx=(6, 6), sticky=W)
-        ttk.Label(frame, textvariable=self.live_motor, width=12, anchor="e").grid(
-            row=1, column=4, padx=(12, 0), sticky=W
-        )
-
-        def on_commit(_e=None):
-            try:
-                v = int(self.motor_target.get())
-            except Exception:
-                v = 0
-            self.motor_target.set(clamp(v, MOTOR_MIN, MOTOR_MAX))
-            self._publish_motor_target()
-
-        entry.bind("<FocusOut>", on_commit)
-        entry.bind("<Return>", on_commit)
-
-    def _build_pressure_frame(self, row):
-        frame = ttk.LabelFrame(self.left, text="Pressure (Solenoids)", padding=8)
-        frame.grid(row=row, column=0, sticky=(N, S, E, W), pady=(0, 8))
-
-        ttk.Label(frame, text="Solenoid 1", width=10).grid(row=0, column=0, sticky=W)
-        ttk.Button(frame, text="ON",  command=lambda: self._set_solenoid(1, True)).grid(
-            row=0, column=1, padx=2, sticky=W
-        )
-        ttk.Button(frame, text="OFF", command=lambda: self._set_solenoid(1, False)).grid(
-            row=0, column=2, padx=2, sticky=W
-        )
-        ttk.Label(frame, textvariable=self.sol1_state_text, width=10, anchor="w").grid(
-            row=0, column=3, padx=(12, 0), sticky=W
-        )
-
-        ttk.Label(frame, text="Solenoid 2", width=10).grid(row=1, column=0, sticky=W, pady=(4, 0))
-        ttk.Button(frame, text="ON",  command=lambda: self._set_solenoid(2, True)).grid(
-            row=1, column=1, padx=2, pady=(4, 0), sticky=W
-        )
-        ttk.Button(frame, text="OFF", command=lambda: self._set_solenoid(2, False)).grid(
-            row=1, column=2, padx=2, pady=(4, 0), sticky=W
-        )
-        ttk.Label(frame, textvariable=self.sol2_state_text, width=10, anchor="w").grid(
-            row=1, column=3, padx=(12, 0), pady=(4, 0), sticky=W
-        )
-
-    def _set_solenoid(self, which, on):
-        pub = self.node.pub_sol1_cmd if which == 1 else self.node.pub_sol2_cmd
-        pub.publish(Bool(data=bool(on)))
-        self.status.set(f"Solenoid {which}: {'ON' if on else 'OFF'}")
-
-    # ── Motor button actions ──────────────────────────────────────────────
-    def _publish_motor_target(self):
-        target = int(self.motor_target.get())
-        self.node.pub_motor_tgt.publish(Int32(data=target))
-        self.status.set(f"Motor target: {target}")
-
-    def _bump_motor(self, sign):
-        new_val = clamp(
-            int(self.motor_target.get()) + sign * int(self.motor_step.get()),
-            MOTOR_MIN, MOTOR_MAX,
-        )
-        self.motor_target.set(new_val)
-        self._publish_motor_target()
-
-    # ── Keyboard shortcuts (UMP1 only) ─────────────────────────────────────
-    def _bind_keys(self):
-        self.root.bind_all("<KeyPress>", self._on_key_press)
-
-    _KEY_BINDINGS = {
-        "up":      ("Z", +1),
-        "down":    ("Z", -1),
-        "a":       ("X", -1),
-        "d":       ("X", +1),
-        "s":       ("Y", -1),
-        "w":       ("Y", +1),
-        "less":    ("D", -1),
-        "comma":   ("D", -1),
-        "greater": ("D", +1),
-        "period":  ("D", +1),
-    }
-
-    def _on_key_press(self, event):
-        ks = (event.keysym or "").lower()
-        binding = self._KEY_BINDINGS.get(ks)
-        if binding is not None:
-            axis, sign = binding
-            self.panel1.bump_axis(axis, sign)
-
-    # ── Acquisition service buttons ────────────────────────────────────────
-    def _acq_start(self):
-        ok, msg = self.node.call_trigger(self.node.cli_acq_start)
-        self.acq_status.set(
-            "Data acquisition: RUNNING" if ok else "Data acquisition: START FAILED"
-        )
-        self.status.set(f"Acq start: {ok} ({msg})")
-
-    def _acq_stop(self):
-        ok, msg = self.node.call_trigger(self.node.cli_acq_stop)
-        self.acq_status.set("Data acquisition: STOPPED")
-        self.status.set(f"Acq stop: {ok} ({msg})")
-
-    # ── Periodic Tk callbacks ──────────────────────────────────────────────
-    def _poll_live_to_gui(self):
-        self.panel1.update_live_display()
-        self.panel2.update_live_display()
-        self.live_motor.set(f"{int(self.node.latest_live_motor):d}")
-        self.sol1_state_text.set(f"S1: {'ON' if self.node.latest_sol1_state else 'OFF'}")
-        self.sol2_state_text.set(f"S2: {'ON' if self.node.latest_sol2_state else 'OFF'}")
-        self.root.after(LIVE_POLL_MS, self._poll_live_to_gui)
-
-    def _update_camera_view(self):
-        frame = self.node.latest_frame_bgr
-        if frame is not None and PIL_AVAILABLE:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = PILImage.fromarray(frame_rgb)
-
-            w = self.cam_label.winfo_width() or self.right.winfo_width() or 640
-            h = max(50, self.cam_label.winfo_height() or 480)
-
-            img = img.copy()
-            img.thumbnail((w, h))
-            self._tkimg = ImageTk.PhotoImage(img)
-            self.cam_label.configure(image=self._tkimg)
-
-        self.root.after(CAM_UPDATE_MS, self._update_camera_view)
-
-    def _update_resistance_plot(self):
-        self._draw_resistance_plot()
-        self.root.after(HEKA_PLOT_UPDATE_MS, self._update_resistance_plot)
-
-    def _draw_resistance_plot(self):
-        canvas = self.heka_canvas
-        canvas.delete("all")
-
-        width = max(320, canvas.winfo_width())
-        height = max(180, canvas.winfo_height())
+        width = max(320, self.width())
+        height = max(180, self.height())
         left, right, top, bottom = 72, 24, 20, 42
         plot_w = max(1, width - left - right)
         plot_h = max(1, height - top - bottom)
 
-        now, latest, points = self.node.get_heka_resistance_snapshot()
         visible = [
             (t, v)
-            for t, v in points
-            if 0.0 <= now - t <= HEKA_PLOT_WINDOW_S
+            for t, v in self.points
+            if 0.0 <= self.now - t <= HEKA_PLOT_WINDOW_S
         ]
-
-        if latest is None:
-            self.heka_resistance_text.set("Resistance: — MOhm")
-        else:
-            self.heka_resistance_text.set(f"Resistance: {latest:.3f} MOhm")
 
         if visible:
             values = [v for _, v in visible]
@@ -654,100 +276,719 @@ class UMPGuiApp:
             ymin, ymax = 0.0, 1.0
 
         def x_from_time(t):
-            age = now - t
+            age = self.now - t
             return left + ((HEKA_PLOT_WINDOW_S - age) / HEKA_PLOT_WINDOW_S) * plot_w
 
         def y_from_value(v):
             return top + (1.0 - ((v - ymin) / (ymax - ymin))) * plot_h
 
-        grid_color = "#d6dbe3"
-        axis_color = "#222222"
-        text_color = "#333333"
-        line_color = "#0b6fb3"
+        grid = QPen(Qt.GlobalColor.lightGray)
+        grid.setColor(Qt.GlobalColor.lightGray)
+        axis = QPen(Qt.GlobalColor.black, 2)
+        line = QPen(Qt.GlobalColor.blue, 3)
+        line.setColor(Qt.GlobalColor.darkCyan)
 
+        painter.setPen(grid)
         for i in range(6):
             frac = i / 5.0
             x = left + frac * plot_w
-            canvas.create_line(x, top, x, top + plot_h, fill=grid_color)
+            painter.drawLine(int(x), top, int(x), top + plot_h)
             seconds = int(round(HEKA_PLOT_WINDOW_S * (frac - 1.0)))
-            canvas.create_text(
-                x,
-                top + plot_h + 15,
-                text=str(seconds),
-                fill=text_color,
-                font=("Segoe UI", 9),
-            )
+            painter.setPen(Qt.GlobalColor.darkGray)
+            painter.drawText(int(x - 14), top + plot_h + 24, 36, 16, Qt.AlignCenter, str(seconds))
+            painter.setPen(grid)
 
         for i in range(5):
             frac = i / 4.0
             y = top + frac * plot_h
             value = ymax - frac * (ymax - ymin)
-            canvas.create_line(left, y, left + plot_w, y, fill=grid_color)
-            canvas.create_text(
-                left - 8,
-                y,
-                text=f"{value:.2f}",
-                fill=text_color,
-                font=("Segoe UI", 9),
-                anchor="e",
-            )
+            painter.drawLine(left, int(y), left + plot_w, int(y))
+            painter.setPen(Qt.GlobalColor.darkGray)
+            painter.drawText(6, int(y - 8), left - 14, 16, Qt.AlignRight, f"{value:.2f}")
+            painter.setPen(grid)
 
-        canvas.create_line(left, top, left, top + plot_h, fill=axis_color, width=2)
-        canvas.create_line(
-            left,
-            top + plot_h,
-            left + plot_w,
-            top + plot_h,
-            fill=axis_color,
-            width=2,
-        )
-        canvas.create_text(
-            left + plot_w / 2,
-            height - 10,
-            text="Time (s)",
-            fill=text_color,
-            font=("Segoe UI", 10),
-        )
-        canvas.create_text(
-            16,
-            top + plot_h / 2,
-            text="Resistance (MOhm)",
-            fill=text_color,
-            font=("Segoe UI", 10),
-            angle=90,
-        )
+        painter.setPen(axis)
+        painter.drawLine(left, top, left, top + plot_h)
+        painter.drawLine(left, top + plot_h, left + plot_w, top + plot_h)
+
+        painter.setPen(Qt.GlobalColor.darkGray)
+        painter.drawText(left, height - 24, plot_w, 18, Qt.AlignCenter, "Time (s)")
+        painter.drawText(left + 4, 2, 80, 16, Qt.AlignLeft, "MOhm")
 
         if len(visible) >= 2:
-            coords = []
-            for t, v in visible:
-                coords.extend((x_from_time(t), y_from_value(v)))
-            canvas.create_line(*coords, fill=line_color, width=3, capstyle="round")
+            painter.setPen(line)
+            for i in range(len(visible) - 1):
+                x1, y1 = x_from_time(visible[i][0]), y_from_value(visible[i][1])
+                x2, y2 = x_from_time(visible[i + 1][0]), y_from_value(visible[i + 1][1])
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
         elif len(visible) == 1:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(Qt.GlobalColor.darkCyan)
             x = x_from_time(visible[0][0])
             y = y_from_value(visible[0][1])
-            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=line_color, outline="")
+            painter.drawEllipse(int(x - 4), int(y - 4), 8, 8)
         else:
-            canvas.create_text(
-                left + plot_w / 2,
-                top + plot_h / 2,
-                text="Waiting for /heka/resistance_mohm",
-                fill="#6b7280",
-                font=("Segoe UI", 11),
+            painter.setPen(Qt.GlobalColor.darkGray)
+            painter.drawText(
+                left,
+                top,
+                plot_w,
+                plot_h,
+                Qt.AlignCenter,
+                "Waiting for /heka/resistance_mohm",
             )
 
-    def _on_close(self):
-        self.root.destroy()
+
+class KeyRouter(QObject):
+    """Global key handler for UMP1 shortcuts."""
+
+    bump = pyqtSignal(str, int)
+
+    KEY_BINDINGS = {
+        Qt.Key_Up: ("Z", +1),
+        Qt.Key_Down: ("Z", -1),
+        Qt.Key_A: ("X", -1),
+        Qt.Key_D: ("X", +1),
+        Qt.Key_S: ("Y", -1),
+        Qt.Key_W: ("Y", +1),
+        Qt.Key_Comma: ("D", -1),
+        Qt.Key_Less: ("D", -1),
+        Qt.Key_Period: ("D", +1),
+        Qt.Key_Greater: ("D", +1),
+    }
+
+    def eventFilter(self, _obj, event):
+        if event.type() != QEvent.KeyPress:
+            return False
+        binding = self.KEY_BINDINGS.get(event.key())
+        if binding is None:
+            return False
+        axis, sign = binding
+        self.bump.emit(axis, sign)
+        return True
+
+
+class UmpPanel(QGroupBox):
+    """Qt controls for one Sensapex UMP."""
+
+    def __init__(self, app, *, label, pub_target, zero_client, live_getter, subtitle):
+        super().__init__(label)
+        self.app = app
+        self.label = label
+        self.pub_target = pub_target
+        self.zero_client = zero_client
+        self._live_getter = live_getter
+        self._updating = False
+
+        self.axis_step = self._spin(DEFAULT_AXIS_STEP, 1, 5000)
+        self.speed = self._spin(DEFAULT_SPEED, SPEED_MIN, SPEED_MAX)
+        self.target_spins = {
+            "X": self._spin(0, AXIS_MIN, AXIS_MAX),
+            "Y": self._spin(0, AXIS_MIN, AXIS_MAX),
+            "Z": self._spin(0, AXIS_MIN, AXIS_MAX),
+            "D": self._spin(0, AXIS_MIN, AXIS_MAX),
+        }
+        self.live_labels = {axis: QLabel("--") for axis in self.target_spins}
+
+        self._send_timer = QTimer(self)
+        self._send_timer.setSingleShot(True)
+        self._send_timer.timeout.connect(self.send_now)
+
+        self._build(subtitle)
+
+    @staticmethod
+    def _spin(value, vmin, vmax):
+        spin = QSpinBox()
+        spin.setRange(vmin, vmax)
+        spin.setValue(value)
+        spin.setKeyboardTracking(False)
+        spin.setAlignment(Qt.AlignRight)
+        spin.setButtonSymbols(QSpinBox.NoButtons)
+        spin.setFixedHeight(28)
+        spin.setMaximumWidth(92)
+        return spin
+
+    def _build(self, subtitle):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(5)
+
+        if subtitle:
+            sub = QLabel(subtitle)
+            sub.setObjectName("hint")
+            layout.addWidget(sub)
+
+        top = QGridLayout()
+        top.setHorizontalSpacing(7)
+        top.setVerticalSpacing(4)
+        top.addWidget(QLabel("Axis step"), 0, 0)
+        top.addWidget(self.axis_step, 0, 1)
+        top.addWidget(QLabel("Speed"), 0, 2)
+        top.addWidget(self.speed, 0, 3)
+        layout.addLayout(top)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+        grid.addWidget(QLabel("Axis"), 0, 0)
+        grid.addWidget(QLabel("Nudge"), 0, 1, 1, 2)
+        grid.addWidget(QLabel("Target"), 0, 3)
+        grid.addWidget(QLabel("Live"), 0, 4)
+
+        for row, axis in enumerate(("X", "Y", "Z", "D"), start=1):
+            live = self.live_labels[axis]
+            live.setObjectName("liveValue")
+            live.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            live.setMinimumWidth(72)
+
+            up = self._tool_button("+", lambda _checked=False, a=axis: self.bump_axis(a, +1))
+            down = self._tool_button("-", lambda _checked=False, a=axis: self.bump_axis(a, -1))
+
+            grid.addWidget(QLabel(axis), row, 0)
+            grid.addWidget(up, row, 1)
+            grid.addWidget(down, row, 2)
+            grid.addWidget(self.target_spins[axis], row, 3)
+            grid.addWidget(live, row, 4)
+            self.target_spins[axis].editingFinished.connect(self.schedule_send)
+
+        layout.addLayout(grid)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        commands = (
+            ("Send", "Send Now", self.send_now, "primary"),
+            ("Home", "Home (0,0,0,0)", self.home, "secondary"),
+            ("Sync", "Sync to Live", self.sync_to_live, "secondary"),
+            ("Zero", "Calibrate Zero", self.calibrate_zero, "secondary"),
+        )
+        for text, tooltip, slot, kind in commands:
+            btn = QPushButton(text)
+            btn.setToolTip(tooltip)
+            btn.setProperty("kind", kind)
+            btn.clicked.connect(slot)
+            buttons.addWidget(btn)
+        layout.addLayout(buttons)
+
+    @staticmethod
+    def _tool_button(text, slot):
+        button = QToolButton()
+        button.setText(text)
+        button.setAutoRaise(False)
+        button.setFixedSize(30, 26)
+        button.clicked.connect(slot)
+        return button
+
+    def _resolved_speed(self):
+        speed = clamp(int(self.speed.value()), SPEED_MIN, SPEED_MAX)
+        self.speed.setValue(speed)
+        return speed
+
+    def _axis_value(self, axis):
+        return int(self.target_spins[axis].value())
+
+    def bump_axis(self, axis, sign):
+        spin = self.target_spins[axis]
+        new_val = clamp(
+            int(spin.value()) + sign * int(self.axis_step.value()), AXIS_MIN, AXIS_MAX
+        )
+        spin.setValue(new_val)
+        self.send_now()
+
+    def send_now(self):
+        self._send_timer.stop()
+        x, y, z, d = (self._axis_value(axis) for axis in ("X", "Y", "Z", "D"))
+        speed = self._resolved_speed()
+
+        msg = Int32MultiArray()
+        msg.data = [x, y, z, d, speed]
+        self.pub_target.publish(msg)
+        self.app.set_status(f"{self.label} target: X={x}, Y={y}, Z={z}, D={d} @ {speed}")
+
+    def schedule_send(self):
+        if not self._updating:
+            self._send_timer.start(SEND_THROTTLE_MS)
+
+    def home(self):
+        self._updating = True
+        for spin in self.target_spins.values():
+            spin.setValue(0)
+        self._updating = False
+        self.send_now()
+
+    def sync_to_live(self):
+        self._updating = True
+        for axis, value in zip(("X", "Y", "Z", "D"), self._live_getter()):
+            self.target_spins[axis].setValue(int(value))
+        self._updating = False
+        self.app.set_status(f"{self.label} targets synced to live")
+
+    def update_live_display(self):
+        for axis, value in zip(("X", "Y", "Z", "D"), self._live_getter()):
+            self.live_labels[axis].setText(f"{int(value):d}")
+
+    def calibrate_zero(self):
+        ok, msg = self.app.node.call_trigger(self.zero_client)
+        self.app.set_status(f"{self.label} zero: {ok} ({msg})")
+
+
+class UMPGuiApp(QMainWindow):
+    """Main Qt application window."""
+
+    def __init__(self, node: GuiNode):
+        super().__init__()
+        self.node = node
+        self.setWindowTitle("Patch Clamping Robot")
+        self.resize(1280, 900)
+        self.setMinimumSize(900, 650)
+
+        self.status = QLabel("Ready")
+        self.acq_pill = StatusPill("STOPPED")
+        self.sol1_pill = StatusPill("S1 OFF")
+        self.sol2_pill = StatusPill("S2 OFF")
+        self.live_motor = QLabel("--")
+        self.live_motor.setObjectName("liveValue")
+        self.live_motor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.heka_resistance = QLabel("Resistance: -- MOhm")
+        self.heka_resistance.setObjectName("sectionTitle")
+
+        self.motor_step = self._spin(DEFAULT_MOTOR_STEP, 1, 100_000)
+        self.motor_target = self._spin(0, MOTOR_MIN, MOTOR_MAX)
+
+        self.camera_label = QLabel("Blackfly S Live")
+        self.camera_label.setAlignment(Qt.AlignCenter)
+        self.camera_label.setObjectName("cameraView")
+        self.camera_label.setMinimumSize(360, 240)
+        self.camera_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.heka_plot = HekaPlot()
+
+        self.panel1 = UmpPanel(
+            self,
+            label="UMP 1",
+            pub_target=node.pub_ump_target,
+            zero_client=node.cli_zero,
+            live_getter=lambda: node.latest_live_ump,
+            subtitle=None,
+        )
+        self.panel2 = UmpPanel(
+            self,
+            label="UMP 2",
+            pub_target=node.pub_ump2_target,
+            zero_client=node.cli_zero2,
+            live_getter=lambda: node.latest_live_ump2,
+            subtitle=None,
+        )
+
+        self._build_ui()
+        self._install_shortcuts()
+
+        self.live_timer = QTimer(self)
+        self.live_timer.timeout.connect(self._poll_live_to_gui)
+        self.live_timer.start(LIVE_POLL_MS)
+
+        self.camera_timer = QTimer(self)
+        self.camera_timer.timeout.connect(self._update_camera_view)
+        self.camera_timer.start(CAM_UPDATE_MS)
+
+        self.heka_timer = QTimer(self)
+        self.heka_timer.timeout.connect(self._update_resistance_plot)
+        self.heka_timer.start(HEKA_PLOT_UPDATE_MS)
+
+    @staticmethod
+    def _spin(value, vmin, vmax):
+        spin = QSpinBox()
+        spin.setRange(vmin, vmax)
+        spin.setValue(value)
+        spin.setKeyboardTracking(False)
+        spin.setAlignment(Qt.AlignRight)
+        spin.setButtonSymbols(QSpinBox.NoButtons)
+        spin.setFixedHeight(28)
+        spin.setMaximumWidth(92)
+        return spin
+
+    def _build_ui(self):
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(12, 10, 12, 10)
+        root_layout.setSpacing(8)
+        root_layout.addLayout(self._header())
+
+        outer = QHBoxLayout()
+        outer.setSpacing(14)
+        root_layout.addLayout(outer, 1)
+
+        left = QFrame()
+        left.setObjectName("panelColumn")
+        left.setMinimumWidth(390)
+        left.setMaximumWidth(410)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(8, 4, 8, 4)
+        left_layout.setSpacing(3)
+
+        left_layout.addWidget(self.panel1)
+        left_layout.addWidget(self.panel2)
+        left_layout.addWidget(self._motor_group())
+        left_layout.addWidget(self._pressure_group())
+        left_layout.addWidget(self._acquisition_group())
+        left_layout.addStretch(1)
+        left_layout.addWidget(self.status)
+
+        right = QFrame()
+        right.setObjectName("panelColumn")
+        right.setMinimumWidth(420)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(16, 16, 16, 16)
+        right_layout.setSpacing(12)
+
+        camera_title = QLabel("Blackfly S Live")
+        camera_title.setObjectName("sectionTitle")
+        right_layout.addWidget(camera_title)
+        right_layout.addWidget(self.camera_label, 3)
+        right_layout.addWidget(self.heka_resistance)
+        right_layout.addWidget(self.heka_plot, 2)
+
+        left_scroll = QScrollArea()
+        left_scroll.setObjectName("controlScroll")
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setFixedWidth(430)
+        left_scroll.setWidget(left)
+
+        outer.addWidget(left_scroll)
+        outer.addWidget(right, 1)
+        self._apply_style()
+
+    def _header(self):
+        bar = QHBoxLayout()
+        bar.setSpacing(10)
+
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        title = QLabel("Patch Clamping Robot")
+        title.setObjectName("appTitle")
+        subtitle = QLabel(
+            "Dual UMP control with focusing knob, pressure control, camera, and resistance monitoring"
+        )
+        subtitle.setObjectName("hint")
+        text.addWidget(title)
+        text.addWidget(subtitle)
+
+        bar.addLayout(text)
+        bar.addStretch(1)
+        return bar
+
+    def _motor_group(self):
+        group = QGroupBox("Motor (ODrive)")
+        layout = QGridLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(6)
+
+        layout.addWidget(QLabel("Step"), 0, 0)
+        layout.addWidget(self.motor_step, 0, 1)
+        layout.addWidget(QLabel("Target"), 0, 2)
+        layout.addWidget(self.motor_target, 0, 3)
+        layout.addWidget(QLabel("Live"), 1, 0)
+        layout.addWidget(self.live_motor, 1, 1)
+
+        up = QToolButton()
+        up.setText("+")
+        up.setFixedSize(30, 26)
+        up.clicked.connect(lambda: self._bump_motor(+1))
+        down = QToolButton()
+        down.setText("-")
+        down.setFixedSize(30, 26)
+        down.clicked.connect(lambda: self._bump_motor(-1))
+        layout.addWidget(up, 1, 2)
+        layout.addWidget(down, 1, 3)
+
+        send = QPushButton("Send")
+        send.setProperty("kind", "primary")
+        send.clicked.connect(self._publish_motor_target)
+        layout.addWidget(send, 1, 4)
+
+        self.motor_target.editingFinished.connect(self._publish_motor_target)
+        return group
+
+    def _pressure_group(self):
+        group = QGroupBox("Pressure (Solenoids)")
+        layout = QGridLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(6)
+
+        layout.addWidget(QLabel("Solenoid 1"), 0, 0)
+        layout.addWidget(self._pressure_button("ON", 1, True), 0, 1)
+        layout.addWidget(self._pressure_button("OFF", 1, False), 0, 2)
+        layout.addWidget(self.sol1_pill, 0, 3)
+
+        layout.addWidget(QLabel("Solenoid 2"), 1, 0)
+        layout.addWidget(self._pressure_button("ON", 2, True), 1, 1)
+        layout.addWidget(self._pressure_button("OFF", 2, False), 1, 2)
+        layout.addWidget(self.sol2_pill, 1, 3)
+        return group
+
+    def _pressure_button(self, text, which, on):
+        button = QPushButton(text)
+        button.setProperty("kind", "danger" if on else "secondary")
+        button.clicked.connect(lambda _checked=False: self._set_solenoid(which, on))
+        return button
+
+    def _acquisition_group(self):
+        group = QGroupBox("Data Acquisition")
+        layout = QGridLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setHorizontalSpacing(6)
+
+        start = QPushButton("Start")
+        start.setProperty("kind", "primary")
+        start.clicked.connect(self._acq_start)
+        stop = QPushButton("Stop")
+        stop.setProperty("kind", "secondary")
+        stop.clicked.connect(self._acq_stop)
+
+        layout.addWidget(start, 0, 0)
+        layout.addWidget(stop, 0, 1)
+        layout.addWidget(self.acq_pill, 0, 2)
+        return group
+
+    def _install_shortcuts(self):
+        # QShortcut catches common letter keys even when widgets have focus.
+        for key, axis, sign in (
+            ("W", "Y", +1),
+            ("S", "Y", -1),
+            ("A", "X", -1),
+            ("D", "X", +1),
+            (",", "D", -1),
+            (".", "D", +1),
+        ):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(lambda a=axis, s=sign: self.panel1.bump_axis(a, s))
+
+        self.key_router = KeyRouter(self)
+        self.key_router.bump.connect(self.panel1.bump_axis)
+        QApplication.instance().installEventFilter(self.key_router)
+
+    def set_status(self, text):
+        self.status.setText(text)
+
+    def _publish_motor_target(self):
+        target = int(self.motor_target.value())
+        self.node.pub_motor_tgt.publish(Int32(data=target))
+        self.set_status(f"Motor target: {target}")
+
+    def _bump_motor(self, sign):
+        new_val = clamp(
+            int(self.motor_target.value()) + sign * int(self.motor_step.value()),
+            MOTOR_MIN,
+            MOTOR_MAX,
+        )
+        self.motor_target.setValue(new_val)
+        self._publish_motor_target()
+
+    def _set_solenoid(self, which, on):
+        pub = self.node.pub_sol1_cmd if which == 1 else self.node.pub_sol2_cmd
+        pub.publish(Bool(data=bool(on)))
+        self.set_status(f"Solenoid {which}: {'ON' if on else 'OFF'}")
+
+    def _acq_start(self):
+        ok, msg = self.node.call_trigger(self.node.cli_acq_start)
+        self.acq_pill.set_on(ok, "RUNNING" if ok else "FAILED")
+        self.set_status(f"Acq start: {ok} ({msg})")
+
+    def _acq_stop(self):
+        ok, msg = self.node.call_trigger(self.node.cli_acq_stop)
+        self.acq_pill.set_on(False, "STOPPED")
+        self.set_status(f"Acq stop: {ok} ({msg})")
+
+    def _poll_live_to_gui(self):
+        self.panel1.update_live_display()
+        self.panel2.update_live_display()
+        self.live_motor.setText(f"{int(self.node.latest_live_motor):d}")
+        sol1_text = "S1 ON" if self.node.latest_sol1_state else "S1 OFF"
+        sol2_text = "S2 ON" if self.node.latest_sol2_state else "S2 OFF"
+        self.sol1_pill.set_on(self.node.latest_sol1_state, sol1_text)
+        self.sol2_pill.set_on(self.node.latest_sol2_state, sol2_text)
+
+    def _update_camera_view(self):
+        frame = self.node.latest_frame_bgr
+        if frame is None:
+            return
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(image)
+        scaled = pixmap.scaled(
+            self.camera_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.camera_label.setPixmap(scaled)
+
+    def _update_resistance_plot(self):
+        now, latest, points = self.node.get_heka_resistance_snapshot()
+        if latest is None:
+            self.heka_resistance.setText("Resistance: -- MOhm")
+        else:
+            self.heka_resistance.setText(f"Resistance: {latest:.3f} MOhm")
+        self.heka_plot.set_data(now, latest, points)
+
+    def closeEvent(self, event):
+        QApplication.instance().removeEventFilter(self.key_router)
+        event.accept()
+
+    def _apply_style(self):
+        QApplication.instance().setStyleSheet(
+            """
+            QWidget#root {
+                background: #eef2f7;
+                color: #172033;
+                font-family: "Segoe UI", "Inter", "Noto Sans", sans-serif;
+                font-size: 12px;
+            }
+            QFrame#panelColumn {
+                background: #ffffff;
+                border: 1px solid #d9e2ec;
+                border-radius: 14px;
+            }
+            QScrollArea#controlScroll {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea#controlScroll > QWidget > QWidget {
+                background: transparent;
+            }
+            QScrollBar:vertical {
+                background: #e2e8f0;
+                width: 10px;
+                border-radius: 5px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: #94a3b8;
+                border-radius: 5px;
+                min-height: 42px;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            QLabel#appTitle {
+                font-size: 24px;
+                font-weight: 800;
+                color: #111827;
+            }
+            QLabel#sectionTitle {
+                font-size: 17px;
+                font-weight: 800;
+                color: #111827;
+            }
+            QLabel#hint {
+                color: #64748b;
+                font-size: 12px;
+            }
+            QLabel#liveValue {
+                background: #f8fafc;
+                border: 1px solid #dbe4ef;
+                border-radius: 8px;
+                padding: 5px 8px;
+                color: #0f172a;
+                font-weight: 700;
+            }
+            QLabel#cameraView {
+                background: #0b1120;
+                color: #cbd5e1;
+                border-radius: 14px;
+                border: 1px solid #1f2937;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            QGroupBox {
+                background: #f8fafc;
+                border: 1px solid #dbe4ef;
+                border-radius: 10px;
+                margin-top: 10px;
+                padding: 5px;
+                font-weight: 800;
+                color: #111827;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 8px;
+                left: 10px;
+            }
+            QSpinBox {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 7px;
+                padding: 3px 6px;
+                min-height: 18px;
+                color: #0f172a;
+            }
+            QSpinBox:focus {
+                border: 1px solid #2563eb;
+            }
+            QPushButton, QToolButton {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 7px;
+                padding: 4px 8px;
+                color: #172033;
+                font-weight: 700;
+            }
+            QPushButton:hover, QToolButton:hover {
+                background: #f1f5f9;
+                border-color: #94a3b8;
+            }
+            QPushButton[kind="primary"] {
+                background: #2563eb;
+                border-color: #2563eb;
+                color: #ffffff;
+            }
+            QPushButton[kind="primary"]:hover {
+                background: #1d4ed8;
+            }
+            QPushButton[kind="danger"] {
+                background: #fff7ed;
+                border-color: #fdba74;
+                color: #9a3412;
+            }
+            QPushButton[kind="danger"]:hover {
+                background: #ffedd5;
+            }
+            QPushButton[kind="secondary"] {
+                background: #ffffff;
+            }
+            """
+        )
 
 
 def main():
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
     rclpy.init()
     node = GuiNode()
 
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
 
-    app = UMPGuiApp(node)
-    app.root.mainloop()
+    app = QApplication(sys.argv)
+    app.setFont(QFont("Segoe UI", 9))
+    window = UMPGuiApp(node)
+    window.showMaximized()
+    rc = app.exec_()
 
     node.destroy_node()
     rclpy.shutdown()
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

@@ -2,7 +2,7 @@
 
 A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **Sensapex UMP micromanipulators**, an **ODrive**-driven focusing knob and a **FLIR Blackfly S** camera.
 
-The package wraps every device behind a small ROS2 node, ships a Tk GUI for manual teleop, a logger that writes synchronized image / video / CSV trials, and a thin client that lets an [OpenPI](https://github.com/Physical-Intelligence/openpi) policy server drive the rig in closed loop.
+The package wraps every device behind a small ROS2 node, ships a Qt GUI for manual teleop, a logger that writes synchronized image / video / CSV trials, and a thin client that lets an [OpenPI](https://github.com/Physical-Intelligence/openpi) policy server drive the rig in closed loop.
 
 ---
 
@@ -32,7 +32,7 @@ ump_suite/
 │   ├── camera_node.py           # PySpin camera publisher + mp4 recorder
 │   ├── pressure_node.py         # Arduino serial bridge for pressure solenoids
 │   ├── logger_node.py           # CSV + frame + video dataset logger
-│   ├── gui_node.py              # Tk control panel
+│   ├── gui_node.py              # PyQt control panel
 │   ├── sensapex_env.py          # Synchronous ROS2 client used by VLA rollouts
 │   ├── heka_udp_receiver_node.py # HEKA UDP bridge for resistance / monitor voltage
 │   ├── main.py                  # Closed-loop OpenPI rollout (absolute targets)
@@ -128,7 +128,7 @@ resistance_mohm
 ```
 
 ### `gui_node`
-A Tkinter control panel split into a controls column and a live camera / HEKA preview column. Two `_UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D entries, ▲▼ bump buttons, axis step, speed, **Send Now**, **Home**, **Sync to Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Solenoids)** frame with ON/OFF buttons and live state labels for each solenoid, Start / Stop buttons that call `/acq/start` and `/acq/stop`, and a 10-second rolling plot of `/heka/resistance_mohm`.
+A PyQt5 control panel split into a controls column and a live camera / HEKA preview column. Two `UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D controls, nudge buttons, axis step, speed, **Send Now**, **Home**, **Sync Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Solenoids)** panel with ON/OFF buttons and live state badges for each solenoid, Start / Stop buttons that call `/acq/start` and `/acq/stop`, and a 10-second rolling plot of `/heka/resistance_mohm`.
 
 Keyboard shortcuts (UMP1 only):
 
@@ -211,6 +211,7 @@ The driver and rollout code import several non-`rosdep` packages:
 - `odrive` — ODrive Python SDK
 - `PySpin` — Spinnaker Python wheel (install into a dedicated venv, see below)
 - `pyserial` — Arduino pressure controller (`pip install pyserial` or `apt install python3-serial`)
+- `PyQt5` — modern desktop GUI (`apt install python3-pyqt5`)
 - `opencv-python`, `numpy`, `pillow`
 - `tyro`, `openpi-client` — only for the rollout scripts
 
