@@ -79,6 +79,8 @@ SEND_THROTTLE_MS = 60
 CAM_UPDATE_MS = 30
 HEKA_PLOT_UPDATE_MS = 100
 HEKA_PLOT_WINDOW_S = 10.0
+HEKA_Y_MIN_MOHM = 0.0
+HEKA_Y_MAX_MOHM = 1000.0
 
 
 def clamp(v, vmin, vmax):
@@ -262,24 +264,14 @@ class HekaPlot(QWidget):
             if 0.0 <= self.now - t <= HEKA_PLOT_WINDOW_S
         ]
 
-        if visible:
-            values = [v for _, v in visible]
-            ymin = min(values)
-            ymax = max(values)
-            if abs(ymax - ymin) < 1e-6:
-                pad = max(1.0, abs(ymax) * 0.05)
-            else:
-                pad = (ymax - ymin) * 0.12
-            ymin -= pad
-            ymax += pad
-        else:
-            ymin, ymax = 0.0, 1.0
+        ymin, ymax = HEKA_Y_MIN_MOHM, HEKA_Y_MAX_MOHM
 
         def x_from_time(t):
             age = self.now - t
             return left + ((HEKA_PLOT_WINDOW_S - age) / HEKA_PLOT_WINDOW_S) * plot_w
 
         def y_from_value(v):
+            v = clamp(v, ymin, ymax)
             return top + (1.0 - ((v - ymin) / (ymax - ymin))) * plot_h
 
         grid = QPen(Qt.GlobalColor.lightGray)
@@ -304,7 +296,7 @@ class HekaPlot(QWidget):
             value = ymax - frac * (ymax - ymin)
             painter.drawLine(left, int(y), left + plot_w, int(y))
             painter.setPen(Qt.GlobalColor.darkGray)
-            painter.drawText(6, int(y - 8), left - 14, 16, Qt.AlignRight, f"{value:.2f}")
+            painter.drawText(6, int(y - 8), left - 14, 16, Qt.AlignRight, f"{value:.0f}")
             painter.setPen(grid)
 
         painter.setPen(axis)
@@ -672,7 +664,8 @@ class UMPGuiApp(QMainWindow):
         title = QLabel("Patch Clamping Robot")
         title.setObjectName("appTitle")
         subtitle = QLabel(
-            "Dual UMP control with focusing knob, pressure control, camera, and resistance monitoring"
+            "Dual UMP control with focusing knob, pressure control, camera, "
+            "and resistance monitoring"
         )
         subtitle.setObjectName("hint")
         text.addWidget(title)
