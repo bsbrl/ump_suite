@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (
 )
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Bool, Float32MultiArray, Int32, Int32MultiArray
+from std_msgs.msg import Bool, Float32, Float32MultiArray, Int32, Int32MultiArray
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
@@ -53,6 +53,7 @@ from .ros_interfaces import (
     SRV_ZERO2,
     TOPIC_CAM_IMAGE_COMPRESSED,
     TOPIC_HEKA_CURRENT_PA,
+    TOPIC_HEKA_RESISTANCE,
     TOPIC_HEKA_VOLTAGE_RAW,
     TOPIC_MOTOR_LIVE,
     TOPIC_MOTOR_TGT,
@@ -123,6 +124,9 @@ class GuiNode(Node):
         self.create_subscription(
             Float32MultiArray, TOPIC_HEKA_CURRENT_PA, self._on_heka_current, 10
         )
+        self.create_subscription(
+            Float32, TOPIC_HEKA_RESISTANCE, self._on_heka_resistance, 10
+        )
 
         self.cli_acq_start = self.create_client(Trigger, SRV_ACQ_START)
         self.cli_acq_stop = self.create_client(Trigger, SRV_ACQ_STOP)
@@ -137,6 +141,7 @@ class GuiNode(Node):
         self.latest_sol2_state = False
         self.latest_heka_voltage = None
         self.latest_heka_current = None
+        self.latest_heka_resistance = None
 
     def _on_ump_live(self, msg: Int32MultiArray):
         if len(msg.data) >= 4:
@@ -197,6 +202,11 @@ class GuiNode(Node):
         self._append_heka_samples(
             self.heka_current_history, "latest_heka_current", msg
         )
+
+    def _on_heka_resistance(self, msg: Float32):
+        value = float(msg.data)
+        if math.isfinite(value):
+            self.latest_heka_resistance = value
 
     def get_heka_signal_snapshot(self):
         now = time.monotonic()
@@ -594,6 +604,9 @@ class UMPGuiApp(QMainWindow):
         self.live_motor = QLabel("--")
         self.live_motor.setObjectName("liveValue")
         self.live_motor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.live_resistance = QLabel("-- MOhm")
+        self.live_resistance.setObjectName("resistanceValue")
+        self.live_resistance.setAlignment(Qt.AlignCenter)
         self.heka_voltage = QLabel("Voltage: -- V")
         self.heka_voltage.setObjectName("sectionTitle")
         self.heka_current = QLabel("Current: -- pA")
@@ -605,7 +618,7 @@ class UMPGuiApp(QMainWindow):
         self.camera_label = QLabel("Blackfly S Live")
         self.camera_label.setAlignment(Qt.AlignCenter)
         self.camera_label.setObjectName("cameraView")
-        self.camera_label.setMinimumSize(360, 320)
+        self.camera_label.setMinimumSize(360, 500)
         self.camera_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.heka_voltage_plot = HekaPlot(
@@ -690,6 +703,7 @@ class UMPGuiApp(QMainWindow):
         left_layout.addWidget(self._motor_group())
         left_layout.addWidget(self._pressure_group())
         left_layout.addWidget(self._acquisition_group())
+        left_layout.addWidget(self._resistance_group())
         left_layout.addStretch(1)
         left_layout.addWidget(self.status)
 
@@ -817,6 +831,13 @@ class UMPGuiApp(QMainWindow):
         layout.addWidget(self.acq_pill, 0, 2)
         return group
 
+    def _resistance_group(self):
+        group = QGroupBox("Live Resistance")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self.live_resistance)
+        return group
+
     def _install_shortcuts(self):
         # QShortcut catches common letter keys even when widgets have focus.
         for key, axis, sign in (
@@ -874,6 +895,13 @@ class UMPGuiApp(QMainWindow):
         sol2_text = "S2 ON" if self.node.latest_sol2_state else "S2 OFF"
         self.sol1_pill.set_on(self.node.latest_sol1_state, sol1_text)
         self.sol2_pill.set_on(self.node.latest_sol2_state, sol2_text)
+        resistance = self.node.latest_heka_resistance
+        if resistance is None:
+            self.live_resistance.setText("-- MOhm")
+        elif resistance >= 1000.0:
+            self.live_resistance.setText(f"{resistance / 1000.0:.3f} GOhm")
+        else:
+            self.live_resistance.setText(f"{resistance:.2f} MOhm")
 
     def _update_camera_view(self):
         frame = self.node.latest_frame_bgr
@@ -969,6 +997,15 @@ class UMPGuiApp(QMainWindow):
                 padding: 5px 8px;
                 color: #0f172a;
                 font-weight: 700;
+            }
+            QLabel#resistanceValue {
+                background: #ecfeff;
+                border: 1px solid #67e8f9;
+                border-radius: 10px;
+                padding: 8px 10px;
+                color: #155e75;
+                font-size: 18px;
+                font-weight: 800;
             }
             QLabel#cameraView {
                 background: #0b1120;

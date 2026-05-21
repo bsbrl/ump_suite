@@ -29,7 +29,7 @@ SRV_ACQ_STOP  = "/acq/stop"
 SRV_ZERO      = "/ump/calibrate_zero"
 SRV_ZERO2     = "/ump2/calibrate_zero"
 
-TOPIC_HEKA_RESISTANCE = "/heka/resistance_mohm"      # std_msgs/Float32
+TOPIC_HEKA_RESISTANCE = "/heka/resistance_mohm"      # std_msgs/Float32 computed/live
 TOPIC_HEKA_MONITOR_V = "/heka/monitor_v"            # std_msgs/Float32
 TOPIC_HEKA_MONITOR_STEP_V = "/heka/monitor_step_v"  # std_msgs/Float32
 TOPIC_HEKA_VOLTAGE_RAW = "/heka/voltage_raw_v"      # Float32MultiArray [rate_hz, samples...]

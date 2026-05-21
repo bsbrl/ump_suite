@@ -59,7 +59,7 @@ All names live in [ros_interfaces.py](ump_suite/ros_interfaces.py).
 | `/heka/current_pa` | `std_msgs/Float32MultiArray` | publish | HEKA current sample packet: `[sample_rate_hz, i0, i1, ...]` |
 | `/heka/monitor_v` | `std_msgs/Float32` | publish | Latest voltage sample from binary packets; mean monitor voltage for legacy packets |
 | `/heka/monitor_step_v` | `std_msgs/Float32` | publish | Legacy monitor step voltage |
-| `/heka/resistance_mohm` | `std_msgs/Float32` | publish | Legacy finite resistance value; reserved for computed resistance |
+| `/heka/resistance_mohm` | `std_msgs/Float32` | publish | Live resistance estimate in MOhm |
 | `/ump/calibrate_zero`, `/ump2/calibrate_zero` | `std_srvs/Trigger` | service | Calibrate zero at the current pose |
 | `/acq/start`, `/acq/stop` | `std_srvs/Trigger` | service | Begin / end a logged trial |
 
@@ -106,7 +106,7 @@ header = "<5sdfH": magic=b"HEKA1", first_sample_time, sample_rate_hz, sample_cou
 payload = repeated float32 pairs: voltage_raw_v, current_pA
 ```
 
-It republishes voltage packets on `/heka/voltage_raw_v` and current packets on `/heka/current_pa` as `Float32MultiArray` messages whose first element is the sample rate and remaining elements are samples. It also republishes the latest voltage sample on `/heka/monitor_v`.
+It republishes voltage packets on `/heka/voltage_raw_v` and current packets on `/heka/current_pa` as `Float32MultiArray` messages whose first element is the sample rate and remaining elements are samples. It also republishes the latest voltage sample on `/heka/monitor_v`, estimates resistance from the test pulse response, and publishes that value on `/heka/resistance_mohm`.
 
 The previous comma-separated packet format is still accepted for compatibility:
 
@@ -114,7 +114,7 @@ The previous comma-separated packet format is still accepted for compatibility:
 timestamp, mean_voltage_V, monitor_step_V, resistance_MOhm
 ```
 
-For now, the GUI plots the last 10 ms of voltage and current. The logger still includes the `resistance_mohm` column for the resistance topic; with the new binary voltage/current packets that column stays blank until computed resistance is published.
+For now, the GUI plots voltage and current and shows the live resistance estimate in the left control column. The logger includes the same value in the `resistance_mohm` CSV column.
 
 ### `logger_node`
 Builds a synchronized dataset:
@@ -139,7 +139,7 @@ resistance_mohm
 ```
 
 ### `gui_node`
-A PyQt5 control panel split into a controls column and a live camera / HEKA preview column. Two `UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D controls, nudge buttons, axis step, speed, **Send Now**, **Home**, **Sync Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Solenoids)** panel with ON/OFF buttons and live state badges for each solenoid, Start / Stop buttons that call `/acq/start` and `/acq/stop`, and rolling 10 ms voltage/current plots from `/heka/voltage_raw_v` and `/heka/current_pa`.
+A PyQt5 control panel split into a controls column and a live camera / HEKA preview column. Two `UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D controls, nudge buttons, axis step, speed, **Send Now**, **Home**, **Sync Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Solenoids)** panel with ON/OFF buttons and live state badges for each solenoid, Start / Stop buttons that call `/acq/start` and `/acq/stop`, rolling voltage/current plots from `/heka/voltage_raw_v` and `/heka/current_pa`, and a live resistance readout.
 
 Keyboard shortcuts (UMP1 only):
 

@@ -2,6 +2,7 @@
 import math
 import socket
 import struct
+from collections import deque
 
 import numpy as np
 import rclpy
@@ -19,6 +20,7 @@ from .ros_interfaces import (
 
 PACKET_MAGIC = b"HEKA1"
 PACKET_HEADER = struct.Struct("<5sdfH")
+DEFAULT_VOLTAGE_MONITOR_SCALE = 10.0
 
 
 class HekaUdpReceiverNode(Node):
@@ -26,6 +28,12 @@ class HekaUdpReceiverNode(Node):
         super().__init__("heka_udp_receiver_node")
 
         self.declare_parameter("port", 5005)
+        self.declare_parameter("voltage_monitor_scale", DEFAULT_VOLTAGE_MONITOR_SCALE)
+        self.declare_parameter("resistance_window_s", 0.25)
+        self.declare_parameter("min_voltage_step_raw_v", 0.005)
+        self.declare_parameter("min_pulse_ms", 0.8)
+        self.declare_parameter("baseline_window_ms", 2.0)
+        self.declare_parameter("min_current_delta_pa", 0.05)
         port = int(self.get_parameter("port").value)
 
         self.pub_res = self.create_publisher(Float32, TOPIC_HEKA_RESISTANCE, 10)
@@ -41,6 +49,9 @@ class HekaUdpReceiverNode(Node):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", port))
         self.sock.setblocking(False)
+
+        self._res_voltage = deque()
+        self._res_current = deque()
 
         self.timer = self.create_timer(0.01, self.loop)
         self.get_logger().info(f"Listening for HEKA UDP on port {port}")
@@ -104,6 +115,111 @@ class HekaUdpReceiverNode(Node):
             latest_voltage = float(voltage_raw_v[-1])
             if math.isfinite(latest_voltage):
                 self.pub_mon.publish(Float32(data=latest_voltage))
+
+        self._update_resistance(voltage_raw_v, current_pa, float(sample_rate_hz))
+
+    def _update_resistance(self, voltage_raw_v, current_pa, sample_rate_hz):
+        if not math.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
+            return
+
+        for voltage, current in zip(voltage_raw_v, current_pa):
+            voltage = float(voltage)
+            current = float(current)
+            if math.isfinite(voltage) and math.isfinite(current):
+                self._res_voltage.append(voltage)
+                self._res_current.append(current)
+
+        window_s = max(0.02, float(self.get_parameter("resistance_window_s").value))
+        max_samples = max(16, int(sample_rate_hz * window_s))
+        while len(self._res_voltage) > max_samples:
+            self._res_voltage.popleft()
+            self._res_current.popleft()
+
+        if len(self._res_voltage) < max(16, int(sample_rate_hz * 0.004)):
+            return
+
+        voltage = np.asarray(self._res_voltage, dtype=np.float64)
+        current = np.asarray(self._res_current, dtype=np.float64)
+        resistance_mohm = self._estimate_resistance_mohm(
+            voltage, current, sample_rate_hz
+        )
+        if resistance_mohm is not None:
+            self.pub_res.publish(Float32(data=float(resistance_mohm)))
+
+    def _estimate_resistance_mohm(self, voltage_raw_v, current_pa, sample_rate_hz):
+        baseline_voltage = float(np.median(voltage_raw_v))
+        voltage_delta = voltage_raw_v - baseline_voltage
+        peak_delta = float(np.max(np.abs(voltage_delta)))
+        min_step_raw = float(self.get_parameter("min_voltage_step_raw_v").value)
+        if peak_delta < min_step_raw:
+            return None
+
+        threshold = max(min_step_raw, peak_delta * 0.25)
+        pulse_mask = np.abs(voltage_delta) >= threshold
+        segments = self._true_segments(pulse_mask)
+
+        min_pulse_len = max(
+            3, int(sample_rate_hz * float(self.get_parameter("min_pulse_ms").value) / 1000.0)
+        )
+        baseline_len = max(
+            3,
+            int(
+                sample_rate_hz
+                * float(self.get_parameter("baseline_window_ms").value)
+                / 1000.0
+            ),
+        )
+        min_current_delta_pa = float(self.get_parameter("min_current_delta_pa").value)
+        voltage_monitor_scale = float(self.get_parameter("voltage_monitor_scale").value)
+        if not math.isfinite(voltage_monitor_scale) or voltage_monitor_scale <= 0:
+            voltage_monitor_scale = DEFAULT_VOLTAGE_MONITOR_SCALE
+
+        latest_resistance = None
+        for start, end in segments:
+            pulse_len = end - start
+            if pulse_len < min_pulse_len:
+                continue
+
+            baseline_start = max(0, start - baseline_len)
+            baseline_end = start
+            if baseline_end - baseline_start < 3:
+                continue
+
+            pulse_start = start + pulse_len // 2
+            pulse_end = end
+            if pulse_end - pulse_start < 3:
+                continue
+
+            baseline_i = float(np.median(current_pa[baseline_start:baseline_end]))
+            pulse_i = float(np.median(current_pa[pulse_start:pulse_end]))
+            baseline_v = float(np.median(voltage_raw_v[baseline_start:baseline_end]))
+            pulse_v = float(np.median(voltage_raw_v[pulse_start:pulse_end]))
+
+            delta_i_pa = pulse_i - baseline_i
+            if abs(delta_i_pa) < min_current_delta_pa:
+                continue
+
+            # EPC 10 voltage monitor is scaled relative to pipette voltage.
+            delta_v_pipette = (pulse_v - baseline_v) / voltage_monitor_scale
+            resistance_mohm = abs(delta_v_pipette / delta_i_pa) * 1e6
+            if math.isfinite(resistance_mohm) and resistance_mohm > 0:
+                latest_resistance = resistance_mohm
+
+        return latest_resistance
+
+    @staticmethod
+    def _true_segments(mask):
+        segments = []
+        start = None
+        for i, value in enumerate(mask):
+            if value and start is None:
+                start = i
+            elif not value and start is not None:
+                segments.append((start, i))
+                start = None
+        if start is not None:
+            segments.append((start, len(mask)))
+        return segments
 
     def _handle_legacy_text_packet(self, data, addr):
         text = data.decode("utf-8").strip()
