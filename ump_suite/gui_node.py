@@ -5,7 +5,7 @@ The ROS surface is intentionally the same as the original Tk GUI:
   * publishes absolute UMP1 / UMP2 targets
   * publishes ODrive motor targets
   * publishes solenoid commands
-  * subscribes to live robot, pressure, camera, and HEKA resistance topics
+  * subscribes to live robot, pressure, camera, and HEKA voltage/current topics
   * calls acquisition and UMP zeroing services
 
 Only the presentation layer changes. PyQt5 is used because it is available in
@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (
 )
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Bool, Float32, Int32, Int32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, Int32, Int32MultiArray
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
@@ -52,7 +52,8 @@ from .ros_interfaces import (
     SRV_ZERO,
     SRV_ZERO2,
     TOPIC_CAM_IMAGE_COMPRESSED,
-    TOPIC_HEKA_RESISTANCE,
+    TOPIC_HEKA_CURRENT_PA,
+    TOPIC_HEKA_VOLTAGE_RAW,
     TOPIC_MOTOR_LIVE,
     TOPIC_MOTOR_TGT,
     TOPIC_SOL1_CMD,
@@ -78,9 +79,8 @@ LIVE_POLL_MS = 50
 SEND_THROTTLE_MS = 60
 CAM_UPDATE_MS = 30
 HEKA_PLOT_UPDATE_MS = 100
-HEKA_PLOT_WINDOW_S = 10.0
-HEKA_Y_MIN_MOHM = 0.0
-HEKA_Y_MAX_MOHM = 1000.0
+HEKA_PLOT_WINDOW_S = 0.25
+HEKA_MAX_DRAW_POINTS = 2200
 
 
 def clamp(v, vmin, vmax):
@@ -94,7 +94,8 @@ class GuiNode(Node):
         super().__init__("gui_node")
 
         self._heka_lock = threading.Lock()
-        self.heka_resistance_history = deque()
+        self.heka_voltage_history = deque()
+        self.heka_current_history = deque()
 
         self.pub_ump_target = self.create_publisher(
             Int32MultiArray, TOPIC_UMP_TARGET, 10
@@ -117,7 +118,10 @@ class GuiNode(Node):
         self.create_subscription(Bool, TOPIC_SOL1_STATE, self._on_sol1_state, 10)
         self.create_subscription(Bool, TOPIC_SOL2_STATE, self._on_sol2_state, 10)
         self.create_subscription(
-            Float32, TOPIC_HEKA_RESISTANCE, self._on_heka_resistance, 10
+            Float32MultiArray, TOPIC_HEKA_VOLTAGE_RAW, self._on_heka_voltage, 10
+        )
+        self.create_subscription(
+            Float32MultiArray, TOPIC_HEKA_CURRENT_PA, self._on_heka_current, 10
         )
 
         self.cli_acq_start = self.create_client(Trigger, SRV_ACQ_START)
@@ -131,7 +135,8 @@ class GuiNode(Node):
         self.latest_frame_bgr = None
         self.latest_sol1_state = False
         self.latest_sol2_state = False
-        self.latest_heka_resistance = None
+        self.latest_heka_voltage = None
+        self.latest_heka_current = None
 
     def _on_ump_live(self, msg: Int32MultiArray):
         if len(msg.data) >= 4:
@@ -159,34 +164,53 @@ class GuiNode(Node):
         except Exception:
             pass
 
-    def _on_heka_resistance(self, msg: Float32):
-        value = float(msg.data)
-        if not math.isfinite(value):
+    def _append_heka_samples(self, history, latest_attr, msg: Float32MultiArray):
+        data = list(msg.data)
+        if len(data) < 2:
+            return
+        sample_rate_hz = float(data[0])
+        if not math.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
             return
 
+        samples = [float(v) for v in data[1:]]
         now = time.monotonic()
+        first_t = now - (len(samples) - 1) / sample_rate_hz
         cutoff = now - HEKA_PLOT_WINDOW_S
+        latest = None
         with self._heka_lock:
-            self.latest_heka_resistance = value
-            self.heka_resistance_history.append((now, value))
-            while (
-                self.heka_resistance_history
-                and self.heka_resistance_history[0][0] < cutoff
-            ):
-                self.heka_resistance_history.popleft()
+            for i, value in enumerate(samples):
+                if not math.isfinite(value):
+                    continue
+                latest = value
+                history.append((first_t + i / sample_rate_hz, value))
+            if latest is not None:
+                setattr(self, latest_attr, latest)
+            while history and history[0][0] < cutoff:
+                history.popleft()
 
-    def get_heka_resistance_snapshot(self):
+    def _on_heka_voltage(self, msg: Float32MultiArray):
+        self._append_heka_samples(
+            self.heka_voltage_history, "latest_heka_voltage", msg
+        )
+
+    def _on_heka_current(self, msg: Float32MultiArray):
+        self._append_heka_samples(
+            self.heka_current_history, "latest_heka_current", msg
+        )
+
+    def get_heka_signal_snapshot(self):
         now = time.monotonic()
         cutoff = now - HEKA_PLOT_WINDOW_S
         with self._heka_lock:
-            while (
-                self.heka_resistance_history
-                and self.heka_resistance_history[0][0] < cutoff
-            ):
-                self.heka_resistance_history.popleft()
-            latest = self.latest_heka_resistance
-            points = list(self.heka_resistance_history)
-        return now, latest, points
+            while self.heka_voltage_history and self.heka_voltage_history[0][0] < cutoff:
+                self.heka_voltage_history.popleft()
+            while self.heka_current_history and self.heka_current_history[0][0] < cutoff:
+                self.heka_current_history.popleft()
+            latest_voltage = self.latest_heka_voltage
+            latest_current = self.latest_heka_current
+            voltage_points = list(self.heka_voltage_history)
+            current_points = list(self.heka_current_history)
+        return now, latest_voltage, latest_current, voltage_points, current_points
 
     def call_trigger(self, client):
         if not client.wait_for_service(timeout_sec=1.0):
@@ -231,14 +255,17 @@ class StatusPill(QLabel):
 
 
 class HekaPlot(QWidget):
-    """Lightweight rolling resistance plot drawn with QPainter."""
+    """Lightweight rolling HEKA signal plot drawn with QPainter."""
 
-    def __init__(self, parent=None):
+    def __init__(self, *, unit, waiting_topic, line_color, parent=None):
         super().__init__(parent)
+        self.unit = unit
+        self.waiting_topic = waiting_topic
+        self.line_color = line_color
         self.now = time.monotonic()
         self.latest = None
         self.points = []
-        self.setMinimumHeight(180)
+        self.setMinimumHeight(110)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def set_data(self, now, latest, points):
@@ -253,41 +280,58 @@ class HekaPlot(QWidget):
         painter.fillRect(self.rect(), Qt.white)
 
         width = max(320, self.width())
-        height = max(180, self.height())
+        height = max(110, self.height())
         left, right, top, bottom = 72, 24, 20, 42
         plot_w = max(1, width - left - right)
         plot_h = max(1, height - top - bottom)
 
-        visible = [
+        visible_all = [
             (t, v)
             for t, v in self.points
             if 0.0 <= self.now - t <= HEKA_PLOT_WINDOW_S
         ]
+        visible = self._decimate(visible_all, HEKA_MAX_DRAW_POINTS)
 
-        ymin, ymax = HEKA_Y_MIN_MOHM, HEKA_Y_MAX_MOHM
+        if visible_all:
+            values = [v for _, v in visible_all]
+            ymin = min(values)
+            ymax = max(values)
+            if abs(ymax - ymin) < 1e-9:
+                pad = max(1.0, abs(ymax) * 0.05)
+            else:
+                pad = (ymax - ymin) * 0.12
+            ymin -= pad
+            ymax += pad
+        else:
+            ymin, ymax = 0.0, 1.0
 
         def x_from_time(t):
             age = self.now - t
             return left + ((HEKA_PLOT_WINDOW_S - age) / HEKA_PLOT_WINDOW_S) * plot_w
 
         def y_from_value(v):
-            v = clamp(v, ymin, ymax)
             return top + (1.0 - ((v - ymin) / (ymax - ymin))) * plot_h
 
         grid = QPen(Qt.GlobalColor.lightGray)
         grid.setColor(Qt.GlobalColor.lightGray)
         axis = QPen(Qt.GlobalColor.black, 2)
-        line = QPen(Qt.GlobalColor.blue, 3)
-        line.setColor(Qt.GlobalColor.darkCyan)
+        line = QPen(self.line_color, 3)
 
         painter.setPen(grid)
         for i in range(6):
             frac = i / 5.0
             x = left + frac * plot_w
             painter.drawLine(int(x), top, int(x), top + plot_h)
-            seconds = int(round(HEKA_PLOT_WINDOW_S * (frac - 1.0)))
+            milliseconds = HEKA_PLOT_WINDOW_S * 1000.0 * (frac - 1.0)
             painter.setPen(Qt.GlobalColor.darkGray)
-            painter.drawText(int(x - 14), top + plot_h + 24, 36, 16, Qt.AlignCenter, str(seconds))
+            painter.drawText(
+                int(x - 18),
+                top + plot_h + 24,
+                42,
+                16,
+                Qt.AlignCenter,
+                f"{milliseconds:.0f}",
+            )
             painter.setPen(grid)
 
         for i in range(5):
@@ -296,7 +340,7 @@ class HekaPlot(QWidget):
             value = ymax - frac * (ymax - ymin)
             painter.drawLine(left, int(y), left + plot_w, int(y))
             painter.setPen(Qt.GlobalColor.darkGray)
-            painter.drawText(6, int(y - 8), left - 14, 16, Qt.AlignRight, f"{value:.0f}")
+            painter.drawText(6, int(y - 8), left - 14, 16, Qt.AlignRight, f"{value:.3g}")
             painter.setPen(grid)
 
         painter.setPen(axis)
@@ -304,8 +348,8 @@ class HekaPlot(QWidget):
         painter.drawLine(left, top + plot_h, left + plot_w, top + plot_h)
 
         painter.setPen(Qt.GlobalColor.darkGray)
-        painter.drawText(left, height - 24, plot_w, 18, Qt.AlignCenter, "Time (s)")
-        painter.drawText(left + 4, 2, 80, 16, Qt.AlignLeft, "MOhm")
+        painter.drawText(left, height - 24, plot_w, 18, Qt.AlignCenter, "Time (ms)")
+        painter.drawText(left + 4, 2, 120, 16, Qt.AlignLeft, self.unit)
 
         if len(visible) >= 2:
             painter.setPen(line)
@@ -315,7 +359,7 @@ class HekaPlot(QWidget):
                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
         elif len(visible) == 1:
             painter.setPen(Qt.NoPen)
-            painter.setBrush(Qt.GlobalColor.darkCyan)
+            painter.setBrush(self.line_color)
             x = x_from_time(visible[0][0])
             y = y_from_value(visible[0][1])
             painter.drawEllipse(int(x - 4), int(y - 4), 8, 8)
@@ -327,8 +371,18 @@ class HekaPlot(QWidget):
                 plot_w,
                 plot_h,
                 Qt.AlignCenter,
-                "Waiting for /heka/resistance_mohm",
+                f"Waiting for {self.waiting_topic}",
             )
+
+    @staticmethod
+    def _decimate(points, max_points):
+        if len(points) <= max_points:
+            return points
+        stride = max(1, math.ceil(len(points) / max_points))
+        decimated = points[::stride]
+        if decimated[-1] != points[-1]:
+            decimated.append(points[-1])
+        return decimated
 
 
 class KeyRouter(QObject):
@@ -540,8 +594,10 @@ class UMPGuiApp(QMainWindow):
         self.live_motor = QLabel("--")
         self.live_motor.setObjectName("liveValue")
         self.live_motor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.heka_resistance = QLabel("Resistance: -- MOhm")
-        self.heka_resistance.setObjectName("sectionTitle")
+        self.heka_voltage = QLabel("Voltage: -- V")
+        self.heka_voltage.setObjectName("sectionTitle")
+        self.heka_current = QLabel("Current: -- pA")
+        self.heka_current.setObjectName("sectionTitle")
 
         self.motor_step = self._spin(DEFAULT_MOTOR_STEP, 1, 100_000)
         self.motor_target = self._spin(0, MOTOR_MIN, MOTOR_MAX)
@@ -549,10 +605,19 @@ class UMPGuiApp(QMainWindow):
         self.camera_label = QLabel("Blackfly S Live")
         self.camera_label.setAlignment(Qt.AlignCenter)
         self.camera_label.setObjectName("cameraView")
-        self.camera_label.setMinimumSize(360, 240)
+        self.camera_label.setMinimumSize(360, 320)
         self.camera_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.heka_plot = HekaPlot()
+        self.heka_voltage_plot = HekaPlot(
+            unit="Voltage (V)",
+            waiting_topic=TOPIC_HEKA_VOLTAGE_RAW,
+            line_color=Qt.GlobalColor.red,
+        )
+        self.heka_current_plot = HekaPlot(
+            unit="Current (pA)",
+            waiting_topic=TOPIC_HEKA_CURRENT_PA,
+            line_color=Qt.GlobalColor.black,
+        )
 
         self.panel1 = UmpPanel(
             self,
@@ -583,7 +648,7 @@ class UMPGuiApp(QMainWindow):
         self.camera_timer.start(CAM_UPDATE_MS)
 
         self.heka_timer = QTimer(self)
-        self.heka_timer.timeout.connect(self._update_resistance_plot)
+        self.heka_timer.timeout.connect(self._update_heka_plots)
         self.heka_timer.start(HEKA_PLOT_UPDATE_MS)
 
     @staticmethod
@@ -638,9 +703,11 @@ class UMPGuiApp(QMainWindow):
         camera_title = QLabel("Blackfly S Live")
         camera_title.setObjectName("sectionTitle")
         right_layout.addWidget(camera_title)
-        right_layout.addWidget(self.camera_label, 3)
-        right_layout.addWidget(self.heka_resistance)
-        right_layout.addWidget(self.heka_plot, 2)
+        right_layout.addWidget(self.camera_label, 2)
+        right_layout.addWidget(self.heka_voltage)
+        right_layout.addWidget(self.heka_voltage_plot, 1)
+        right_layout.addWidget(self.heka_current)
+        right_layout.addWidget(self.heka_current_plot, 1)
 
         left_scroll = QScrollArea()
         left_scroll.setObjectName("controlScroll")
@@ -665,7 +732,7 @@ class UMPGuiApp(QMainWindow):
         title.setObjectName("appTitle")
         subtitle = QLabel(
             "Dual UMP control with focusing knob, pressure control, camera, "
-            "and resistance monitoring"
+            "and HEKA voltage/current monitoring"
         )
         subtitle.setObjectName("hint")
         text.addWidget(title)
@@ -823,13 +890,23 @@ class UMPGuiApp(QMainWindow):
         )
         self.camera_label.setPixmap(scaled)
 
-    def _update_resistance_plot(self):
-        now, latest, points = self.node.get_heka_resistance_snapshot()
-        if latest is None:
-            self.heka_resistance.setText("Resistance: -- MOhm")
+    def _update_heka_plots(self):
+        now, latest_v, latest_i, voltage_points, current_points = (
+            self.node.get_heka_signal_snapshot()
+        )
+
+        if latest_v is None:
+            self.heka_voltage.setText("Voltage: -- V")
         else:
-            self.heka_resistance.setText(f"Resistance: {latest:.3f} MOhm")
-        self.heka_plot.set_data(now, latest, points)
+            self.heka_voltage.setText(f"Voltage: {latest_v:.6g} V")
+
+        if latest_i is None:
+            self.heka_current.setText("Current: -- pA")
+        else:
+            self.heka_current.setText(f"Current: {latest_i:.6g} pA")
+
+        self.heka_voltage_plot.set_data(now, latest_v, voltage_points)
+        self.heka_current_plot.set_data(now, latest_i, current_points)
 
     def closeEvent(self, event):
         QApplication.instance().removeEventFilter(self.key_router)

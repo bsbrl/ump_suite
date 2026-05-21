@@ -34,7 +34,7 @@ ump_suite/
 │   ├── logger_node.py           # CSV + frame + video dataset logger
 │   ├── gui_node.py              # PyQt control panel
 │   ├── sensapex_env.py          # Synchronous ROS2 client used by VLA rollouts
-│   ├── heka_udp_receiver_node.py # HEKA UDP bridge for resistance / monitor voltage
+│   ├── heka_udp_receiver_node.py # HEKA UDP bridge for voltage/current samples
 │   ├── main.py                  # Closed-loop OpenPI rollout (absolute targets)
 │   └── rollout.py               # Shared CLI args / E-stop / SIGINT helpers
 └── InstallationFiles/libum.so   # Sensapex shared library
@@ -55,9 +55,11 @@ All names live in [ros_interfaces.py](ump_suite/ros_interfaces.py).
 | `/camera/record_cmd` | `std_msgs/String` | subscribe | Path = start mp4 recording, `""` = stop |
 | `/pressure/solenoid1/cmd`, `/pressure/solenoid2/cmd` | `std_msgs/Bool` | subscribe | `True` = energize relay, `False` = release |
 | `/pressure/solenoid1/state`, `/pressure/solenoid2/state` | `std_msgs/Bool` | publish | Echoed state from the Arduino after each command |
-| `/heka/resistance_mohm` | `std_msgs/Float32` | publish | Latest finite resistance value from HEKA UDP packets |
-| `/heka/monitor_v` | `std_msgs/Float32` | publish | Mean monitor voltage from HEKA UDP packets |
-| `/heka/monitor_step_v` | `std_msgs/Float32` | publish | Monitor step voltage from HEKA UDP packets |
+| `/heka/voltage_raw_v` | `std_msgs/Float32MultiArray` | publish | HEKA voltage sample packet: `[sample_rate_hz, v0, v1, ...]` |
+| `/heka/current_pa` | `std_msgs/Float32MultiArray` | publish | HEKA current sample packet: `[sample_rate_hz, i0, i1, ...]` |
+| `/heka/monitor_v` | `std_msgs/Float32` | publish | Latest voltage sample from binary packets; mean monitor voltage for legacy packets |
+| `/heka/monitor_step_v` | `std_msgs/Float32` | publish | Legacy monitor step voltage |
+| `/heka/resistance_mohm` | `std_msgs/Float32` | publish | Legacy finite resistance value; reserved for computed resistance |
 | `/ump/calibrate_zero`, `/ump2/calibrate_zero` | `std_srvs/Trigger` | service | Calibrate zero at the current pose |
 | `/acq/start`, `/acq/stop` | `std_srvs/Trigger` | service | Begin / end a logged trial |
 
@@ -97,20 +99,29 @@ Parameters:
 | `reconnect_s` | `2.0` | Delay before retrying a closed port. |
 
 ### `heka_udp_receiver_node`
-Listens for UDP packets on `port` (default `5005`) and expects comma-separated fields:
+Listens for UDP packets on `port` (default `5005`). The current Windows sender emits binary packets:
+
+```
+header = "<5sdfH": magic=b"HEKA1", first_sample_time, sample_rate_hz, sample_count
+payload = repeated float32 pairs: voltage_raw_v, current_pA
+```
+
+It republishes voltage packets on `/heka/voltage_raw_v` and current packets on `/heka/current_pa` as `Float32MultiArray` messages whose first element is the sample rate and remaining elements are samples. It also republishes the latest voltage sample on `/heka/monitor_v`.
+
+The previous comma-separated packet format is still accepted for compatibility:
 
 ```
 timestamp, mean_voltage_V, monitor_step_V, resistance_MOhm
 ```
 
-It republishes the monitor voltage on `/heka/monitor_v`, the monitor step on `/heka/monitor_step_v`, and finite resistance values on `/heka/resistance_mohm`. The GUI plots the last 10 seconds of resistance, and the logger appends the latest resistance value to each CSV row.
+For now, the GUI plots the last 10 ms of voltage and current. The logger still includes the `resistance_mohm` column for the resistance topic; with the new binary voltage/current packets that column stays blank until computed resistance is published.
 
 ### `logger_node`
 Builds a synchronized dataset:
 1. Subscribes to **live** topics (UMP1, UMP2, motor) and to **target** topics published by the GUI / policy.
-2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value.
+2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value when available.
 3. On `/acq/start`, picks the next free `trial_N` ID under `logs/`, opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and tells the camera to record `saved_videos/trial_N.mp4`.
-4. Every `log_interval_ms` it saves the latest JPEG to `saved_frames/trial_N/frame_NNNNNN.png` and appends one CSV row with the live pose, the most-recent commanded target, the saved image's path, and the latest resistance.
+4. Every `log_interval_ms` it saves the latest JPEG to `saved_frames/trial_N/frame_NNNNNN.png` and appends one CSV row with the live pose, the most-recent commanded target, the saved image's path, and the latest resistance when available.
 5. On `/acq/stop` it closes the file and sends an empty record command to the camera.
 
 The latest target is **not cleared** between ticks, so even if the user stops issuing commands the most recent target keeps appearing in the log and `(target − current)` is always meaningful.
@@ -128,7 +139,7 @@ resistance_mohm
 ```
 
 ### `gui_node`
-A PyQt5 control panel split into a controls column and a live camera / HEKA preview column. Two `UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D controls, nudge buttons, axis step, speed, **Send Now**, **Home**, **Sync Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Solenoids)** panel with ON/OFF buttons and live state badges for each solenoid, Start / Stop buttons that call `/acq/start` and `/acq/stop`, and a 10-second rolling plot of `/heka/resistance_mohm`.
+A PyQt5 control panel split into a controls column and a live camera / HEKA preview column. Two `UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D controls, nudge buttons, axis step, speed, **Send Now**, **Home**, **Sync Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Solenoids)** panel with ON/OFF buttons and live state badges for each solenoid, Start / Stop buttons that call `/acq/start` and `/acq/stop`, and rolling 10 ms voltage/current plots from `/heka/voltage_raw_v` and `/heka/current_pa`.
 
 Keyboard shortcuts (UMP1 only):
 

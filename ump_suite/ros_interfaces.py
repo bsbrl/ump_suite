@@ -32,3 +32,5 @@ SRV_ZERO2     = "/ump2/calibrate_zero"
 TOPIC_HEKA_RESISTANCE = "/heka/resistance_mohm"      # std_msgs/Float32
 TOPIC_HEKA_MONITOR_V = "/heka/monitor_v"            # std_msgs/Float32
 TOPIC_HEKA_MONITOR_STEP_V = "/heka/monitor_step_v"  # std_msgs/Float32
+TOPIC_HEKA_VOLTAGE_RAW = "/heka/voltage_raw_v"      # Float32MultiArray [rate_hz, samples...]
+TOPIC_HEKA_CURRENT_PA = "/heka/current_pa"          # Float32MultiArray [rate_hz, samples...]
