@@ -2,7 +2,7 @@
 
 When acquisition is running, this node periodically writes one CSV row per
 "timestep" containing:
-  * the latest live state of UMP1, UMP2 and the motor
+  * the latest live state of UMP1 and UMP2
   * the most recent commanded *target* for each of them (latest, not consumed)
   * the path of the camera frame that was saved on this tick
 
@@ -18,7 +18,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float32, Int32, Int32MultiArray, String
+from std_msgs.msg import Float32, Int32MultiArray, String
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
@@ -27,8 +27,6 @@ from .ros_interfaces import (
     TOPIC_CAM_IMAGE_COMPRESSED,
     TOPIC_CAM_REC_CMD,
     TOPIC_HEKA_RESISTANCE,
-    TOPIC_MOTOR_LIVE,
-    TOPIC_MOTOR_TGT,
     TOPIC_UMP_LIVE,
     TOPIC_UMP_TARGET,
     TOPIC_UMP2_LIVE,
@@ -38,8 +36,8 @@ from .ros_interfaces import (
 
 CSV_HEADER = [
     "timestep",
-    "current_x",  "current_y",  "current_z",  "current_d",  "current_motor",
-    "target_x",   "target_y",   "target_z",   "target_d",   "target_motor",
+    "current_x",  "current_y",  "current_z",  "current_d",
+    "target_x",   "target_y",   "target_z",   "target_d",
     "current_x2", "current_y2", "current_z2", "current_d2",
     "target_x2",  "target_y2",  "target_z2",  "target_d2",
     "image_path",
@@ -62,7 +60,6 @@ class LoggerNode(Node):
         # Latest live state.
         self.latest_live_ump = None
         self.latest_live_ump2 = None
-        self.latest_live_motor = None
         self.latest_image_msg = None
         self.latest_resistance_mohm = None
 
@@ -71,7 +68,6 @@ class LoggerNode(Node):
         # appearing in subsequent rows so target/current can always be diffed.
         self.latest_target_ump = None
         self.latest_target_ump2 = None
-        self.latest_target_motor = None
 
         self.acquiring = False
         self.trial_name = None
@@ -87,12 +83,10 @@ class LoggerNode(Node):
         # Live state subscribers.
         self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE,   self.on_ump_live,   10)
         self.create_subscription(Int32MultiArray, TOPIC_UMP2_LIVE,  self.on_ump2_live,  10)
-        self.create_subscription(Int32,           TOPIC_MOTOR_LIVE, self.on_motor_live, 10)
 
         # Target subscribers (snoop on whatever the GUI / VLA publishes).
         self.create_subscription(Int32MultiArray, TOPIC_UMP_TARGET,  self.on_ump_target,  10)
         self.create_subscription(Int32MultiArray, TOPIC_UMP2_TARGET, self.on_ump2_target, 10)
-        self.create_subscription(Int32,           TOPIC_MOTOR_TGT,   self.on_motor_target, 10)
 
         self.create_subscription(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self.on_img, 10)
         self.create_subscription(Float32, TOPIC_HEKA_RESISTANCE, self.on_resistance, 10)
@@ -112,18 +106,12 @@ class LoggerNode(Node):
     def on_ump2_live(self, msg: Int32MultiArray):
         self.latest_live_ump2 = list(msg.data)
 
-    def on_motor_live(self, msg: Int32):
-        self.latest_live_motor = int(msg.data)
-
     def on_ump_target(self, msg: Int32MultiArray):
         # /ump/target carries [x,y,z,d,speed]; we only log [x,y,z,d].
         self.latest_target_ump = list(msg.data)
 
     def on_ump2_target(self, msg: Int32MultiArray):
         self.latest_target_ump2 = list(msg.data)
-
-    def on_motor_target(self, msg: Int32):
-        self.latest_target_motor = int(msg.data)
 
     def on_img(self, msg: CompressedImage):
         self.latest_image_msg = msg
@@ -225,11 +213,9 @@ class LoggerNode(Node):
 
         cx,  cy,  cz,  cd  = _xyzd(self.latest_live_ump)
         cx2, cy2, cz2, cd2 = _xyzd(self.latest_live_ump2)
-        cm = int(self.latest_live_motor) if self.latest_live_motor is not None else 0
 
         tx,  ty,  tz,  td  = _xyzd(self.latest_target_ump)
         tx2, ty2, tz2, td2 = _xyzd(self.latest_target_ump2)
-        tm = int(self.latest_target_motor) if self.latest_target_motor is not None else 0
         resistance = (
             float(self.latest_resistance_mohm)
             if self.latest_resistance_mohm is not None
@@ -240,8 +226,8 @@ class LoggerNode(Node):
 
         self.writer.writerow([
             self.timestep,
-            cx, cy, cz, cd, cm,
-            tx, ty, tz, td, tm,
+            cx, cy, cz, cd,
+            tx, ty, tz, td,
             cx2, cy2, cz2, cd2,
             tx2, ty2, tz2, td2,
             image_path,

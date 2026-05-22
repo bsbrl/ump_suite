@@ -8,14 +8,16 @@ TOPIC_UMP_LIVE   = "/ump/live"            # Int32MultiArray [x,y,z,d]
 TOPIC_UMP2_TARGET = "/ump2/target"
 TOPIC_UMP2_LIVE   = "/ump2/live"
 
-# ODrive motor (single axis)
+# ODrive motor (manual GUI control; not part of policy rollout/logged CSV state)
 TOPIC_MOTOR_TGT  = "/motor/target_counts"   # Int32 absolute encoder counts
 TOPIC_MOTOR_LIVE = "/motor/live_counts"     # Int32 current counts
 
-# Pressure control (Arduino-driven solenoids)
+# Pressure control (single Arduino-driven solenoid)
 TOPIC_SOL1_CMD   = "/pressure/solenoid1/cmd"     # Bool: True=ON, False=OFF
-TOPIC_SOL2_CMD   = "/pressure/solenoid2/cmd"     # Bool: True=ON, False=OFF
 TOPIC_SOL1_STATE = "/pressure/solenoid1/state"   # Bool: echoed actual state
+
+# Legacy names kept for older scripts; the current pressure node/GUI do not use them.
+TOPIC_SOL2_CMD   = "/pressure/solenoid2/cmd"     # Bool: True=ON, False=OFF
 TOPIC_SOL2_STATE = "/pressure/solenoid2/state"   # Bool: echoed actual state
 
 # Camera (Blackfly via PySpin)

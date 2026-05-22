@@ -59,8 +59,6 @@ from .ros_interfaces import (
     TOPIC_MOTOR_TGT,
     TOPIC_SOL1_CMD,
     TOPIC_SOL1_STATE,
-    TOPIC_SOL2_CMD,
-    TOPIC_SOL2_STATE,
     TOPIC_UMP_LIVE,
     TOPIC_UMP_TARGET,
     TOPIC_UMP2_LIVE,
@@ -106,7 +104,6 @@ class GuiNode(Node):
         )
         self.pub_motor_tgt = self.create_publisher(Int32, TOPIC_MOTOR_TGT, 10)
         self.pub_sol1_cmd = self.create_publisher(Bool, TOPIC_SOL1_CMD, 10)
-        self.pub_sol2_cmd = self.create_publisher(Bool, TOPIC_SOL2_CMD, 10)
 
         self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE, self._on_ump_live, 10)
         self.create_subscription(
@@ -117,7 +114,6 @@ class GuiNode(Node):
             CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self._on_cam_image, 10
         )
         self.create_subscription(Bool, TOPIC_SOL1_STATE, self._on_sol1_state, 10)
-        self.create_subscription(Bool, TOPIC_SOL2_STATE, self._on_sol2_state, 10)
         self.create_subscription(
             Float32MultiArray, TOPIC_HEKA_VOLTAGE_RAW, self._on_heka_voltage, 10
         )
@@ -138,7 +134,6 @@ class GuiNode(Node):
         self.latest_live_motor = 0
         self.latest_frame_bgr = None
         self.latest_sol1_state = False
-        self.latest_sol2_state = False
         self.latest_heka_voltage = None
         self.latest_heka_current = None
         self.latest_heka_resistance = None
@@ -156,9 +151,6 @@ class GuiNode(Node):
 
     def _on_sol1_state(self, msg: Bool):
         self.latest_sol1_state = bool(msg.data)
-
-    def _on_sol2_state(self, msg: Bool):
-        self.latest_sol2_state = bool(msg.data)
 
     def _on_cam_image(self, msg: CompressedImage):
         try:
@@ -599,8 +591,7 @@ class UMPGuiApp(QMainWindow):
 
         self.status = QLabel("Ready")
         self.acq_pill = StatusPill("STOPPED")
-        self.sol1_pill = StatusPill("S1 OFF")
-        self.sol2_pill = StatusPill("S2 OFF")
+        self.sol1_pill = StatusPill("OFF")
         self.live_motor = QLabel("--")
         self.live_motor.setObjectName("liveValue")
         self.live_motor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -790,27 +781,22 @@ class UMPGuiApp(QMainWindow):
         return group
 
     def _pressure_group(self):
-        group = QGroupBox("Pressure (Solenoids)")
+        group = QGroupBox("Pressure (Solenoid)")
         layout = QGridLayout(group)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setHorizontalSpacing(6)
         layout.setVerticalSpacing(6)
 
-        layout.addWidget(QLabel("Solenoid 1"), 0, 0)
-        layout.addWidget(self._pressure_button("ON", 1, True), 0, 1)
-        layout.addWidget(self._pressure_button("OFF", 1, False), 0, 2)
+        layout.addWidget(QLabel("Solenoid"), 0, 0)
+        layout.addWidget(self._pressure_button("ON", True), 0, 1)
+        layout.addWidget(self._pressure_button("OFF", False), 0, 2)
         layout.addWidget(self.sol1_pill, 0, 3)
-
-        layout.addWidget(QLabel("Solenoid 2"), 1, 0)
-        layout.addWidget(self._pressure_button("ON", 2, True), 1, 1)
-        layout.addWidget(self._pressure_button("OFF", 2, False), 1, 2)
-        layout.addWidget(self.sol2_pill, 1, 3)
         return group
 
-    def _pressure_button(self, text, which, on):
+    def _pressure_button(self, text, on):
         button = QPushButton(text)
         button.setProperty("kind", "danger" if on else "secondary")
-        button.clicked.connect(lambda _checked=False: self._set_solenoid(which, on))
+        button.clicked.connect(lambda _checked=False: self._set_solenoid(on))
         return button
 
     def _acquisition_group(self):
@@ -872,10 +858,9 @@ class UMPGuiApp(QMainWindow):
         self.motor_target.setValue(new_val)
         self._publish_motor_target()
 
-    def _set_solenoid(self, which, on):
-        pub = self.node.pub_sol1_cmd if which == 1 else self.node.pub_sol2_cmd
-        pub.publish(Bool(data=bool(on)))
-        self.set_status(f"Solenoid {which}: {'ON' if on else 'OFF'}")
+    def _set_solenoid(self, on):
+        self.node.pub_sol1_cmd.publish(Bool(data=bool(on)))
+        self.set_status(f"Solenoid: {'ON' if on else 'OFF'}")
 
     def _acq_start(self):
         ok, msg = self.node.call_trigger(self.node.cli_acq_start)
@@ -891,10 +876,8 @@ class UMPGuiApp(QMainWindow):
         self.panel1.update_live_display()
         self.panel2.update_live_display()
         self.live_motor.setText(f"{int(self.node.latest_live_motor):d}")
-        sol1_text = "S1 ON" if self.node.latest_sol1_state else "S1 OFF"
-        sol2_text = "S2 ON" if self.node.latest_sol2_state else "S2 OFF"
+        sol1_text = "ON" if self.node.latest_sol1_state else "OFF"
         self.sol1_pill.set_on(self.node.latest_sol1_state, sol1_text)
-        self.sol2_pill.set_on(self.node.latest_sol2_state, sol2_text)
         resistance = self.node.latest_heka_resistance
         if resistance is None:
             self.live_resistance.setText("-- MOhm")

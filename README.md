@@ -1,6 +1,6 @@
 # ump_suite
 
-A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **Sensapex UMP micromanipulators**, an **ODrive**-driven focusing knob and a **FLIR Blackfly S** camera.
+A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **two Sensapex UMP micromanipulators**, an **ODrive**-driven focusing knob and a **FLIR Blackfly S** camera.
 
 The package wraps every device behind a small ROS2 node, ships a Qt GUI for manual teleop, a logger that writes synchronized image / video / CSV trials, and a thin client that lets an [OpenPI](https://github.com/Physical-Intelligence/openpi) policy server drive the rig in closed loop.
 
@@ -13,7 +13,7 @@ The package wraps every device behind a small ROS2 node, ships a Qt GUI for manu
 | Sensapex UMP (×2) | `sensapex` Python SDK + `libum.so` | [ump_driver_node.py](ump_suite/ump_driver_node.py) |
 | ODrive single-axis motor (focusing knob) | `odrive` Python SDK | [odrive_driver_node.py](ump_suite/odrive_driver_node.py) |
 | FLIR Blackfly S camera | PySpin (Spinnaker) | [camera_node.py](ump_suite/camera_node.py) |
-| Arduino + 2-channel relay (pressure solenoids) | `pyserial` | [pressure_node.py](ump_suite/pressure_node.py) |
+| Arduino + relay (pressure solenoid) | `pyserial` | [pressure_node.py](ump_suite/pressure_node.py) |
 | HEKA / patch-clamp monitor stream | UDP packets | [heka_udp_receiver_node.py](ump_suite/heka_udp_receiver_node.py) |
 
 A copy of the Sensapex shared library used during development is bundled at [InstallationFiles/libum.so](InstallationFiles/libum.so).
@@ -28,15 +28,14 @@ ump_suite/
 ├── ump_suite/
 │   ├── ros_interfaces.py        # Topic / service name constants shared by all nodes
 │   ├── ump_driver_node.py       # Sensapex UMP driver (one per device)
-│   ├── odrive_driver_node.py    # ODrive height-stage driver
+│   ├── odrive_driver_node.py    # ODrive focusing-knob driver
 │   ├── camera_node.py           # PySpin camera publisher + mp4 recorder
-│   ├── pressure_node.py         # Arduino serial bridge for pressure solenoids
+│   ├── pressure_node.py         # Arduino serial bridge for pressure solenoid
 │   ├── logger_node.py           # CSV + frame + video dataset logger
 │   ├── gui_node.py              # PyQt control panel
 │   ├── sensapex_env.py          # Synchronous ROS2 client used by VLA rollouts
 │   ├── heka_udp_receiver_node.py # HEKA UDP bridge for voltage/current samples
-│   ├── main.py                  # Closed-loop OpenPI rollout (absolute targets)
-│   └── rollout.py               # Shared CLI args / E-stop / SIGINT helpers
+│   └── main.py                  # Closed-loop OpenPI rollout (absolute targets)
 └── InstallationFiles/libum.so   # Sensapex shared library
 ```
 
@@ -53,8 +52,8 @@ All names live in [ros_interfaces.py](ump_suite/ros_interfaces.py).
 | `/camera/image/compressed` | `sensor_msgs/CompressedImage` | publish | JPEG preview from PySpin grabber |
 | `/camera/fps` | `std_msgs/Float32` | publish | Effective grabber FPS |
 | `/camera/record_cmd` | `std_msgs/String` | subscribe | Path = start mp4 recording, `""` = stop |
-| `/pressure/solenoid1/cmd`, `/pressure/solenoid2/cmd` | `std_msgs/Bool` | subscribe | `True` = energize relay, `False` = release |
-| `/pressure/solenoid1/state`, `/pressure/solenoid2/state` | `std_msgs/Bool` | publish | Echoed state from the Arduino after each command |
+| `/pressure/solenoid1/cmd` | `std_msgs/Bool` | subscribe | `True` = energize relay, `False` = release |
+| `/pressure/solenoid1/state` | `std_msgs/Bool` | publish | Echoed state from the Arduino after each command |
 | `/heka/voltage_raw_v` | `std_msgs/Float32MultiArray` | publish | HEKA voltage sample packet: `[sample_rate_hz, v0, v1, ...]` |
 | `/heka/current_pa` | `std_msgs/Float32MultiArray` | publish | HEKA current sample packet: `[sample_rate_hz, i0, i1, ...]` |
 | `/heka/monitor_v` | `std_msgs/Float32` | publish | Latest voltage sample from binary packets; mean monitor voltage for legacy packets |
@@ -77,6 +76,8 @@ The `ump_dual_driver_node` entry point runs both devices in one process so they 
 ### `odrive_driver_node`
 Connects via `odrive.find_any()`, puts axis 0 into closed-loop velocity control, and implements a software bang-bang position controller on top: every tick it diffs the latest target against `encoder.shadow_count` and commands `±goto_speed_turns_s` until inside `deadband_counts`. The axis is returned to idle on shutdown.
 
+The ODrive remains available for manual focusing-knob control from the GUI, but it is not included in the policy rollout action vector and is not written into the CSV logger.
+
 ### `camera_node`
 Initializes the first PySpin camera, prefers `BGR8` and `NewestOnly` stream buffering so the policy / GUI always see the freshest frame. A worker thread:
 - publishes a JPEG preview (`jpeg_quality`) at `publish_hz` on `/camera/image/compressed`
@@ -88,7 +89,7 @@ Recording is toggled by sending a path on `/camera/record_cmd` (empty string to 
 PySpin needs the system Spinnaker `.so` libraries plus a dedicated virtualenv, so the launch file starts the camera node via `ExecuteProcess` with the venv activated rather than as a normal `ament_python` executable. Edit the `CAMERA_BOOTSTRAP` string in [launch/app.launch.py](launch/app.launch.py) to match your setup.
 
 ### `pressure_node`
-Talks to an Arduino (2-channel relay module, default active-LOW) over USB serial using `pyserial`. Subscribes to `/pressure/solenoid{1,2}/cmd` and writes `S11`/`S10`/`S21`/`S20` + newline, matching the Arduino sketch on the device. A background reader thread parses the Arduino's `S1 ON/OFF` echoes and republishes them on `/pressure/solenoid{1,2}/state`. Both solenoids are released on shutdown.
+Talks to an Arduino relay controller (active-LOW in the current sketch) over USB serial using `pyserial`. Subscribes to `/pressure/solenoid1/cmd` and writes `S11`/`S10` + newline, matching the Arduino sketch on the device. A background reader thread parses the Arduino's `Solenoid ON/OFF` echoes and republishes them on `/pressure/solenoid1/state`. The solenoid is released on shutdown.
 
 Parameters:
 
@@ -118,7 +119,7 @@ For now, the GUI plots voltage and current and shows the live resistance estimat
 
 ### `logger_node`
 Builds a synchronized dataset:
-1. Subscribes to **live** topics (UMP1, UMP2, motor) and to **target** topics published by the GUI / policy.
+1. Subscribes to **live** topics (UMP1, UMP2) and to **target** topics published by the GUI / policy.
 2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value when available.
 3. On `/acq/start`, picks the next free `trial_N` ID under `logs/`, opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and tells the camera to record `saved_videos/trial_N.mp4`.
 4. Every `log_interval_ms` it saves the latest JPEG to `saved_frames/trial_N/frame_NNNNNN.png` and appends one CSV row with the live pose, the most-recent commanded target, the saved image's path, and the latest resistance when available.
@@ -126,12 +127,14 @@ Builds a synchronized dataset:
 
 The latest target is **not cleared** between ticks, so even if the user stops issuing commands the most recent target keeps appearing in the log and `(target − current)` is always meaningful.
 
+The ODrive motor is intentionally excluded from the CSV rows. It can still be driven from the GUI, but the dataset state/target columns below are UMP-only.
+
 CSV columns:
 
 ```
 timestep,
-current_x, current_y, current_z, current_d, current_motor,
-target_x,  target_y,  target_z,  target_d,  target_motor,
+current_x, current_y, current_z, current_d,
+target_x,  target_y,  target_z,  target_d,
 current_x2, current_y2, current_z2, current_d2,
 target_x2,  target_y2,  target_z2,  target_d2,
 image_path,
@@ -139,7 +142,7 @@ resistance_mohm
 ```
 
 ### `gui_node`
-A PyQt5 control panel split into a controls column and a live camera / HEKA preview column. Two `UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D controls, nudge buttons, axis step, speed, **Send Now**, **Home**, **Sync Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Solenoids)** panel with ON/OFF buttons and live state badges for each solenoid, Start / Stop buttons that call `/acq/start` and `/acq/stop`, rolling voltage/current plots from `/heka/voltage_raw_v` and `/heka/current_pa`, and a live resistance readout.
+A PyQt5 control panel split into a controls column and a live camera / HEKA preview column. Two `UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D controls, nudge buttons, axis step, speed, **Send Now**, **Home**, **Sync Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Solenoid)** panel with ON/OFF buttons and a live state badge, Start / Stop buttons that call `/acq/start` and `/acq/stop`, rolling voltage/current plots from `/heka/voltage_raw_v` and `/heka/current_pa`, and a live resistance readout.
 
 Keyboard shortcuts (UMP1 only):
 
@@ -158,23 +161,25 @@ All commands are absolute targets — the bump buttons mutate the locally-held t
 
 [main.py](ump_suite/main.py) and [sensapex_env.py](ump_suite/sensapex_env.py) connect this rig to an [OpenPI](https://github.com/Physical-Intelligence/openpi) policy server.
 
-`SensapexEnv` spins its own `rclpy` node in a background thread, subscribes to `/camera/image/compressed`, `/ump/live`, `/ump2/live` and `/motor/live_counts`, and exposes a synchronous interface:
+`SensapexEnv` spins its own `rclpy` node in a background thread, subscribes to `/camera/image/compressed`, `/ump/live` and `/ump2/live`, and exposes a synchronous interface:
 
 ```python
 env = SensapexEnv(default_speed=100)
-obs = env.get_observation()      # SensapexObs(image_rgb, state=[x1,y1,z1,d1, x2,y2,z2,d2, h_ticks])
-env.step_absolute(action_9d)     # publishes /ump/target + /ump2/target + /motor/target_counts
+obs = env.get_observation()      # SensapexObs(image_rgb, state=[x1,y1,z1,d1, x2,y2,z2,d2])
+env.step_absolute(action_8d)     # 8 motion values: UMP1(4) + UMP2(4)
 env.close()
 ```
+
+The 8-value state/action vector is only the two 4-axis UMP manipulators. The ODrive focusing knob and pressure solenoid are controlled separately through `/motor/target_counts` and `/pressure/solenoid1/cmd`; neither is part of the policy rollout action vector.
 
 `main.py` runs the rollout loop:
 
 1. Asks the user for an instruction.
 2. Each tick, grabs `(image, state)` from `SensapexEnv`.
 3. Whenever the open-loop chunk is exhausted, packages `image` (resized) + `state` + `prompt` and calls `policy_client.infer(...)` against the OpenPI websocket server.
-4. Pops the next 9-dim absolute action from the chunk and runs it through:
-   - `clamp_action_9d` — per-stage workspace boxes (`X1_MIN/MAX`…`D1_MIN/MAX`, `X2_MIN/MAX`…`D2_MIN/MAX`, `H_MIN/MAX`)
-   - `limit_step` — per-tick max delta on each axis (`MAX_DX1/Y1/Z1/D1`, `MAX_DX2/Y2/Z2/D2`, `MAX_DH`)
+4. Pops the next 8-value absolute motion action from the chunk and runs it through:
+   - `clamp_action_8d` — per-stage workspace boxes (`X1_MIN/MAX`…`D1_MIN/MAX`, `X2_MIN/MAX`…`D2_MIN/MAX`)
+   - `limit_step` — per-tick max delta on each axis (`MAX_DX1/Y1/Z1/D1`, `MAX_DX2/Y2/Z2/D2`)
    - optional first-order EMA smoothing (`USE_EMA_SMOOTHING`, `EMA_ALPHA`)
 5. Sends the result via `env.step_absolute(...)` and sleeps to hold `CONTROL_FREQUENCY_HZ` (default 3 Hz, matching the dataset).
 
@@ -183,7 +188,7 @@ Two safety paths are wired in:
 - **E-stop** — press `q` + Enter at any time. The watcher thread (`start_estop_listener`) flips a flag the loop polls; on the next tick the env is commanded to hold its current state and the loop exits.
 - **SIGINT shielding around inference** — `prevent_keyboard_interrupt()` blocks `SIGINT` for the duration of the websocket round-trip so a Ctrl+C in the middle of inference cannot leave the websocket in a half-open state. The interrupt is re-raised cleanly after the call returns.
 
-CLI args (see [`RolloutArgs`](ump_suite/rollout.py)):
+CLI args are defined by the `Args` dataclass in [main.py](ump_suite/main.py):
 
 ```
 --remote-host             OpenPI server host (default 127.0.0.1)
@@ -198,7 +203,7 @@ CLI args (see [`RolloutArgs`](ump_suite/rollout.py)):
 --debug-every             Print one state/cmd line every N steps (0 = silent)
 ```
 
-> ⚠️ The safety limits in [main.py](ump_suite/main.py) (`X1_MIN`, `X1_MAX`, ..., `X2_MIN`, `X2_MAX`, `H_MIN`, `H_MAX`, `MAX_DX1`, `MAX_DX2`, ...) are tied to a specific physical setup. **Edit them for your stage before running a rollout.**
+> ⚠️ The safety limits in [main.py](ump_suite/main.py) (`X1_MIN`, `X1_MAX`, ..., `X2_MIN`, `X2_MAX`, `MAX_DX1`, `MAX_DX2`, ...) are tied to a specific physical setup. **Edit them for your stage before running a rollout.**
 
 ---
 
@@ -257,7 +262,7 @@ ros2 launch ump_suite app.launch.py pressure_port:=/dev/ttyACM0
 ### Collect a dataset trial
 
 1. Launch the suite as above.
-2. Use the GUI (or publish on `/ump/target`, `/ump2/target`, `/motor/target_counts` directly) to drive the rig.
+2. Use the GUI (or publish on `/ump/target`, `/ump2/target`, and `/motor/target_counts` directly) to drive the rig. The CSV logger records UMP state/targets and HEKA resistance, but not the ODrive motor.
 3. Click **Start Data Acquisition** — this calls `/acq/start`, which opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and asks the camera to record `saved_videos/trial_N.mp4`.
 4. Perform the trial. The logger writes one row per `log_interval_ms` (default 200 ms).
 5. Click **Stop Data Acquisition** — this calls `/acq/stop`, closes the CSV, and stops the mp4.
@@ -275,7 +280,7 @@ saved_videos/trial_1.mp4
 ### Run a closed-loop policy rollout
 
 1. Start the OpenPI websocket policy server somewhere reachable.
-2. Launch this suite (the rollout needs `/camera/image/compressed`, `/ump/live`, `/ump2/live`, and `/motor/live_counts`).
+2. Launch this suite (the rollout needs `/camera/image/compressed`, `/ump/live`, and `/ump2/live`).
 3. **Edit the safety limits in [main.py](ump_suite/main.py) for your stage.**
 4. Run:
 

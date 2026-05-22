@@ -1,12 +1,11 @@
-"""ROS2 driver for the Arduino-based pressure controller (two solenoids).
+"""ROS2 driver for the Arduino-based pressure controller (single solenoid).
 
 The Arduino firmware listens on a serial port for newline-terminated commands:
-    S11 -> solenoid 1 ON      S10 -> solenoid 1 OFF
-    S21 -> solenoid 2 ON      S20 -> solenoid 2 OFF
+    S11 -> solenoid ON      S10 -> solenoid OFF
 
 This node bridges those commands to ROS2:
-  * subscribes to /pressure/solenoid{1,2}/cmd (std_msgs/Bool)
-  * publishes the echoed state on /pressure/solenoid{1,2}/state (std_msgs/Bool)
+  * subscribes to /pressure/solenoid1/cmd (std_msgs/Bool)
+  * publishes the echoed state on /pressure/solenoid1/state (std_msgs/Bool)
 
 The serial port defaults to /dev/ttyACM1 but can be overridden via the
 `port` ROS parameter (see launch file).
@@ -22,8 +21,6 @@ from std_msgs.msg import Bool
 from .ros_interfaces import (
     TOPIC_SOL1_CMD,
     TOPIC_SOL1_STATE,
-    TOPIC_SOL2_CMD,
-    TOPIC_SOL2_STATE,
 )
 
 
@@ -43,10 +40,8 @@ class PressureNode(Node):
         self._stop = threading.Event()
 
         self.pub_sol1_state = self.create_publisher(Bool, TOPIC_SOL1_STATE, 10)
-        self.pub_sol2_state = self.create_publisher(Bool, TOPIC_SOL2_STATE, 10)
 
         self.create_subscription(Bool, TOPIC_SOL1_CMD, self._on_sol1_cmd, 10)
-        self.create_subscription(Bool, TOPIC_SOL2_CMD, self._on_sol2_cmd, 10)
 
         self._connect()
 
@@ -80,9 +75,6 @@ class PressureNode(Node):
     def _on_sol1_cmd(self, msg: Bool):
         self._send("S11" if msg.data else "S10")
 
-    def _on_sol2_cmd(self, msg: Bool):
-        self._send("S21" if msg.data else "S20")
-
     def _read_loop(self):
         reconnect_s = float(self.get_parameter("reconnect_s").value)
         while not self._stop.is_set():
@@ -108,21 +100,16 @@ class PressureNode(Node):
 
             self.get_logger().debug(f"Arduino: {line}")
 
-            if line == "S1 ON":
+            if line in ("Solenoid ON", "S1 ON"):
                 self.pub_sol1_state.publish(Bool(data=True))
-            elif line == "S1 OFF":
+            elif line in ("Solenoid OFF", "S1 OFF"):
                 self.pub_sol1_state.publish(Bool(data=False))
-            elif line == "S2 ON":
-                self.pub_sol2_state.publish(Bool(data=True))
-            elif line == "S2 OFF":
-                self.pub_sol2_state.publish(Bool(data=False))
 
     def destroy_node(self):
         self._stop.set()
         try:
             if self._ser is not None and self._ser.is_open:
                 self._send("S10")
-                self._send("S20")
                 self._ser.close()
         except Exception:
             pass

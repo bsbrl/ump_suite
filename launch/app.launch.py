@@ -24,7 +24,7 @@ CAMERA_BOOTSTRAP = (
 def generate_launch_description():
     pressure_port_arg = DeclareLaunchArgument(
         "pressure_port",
-        default_value="/dev/ttyACM1",
+        default_value="/dev/ttyACM0",
         description="Serial port for the pressure-control Arduino",
     )
 
