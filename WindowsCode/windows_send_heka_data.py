@@ -31,7 +31,7 @@ Linux unpack sketch:
     current_pA = samples[:, 1]
 """
 
-# windows_send_heka_resistance.py
+# windows_send_heka_data.py
 import socket
 import struct
 import time
