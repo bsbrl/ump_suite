@@ -2,11 +2,11 @@
 
 # UMP 1 ── primary Sensapex micromanipulator
 TOPIC_UMP_TARGET = "/ump/target"          # Int32MultiArray [x,y,z,d,speed] absolute
-TOPIC_UMP_LIVE   = "/ump/live"            # Int32MultiArray [x,y,z,d]
+TOPIC_UMP_LIVE   = "/ump/live"            # Int32MultiArray [x,y,z,d] absolute
 
 # UMP 2 ── secondary Sensapex micromanipulator
-TOPIC_UMP2_TARGET = "/ump2/target"
-TOPIC_UMP2_LIVE   = "/ump2/live"
+TOPIC_UMP2_TARGET = "/ump2/target"        # Int32MultiArray [x,y,z,d,speed] absolute
+TOPIC_UMP2_LIVE   = "/ump2/live"          # Int32MultiArray [x,y,z,d] absolute
 
 # ODrive motor (manual GUI control; not part of policy rollout/logged CSV state)
 TOPIC_MOTOR_TGT  = "/motor/target_counts"   # Int32 absolute encoder counts

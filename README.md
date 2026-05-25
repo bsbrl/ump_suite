@@ -45,8 +45,8 @@ All names live in [ros_interfaces.py](ump_suite/ros_interfaces.py).
 
 | Name | Type | Direction | Notes |
 |---|---|---|---|
-| `/ump/live`, `/ump2/live` | `std_msgs/Int32MultiArray` | publish | Current `[x, y, z, d]` in **centered counts** (0 = middle of travel) |
-| `/ump/target`, `/ump2/target` | `std_msgs/Int32MultiArray` | subscribe | Absolute target `[x, y, z, d, speed]` |
+| `/ump/live`, `/ump2/live` | `std_msgs/Int32MultiArray` | publish | Current `[x, y, z, d]` in absolute Sensapex device counts |
+| `/ump/target`, `/ump2/target` | `std_msgs/Int32MultiArray` | subscribe | Absolute Sensapex target `[x, y, z, d, speed]` |
 | `/motor/live_counts` | `std_msgs/Int32` | publish | Current ODrive shadow encoder count |
 | `/motor/target_counts` | `std_msgs/Int32` | subscribe | Absolute target encoder count |
 | `/camera/image/compressed` | `sensor_msgs/CompressedImage` | publish | JPEG preview from PySpin grabber |
@@ -62,14 +62,14 @@ All names live in [ros_interfaces.py](ump_suite/ros_interfaces.py).
 | `/ump/calibrate_zero`, `/ump2/calibrate_zero` | `std_srvs/Trigger` | service | Calibrate zero at the current pose |
 | `/acq/start`, `/acq/stop` | `std_srvs/Trigger` | service | Begin / end a logged trial |
 
-The UMP driver translates between the Sensapex SDK's unsigned device units and a symmetric "centered counts" frame (`CENTER_OFFSET = 10000`), so the GUI, logger and policies always see signed values around zero.
+The UMP driver publishes and accepts raw absolute Sensapex device coordinates. There is no `10000` count centering offset in the ROS topics.
 
 ---
 
 ## Nodes
 
 ### `ump_driver_node`
-Connects to the UMP at the configured `device_id`, publishes the live pose at `poll_ms`, and forwards `[x, y, z, d, speed]` targets to `stage.goto_pos`. Topic names are derived from the `topic_prefix` parameter so devices can expose `/ump/*` and `/ump2/*`.
+Connects to the UMP at the configured `device_id`, publishes the live absolute pose at `poll_ms`, and forwards `[x, y, z, d, speed]` targets directly to `stage.goto_pos`. Topic names are derived from the `topic_prefix` parameter so devices can expose `/ump/*` and `/ump2/*`.
 
 The `ump_dual_driver_node` entry point runs both devices in one process so they share the Sensapex SDK singleton / UDP socket. This is what [launch/app.launch.py](launch/app.launch.py) uses, because separate UMP processes can conflict on the SDK socket.
 
@@ -153,7 +153,7 @@ Keyboard shortcuts (UMP1 only):
 | `↑` / `↓` | Z +/− |
 | `,` `<` / `.` `>` | D −/+ |
 
-All commands are absolute targets — the bump buttons mutate the locally-held target and republish the full vector.
+All UMP commands are absolute Sensapex targets. The bump buttons mutate the locally-held target and republish the full vector; the GUI spin boxes use the raw device range (`0` to `20000` counts).
 
 ---
 

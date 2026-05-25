@@ -1,9 +1,9 @@
 """ROS2 driver for one Sensapex UMP micromanipulator stage.
 
 The Sensapex SDK reports positions in unsigned device units. This node exposes
-them as signed "centered counts" (0 = middle of travel) on the ROS topics, so
-that the GUI and logger can work with symmetric ranges. Topic names are built
-from a `topic_prefix` parameter, allowing one process per device.
+those same absolute device coordinates on the ROS topics and forwards absolute
+targets directly to the device. Topic names are built from a `topic_prefix`
+parameter, allowing one process per device.
 """
 
 import rclpy
@@ -12,20 +12,6 @@ from std_msgs.msg import Int32MultiArray
 from std_srvs.srv import Trigger
 
 from sensapex import UMP
-
-
-# Half the usable travel range, in device counts. Subtracted on the way out
-# and added back before sending commands so the rest of the stack sees a
-# symmetric coordinate system around zero.
-CENTER_OFFSET = 10000
-
-
-def device_to_center(v):
-    return int(v) - CENTER_OFFSET
-
-
-def center_to_device(v):
-    return int(v) + CENTER_OFFSET
 
 
 class UMPDriverNode(Node):
@@ -56,15 +42,15 @@ class UMPDriverNode(Node):
         )
         self.timer = self.create_timer(poll_ms / 1000.0, self.poll_live)
 
-    def _read_centered_pos(self):
-        """Return the current [x, y, z, d] position in centered counts."""
+    def _read_absolute_pos(self):
+        """Return the current [x, y, z, d] position in absolute device counts."""
         pos = self.stage.get_pos()
-        return [device_to_center(pos[i]) for i in range(4)]
+        return [int(pos[i]) for i in range(4)]
 
     def poll_live(self):
         try:
             msg = Int32MultiArray()
-            msg.data = self._read_centered_pos()
+            msg.data = self._read_absolute_pos()
             self.pub_live.publish(msg)
         except Exception as e:
             self.get_logger().warn(f"UMP live read error: {e}")
@@ -75,8 +61,7 @@ class UMPDriverNode(Node):
             return
         try:
             x, y, z, d, speed = (int(v) for v in msg.data[:5])
-            device = [center_to_device(v) for v in (x, y, z, d)]
-            self.stage.goto_pos(device, speed=speed)
+            self.stage.goto_pos([x, y, z, d], speed=speed)
         except Exception as e:
             self.get_logger().error(f"UMP goto_pos error: {e}")
 

@@ -66,11 +66,12 @@ from .ros_interfaces import (
 )
 
 
-AXIS_MIN, AXIS_MAX = -10000, 10000
+AXIS_MIN, AXIS_MAX = 0, 20000
 SPEED_MIN, SPEED_MAX = 10, 2000
 MOTOR_MIN, MOTOR_MAX = -1_000_000, 1_000_000
 
 DEFAULT_AXIS_STEP = 50
+DEFAULT_AXIS_TARGET = 10000
 DEFAULT_SPEED = 1000
 DEFAULT_MOTOR_STEP = 500
 
@@ -431,10 +432,10 @@ class UmpPanel(QGroupBox):
         self.axis_step = self._spin(DEFAULT_AXIS_STEP, 1, 5000)
         self.speed = self._spin(DEFAULT_SPEED, SPEED_MIN, SPEED_MAX)
         self.target_spins = {
-            "X": self._spin(0, AXIS_MIN, AXIS_MAX),
-            "Y": self._spin(0, AXIS_MIN, AXIS_MAX),
-            "Z": self._spin(0, AXIS_MIN, AXIS_MAX),
-            "D": self._spin(0, AXIS_MIN, AXIS_MAX),
+            "X": self._spin(DEFAULT_AXIS_TARGET, AXIS_MIN, AXIS_MAX),
+            "Y": self._spin(DEFAULT_AXIS_TARGET, AXIS_MIN, AXIS_MAX),
+            "Z": self._spin(DEFAULT_AXIS_TARGET, AXIS_MIN, AXIS_MAX),
+            "D": self._spin(DEFAULT_AXIS_TARGET, AXIS_MIN, AXIS_MAX),
         }
         self.live_labels = {axis: QLabel("--") for axis in self.target_spins}
 
