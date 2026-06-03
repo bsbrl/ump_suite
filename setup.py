@@ -34,7 +34,6 @@ setup(
             'camera_node = ump_suite.camera_node:main',
             'pressure_node = ump_suite.pressure_node:main',
             'logger_node = ump_suite.logger_node:main',
-            'sensapex_rollout = ump_suite.main:main_entry',
             'heka_udp_receiver_node = ump_suite.heka_udp_receiver_node:main',
         ],
     },
