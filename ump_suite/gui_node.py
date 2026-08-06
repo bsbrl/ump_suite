@@ -1,12 +1,15 @@
 """
 Modern Qt control panel for the UMP suite.
 
-The ROS surface is intentionally the same as the original Tk GUI:
+The ROS surface is:
   * publishes absolute UMP1 / UMP2 targets
   * publishes ODrive motor targets
-  * publishes solenoid commands
+  * publishes the binary pressure state plus the positive/negative mbar
+    setpoints it is resolved against
   * subscribes to live robot, pressure, camera, and HEKA voltage/current topics
   * calls acquisition and UMP zeroing services
+
+The panel is mouse-only; there are deliberately no keyboard shortcuts.
 
 Only the presentation layer changes. PyQt5 is used because it is available in
 the ROS environment on this machine and gives the app a more polished desktop
@@ -22,10 +25,11 @@ from collections import deque
 import cv2
 import numpy as np
 import rclpy
-from PyQt5.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont, QImage, QKeySequence, QPainter, QPen, QPixmap
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
+    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -33,7 +37,6 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
-    QShortcut,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -43,12 +46,23 @@ from PyQt5.QtWidgets import (
 )
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Bool, Float32, Float32MultiArray, Int32, Int32MultiArray
+from std_msgs.msg import (
+    Bool,
+    Float32,
+    Float32MultiArray,
+    Int8,
+    Int32,
+    Int32MultiArray,
+)
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
+    PRESSURE_STATE_NEGATIVE,
+    PRESSURE_STATE_POSITIVE,
+    PRESSURE_STATE_VENTED,
     SRV_ACQ_START,
     SRV_ACQ_STOP,
+    SRV_PRESSURE_VENT,
     SRV_ZERO,
     SRV_ZERO2,
     TOPIC_CAM_IMAGE_COMPRESSED,
@@ -57,12 +71,16 @@ from .ros_interfaces import (
     TOPIC_HEKA_VOLTAGE_RAW,
     TOPIC_MOTOR_LIVE,
     TOPIC_MOTOR_TGT,
-    TOPIC_SOL1_CMD,
-    TOPIC_SOL1_STATE,
+    TOPIC_PRESSURE_MEASURED,
+    TOPIC_PRESSURE_NEG_MBAR,
+    TOPIC_PRESSURE_POS_MBAR,
+    TOPIC_PRESSURE_STATE,
+    TOPIC_PRESSURE_STATE_CMD,
     TOPIC_UMP_LIVE,
     TOPIC_UMP_TARGET,
     TOPIC_UMP2_LIVE,
     TOPIC_UMP2_TARGET,
+    latched_qos,
 )
 
 
@@ -70,10 +88,16 @@ AXIS_MIN, AXIS_MAX = 0, 20000
 SPEED_MIN, SPEED_MAX = 10, 2000
 MOTOR_MIN, MOTOR_MAX = -1_000_000, 1_000_000
 
+# Matches the Fluigent LineUP push-pull channel range (+/-1000 mbar). The
+# pressure node clamps to whatever the connected controller actually reports.
+PRESSURE_LIMIT_MBAR = 1000.0
+
 DEFAULT_AXIS_STEP = 50
 DEFAULT_AXIS_TARGET = 10000
 DEFAULT_SPEED = 1000
 DEFAULT_MOTOR_STEP = 500
+DEFAULT_POSITIVE_MBAR = 20.0
+DEFAULT_NEGATIVE_MBAR = -20.0
 
 LIVE_POLL_MS = 50
 SEND_THROTTLE_MS = 60
@@ -104,7 +128,17 @@ class GuiNode(Node):
             Int32MultiArray, TOPIC_UMP2_TARGET, 10
         )
         self.pub_motor_tgt = self.create_publisher(Int32, TOPIC_MOTOR_TGT, 10)
-        self.pub_sol1_cmd = self.create_publisher(Bool, TOPIC_SOL1_CMD, 10)
+        self.pub_pressure_state_cmd = self.create_publisher(
+            Bool, TOPIC_PRESSURE_STATE_CMD, 10
+        )
+        # Latched so the pressure node picks up the dialed-in setpoints even if
+        # it (re)starts after the GUI.
+        self.pub_pressure_pos = self.create_publisher(
+            Float32, TOPIC_PRESSURE_POS_MBAR, latched_qos()
+        )
+        self.pub_pressure_neg = self.create_publisher(
+            Float32, TOPIC_PRESSURE_NEG_MBAR, latched_qos()
+        )
 
         self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE, self._on_ump_live, 10)
         self.create_subscription(
@@ -114,7 +148,12 @@ class GuiNode(Node):
         self.create_subscription(
             CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self._on_cam_image, 10
         )
-        self.create_subscription(Bool, TOPIC_SOL1_STATE, self._on_sol1_state, 10)
+        self.create_subscription(
+            Int8, TOPIC_PRESSURE_STATE, self._on_pressure_state, latched_qos()
+        )
+        self.create_subscription(
+            Float32, TOPIC_PRESSURE_MEASURED, self._on_pressure_measured, 10
+        )
         self.create_subscription(
             Float32MultiArray, TOPIC_HEKA_VOLTAGE_RAW, self._on_heka_voltage, 10
         )
@@ -129,12 +168,14 @@ class GuiNode(Node):
         self.cli_acq_stop = self.create_client(Trigger, SRV_ACQ_STOP)
         self.cli_zero = self.create_client(Trigger, SRV_ZERO)
         self.cli_zero2 = self.create_client(Trigger, SRV_ZERO2)
+        self.cli_pressure_vent = self.create_client(Trigger, SRV_PRESSURE_VENT)
 
         self.latest_live_ump = [0, 0, 0, 0]
         self.latest_live_ump2 = [0, 0, 0, 0]
         self.latest_live_motor = 0
         self.latest_frame_bgr = None
-        self.latest_sol1_state = False
+        self.latest_pressure_state = None  # PRESSURE_STATE_*, None until reported
+        self.latest_pressure_mbar = None
         self.latest_heka_voltage = None
         self.latest_heka_current = None
         self.latest_heka_resistance = None
@@ -150,8 +191,13 @@ class GuiNode(Node):
     def _on_motor_live(self, msg: Int32):
         self.latest_live_motor = int(msg.data)
 
-    def _on_sol1_state(self, msg: Bool):
-        self.latest_sol1_state = bool(msg.data)
+    def _on_pressure_state(self, msg: Int8):
+        self.latest_pressure_state = int(msg.data)
+
+    def _on_pressure_measured(self, msg: Float32):
+        value = float(msg.data)
+        if math.isfinite(value):
+            self.latest_pressure_mbar = value
 
     def _on_cam_image(self, msg: CompressedImage):
         try:
@@ -230,18 +276,28 @@ class GuiNode(Node):
 
 
 class StatusPill(QLabel):
-    """Small colored state badge used for solenoid and acquisition state."""
+    """Small colored state badge used for pressure and acquisition state."""
+
+    # tone -> (foreground, background, border)
+    TONES = {
+        "idle": ("#475569", "#f1f5f9", "#cbd5e1"),
+        "on": ("#166534", "#dcfce7", "#86efac"),
+        "positive": ("#9a3412", "#fff7ed", "#fdba74"),
+        "negative": ("#1e40af", "#eff6ff", "#93c5fd"),
+        "vented": ("#334155", "#e2e8f0", "#94a3b8"),
+    }
 
     def __init__(self, text="--", parent=None):
         super().__init__(text, parent)
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumWidth(74)
-        self.set_on(False, text)
+        self.set_tone(text, "idle")
 
     def set_on(self, on, text):
-        bg = "#dcfce7" if on else "#f1f5f9"
-        fg = "#166534" if on else "#475569"
-        border = "#86efac" if on else "#cbd5e1"
+        self.set_tone(text, "on" if on else "idle")
+
+    def set_tone(self, text, tone):
+        fg, bg, border = self.TONES[tone]
         self.setText(text)
         self.setStyleSheet(
             f"""
@@ -386,35 +442,6 @@ class HekaPlot(QWidget):
         if decimated[-1] != points[-1]:
             decimated.append(points[-1])
         return decimated
-
-
-class KeyRouter(QObject):
-    """Global key handler for UMP1 shortcuts."""
-
-    bump = pyqtSignal(str, int)
-
-    KEY_BINDINGS = {
-        Qt.Key_Up: ("Z", +1),
-        Qt.Key_Down: ("Z", -1),
-        Qt.Key_A: ("X", -1),
-        Qt.Key_D: ("X", +1),
-        Qt.Key_S: ("Y", -1),
-        Qt.Key_W: ("Y", +1),
-        Qt.Key_Comma: ("D", -1),
-        Qt.Key_Less: ("D", -1),
-        Qt.Key_Period: ("D", +1),
-        Qt.Key_Greater: ("D", +1),
-    }
-
-    def eventFilter(self, _obj, event):
-        if event.type() != QEvent.KeyPress:
-            return False
-        binding = self.KEY_BINDINGS.get(event.key())
-        if binding is None:
-            return False
-        axis, sign = binding
-        self.bump.emit(axis, sign)
-        return True
 
 
 class UmpPanel(QGroupBox):
@@ -592,7 +619,16 @@ class UMPGuiApp(QMainWindow):
 
         self.status = QLabel("Ready")
         self.acq_pill = StatusPill("STOPPED")
-        self.sol1_pill = StatusPill("OFF")
+        self.pressure_pill = StatusPill("--")
+        self.live_pressure = QLabel("-- mbar")
+        self.live_pressure.setObjectName("liveValue")
+        self.live_pressure.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.positive_mbar = self._double_spin(
+            DEFAULT_POSITIVE_MBAR, 0.0, PRESSURE_LIMIT_MBAR
+        )
+        self.negative_mbar = self._double_spin(
+            DEFAULT_NEGATIVE_MBAR, -PRESSURE_LIMIT_MBAR, 0.0
+        )
         self.live_motor = QLabel("--")
         self.live_motor.setObjectName("liveValue")
         self.live_motor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -642,7 +678,10 @@ class UMPGuiApp(QMainWindow):
         )
 
         self._build_ui()
-        self._install_shortcuts()
+
+        # Hand the pressure node the setpoints it should resolve states against,
+        # so a state command works before the operator touches the spin boxes.
+        self._publish_pressure_setpoints()
 
         self.live_timer = QTimer(self)
         self.live_timer.timeout.connect(self._poll_live_to_gui)
@@ -666,6 +705,21 @@ class UMPGuiApp(QMainWindow):
         spin.setButtonSymbols(QSpinBox.NoButtons)
         spin.setFixedHeight(28)
         spin.setMaximumWidth(92)
+        return spin
+
+    @staticmethod
+    def _double_spin(value, vmin, vmax):
+        spin = QDoubleSpinBox()
+        spin.setRange(vmin, vmax)
+        spin.setDecimals(1)
+        spin.setSingleStep(1.0)
+        spin.setSuffix(" mbar")
+        spin.setValue(value)
+        spin.setKeyboardTracking(False)
+        spin.setAlignment(Qt.AlignRight)
+        spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        spin.setFixedHeight(28)
+        spin.setMaximumWidth(110)
         return spin
 
     def _build_ui(self):
@@ -782,22 +836,41 @@ class UMPGuiApp(QMainWindow):
         return group
 
     def _pressure_group(self):
-        group = QGroupBox("Pressure (Solenoid)")
+        group = QGroupBox("Pressure (Fluigent)")
         layout = QGridLayout(group)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setHorizontalSpacing(6)
         layout.setVerticalSpacing(6)
 
-        layout.addWidget(QLabel("Solenoid"), 0, 0)
-        layout.addWidget(self._pressure_button("ON", True), 0, 1)
-        layout.addWidget(self._pressure_button("OFF", False), 0, 2)
-        layout.addWidget(self.sol1_pill, 0, 3)
+        layout.addWidget(QLabel("Positive"), 0, 0)
+        layout.addWidget(self.positive_mbar, 0, 1)
+        layout.addWidget(self._pressure_button("Positive", True), 0, 2)
+
+        layout.addWidget(QLabel("Negative"), 1, 0)
+        layout.addWidget(self.negative_mbar, 1, 1)
+        layout.addWidget(self._pressure_button("Negative", False), 1, 2)
+
+        vent = QPushButton("Vent (0 mbar)")
+        vent.setToolTip("Drop the channel to 0 mbar")
+        vent.setProperty("kind", "secondary")
+        vent.clicked.connect(self._vent_pressure)
+        layout.addWidget(vent, 2, 0, 1, 3)
+
+        layout.addWidget(QLabel("State"), 3, 0)
+        layout.addWidget(self.pressure_pill, 3, 1)
+        layout.addWidget(QLabel("Measured"), 3, 2)
+        layout.addWidget(self.live_pressure, 3, 3)
+
+        # Re-publish setpoints when edited; the pressure node applies the new
+        # value immediately if that state is the one currently active.
+        self.positive_mbar.editingFinished.connect(self._publish_pressure_setpoints)
+        self.negative_mbar.editingFinished.connect(self._publish_pressure_setpoints)
         return group
 
-    def _pressure_button(self, text, on):
+    def _pressure_button(self, text, positive):
         button = QPushButton(text)
-        button.setProperty("kind", "danger" if on else "secondary")
-        button.clicked.connect(lambda _checked=False: self._set_solenoid(on))
+        button.setProperty("kind", "danger" if positive else "primary")
+        button.clicked.connect(lambda _checked=False: self._set_pressure_state(positive))
         return button
 
     def _acquisition_group(self):
@@ -825,23 +898,6 @@ class UMPGuiApp(QMainWindow):
         layout.addWidget(self.live_resistance)
         return group
 
-    def _install_shortcuts(self):
-        # QShortcut catches common letter keys even when widgets have focus.
-        for key, axis, sign in (
-            ("W", "Y", +1),
-            ("S", "Y", -1),
-            ("A", "X", -1),
-            ("D", "X", +1),
-            (",", "D", -1),
-            (".", "D", +1),
-        ):
-            shortcut = QShortcut(QKeySequence(key), self)
-            shortcut.activated.connect(lambda a=axis, s=sign: self.panel1.bump_axis(a, s))
-
-        self.key_router = KeyRouter(self)
-        self.key_router.bump.connect(self.panel1.bump_axis)
-        QApplication.instance().installEventFilter(self.key_router)
-
     def set_status(self, text):
         self.status.setText(text)
 
@@ -859,9 +915,28 @@ class UMPGuiApp(QMainWindow):
         self.motor_target.setValue(new_val)
         self._publish_motor_target()
 
-    def _set_solenoid(self, on):
-        self.node.pub_sol1_cmd.publish(Bool(data=bool(on)))
-        self.set_status(f"Solenoid: {'ON' if on else 'OFF'}")
+    def _publish_pressure_setpoints(self):
+        positive = float(self.positive_mbar.value())
+        negative = float(self.negative_mbar.value())
+        self.node.pub_pressure_pos.publish(Float32(data=positive))
+        self.node.pub_pressure_neg.publish(Float32(data=negative))
+        self.set_status(
+            f"Pressure setpoints: {positive:+.1f} / {negative:+.1f} mbar"
+        )
+
+    def _set_pressure_state(self, positive):
+        # Make sure the node is resolving against what is on screen right now,
+        # then command the binary state.
+        self._publish_pressure_setpoints()
+        self.node.pub_pressure_state_cmd.publish(Bool(data=bool(positive)))
+        target = self.positive_mbar.value() if positive else self.negative_mbar.value()
+        self.set_status(
+            f"Pressure: {'POSITIVE' if positive else 'NEGATIVE'} ({target:+.1f} mbar)"
+        )
+
+    def _vent_pressure(self):
+        ok, msg = self.node.call_trigger(self.node.cli_pressure_vent)
+        self.set_status(f"Pressure vent: {ok} ({msg})")
 
     def _acq_start(self):
         ok, msg = self.node.call_trigger(self.node.cli_acq_start)
@@ -877,8 +952,22 @@ class UMPGuiApp(QMainWindow):
         self.panel1.update_live_display()
         self.panel2.update_live_display()
         self.live_motor.setText(f"{int(self.node.latest_live_motor):d}")
-        sol1_text = "ON" if self.node.latest_sol1_state else "OFF"
-        self.sol1_pill.set_on(self.node.latest_sol1_state, sol1_text)
+
+        state = self.node.latest_pressure_state
+        if state == PRESSURE_STATE_POSITIVE:
+            self.pressure_pill.set_tone("POSITIVE", "positive")
+        elif state == PRESSURE_STATE_NEGATIVE:
+            self.pressure_pill.set_tone("NEGATIVE", "negative")
+        elif state == PRESSURE_STATE_VENTED:
+            self.pressure_pill.set_tone("VENTED", "vented")
+        else:
+            self.pressure_pill.set_tone("--", "idle")
+
+        measured = self.node.latest_pressure_mbar
+        self.live_pressure.setText(
+            "-- mbar" if measured is None else f"{measured:+.1f} mbar"
+        )
+
         resistance = self.node.latest_heka_resistance
         if resistance is None:
             self.live_resistance.setText("-- MOhm")
@@ -919,10 +1008,6 @@ class UMPGuiApp(QMainWindow):
 
         self.heka_voltage_plot.set_data(now, latest_v, voltage_points)
         self.heka_current_plot.set_data(now, latest_i, current_points)
-
-    def closeEvent(self, event):
-        QApplication.instance().removeEventFilter(self.key_router)
-        event.accept()
 
     def _apply_style(self):
         QApplication.instance().setStyleSheet(
@@ -1014,7 +1099,7 @@ class UMPGuiApp(QMainWindow):
                 padding: 0 8px;
                 left: 10px;
             }
-            QSpinBox {
+            QSpinBox, QDoubleSpinBox {
                 background: #ffffff;
                 border: 1px solid #cbd5e1;
                 border-radius: 7px;
@@ -1022,7 +1107,7 @@ class UMPGuiApp(QMainWindow):
                 min-height: 18px;
                 color: #0f172a;
             }
-            QSpinBox:focus {
+            QSpinBox:focus, QDoubleSpinBox:focus {
                 border: 1px solid #2563eb;
             }
             QPushButton, QToolButton {
