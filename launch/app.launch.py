@@ -38,10 +38,10 @@ def generate_launch_description():
             parameters=[{
                 "channel": 0,
                 "poll_ms": 100,
-                # Startup setpoints; the GUI overrides these as soon as it
-                # publishes on /pressure/{positive,negative}_mbar.
-                "positive_mbar": 20.0,
-                "negative_mbar": -20.0,
+                # Safety envelope, intersected with the range the controller
+                # reports. Tighten these to protect the pipette.
+                "max_mbar": 1000.0,
+                "min_mbar": -1000.0,
             }],
         ),
 

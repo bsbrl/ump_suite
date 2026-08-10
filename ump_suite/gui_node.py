@@ -4,8 +4,7 @@ Modern Qt control panel for the UMP suite.
 The ROS surface is:
   * publishes absolute UMP1 / UMP2 targets
   * publishes ODrive motor targets
-  * publishes the binary pressure state plus the positive/negative mbar
-    setpoints it is resolved against
+  * publishes the exact commanded pressure in mbar
   * subscribes to live robot, pressure, camera, and HEKA voltage/current topics
   * calls acquisition and UMP zeroing services
 
@@ -46,23 +45,12 @@ from PyQt5.QtWidgets import (
 )
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import (
-    Bool,
-    Float32,
-    Float32MultiArray,
-    Int8,
-    Int32,
-    Int32MultiArray,
-)
+from std_msgs.msg import Float32, Float32MultiArray, Int32, Int32MultiArray
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
-    PRESSURE_STATE_NEGATIVE,
-    PRESSURE_STATE_POSITIVE,
-    PRESSURE_STATE_VENTED,
     SRV_ACQ_START,
     SRV_ACQ_STOP,
-    SRV_PRESSURE_VENT,
     SRV_ZERO,
     SRV_ZERO2,
     TOPIC_CAM_IMAGE_COMPRESSED,
@@ -71,11 +59,9 @@ from .ros_interfaces import (
     TOPIC_HEKA_VOLTAGE_RAW,
     TOPIC_MOTOR_LIVE,
     TOPIC_MOTOR_TGT,
+    TOPIC_PRESSURE_MBAR,
     TOPIC_PRESSURE_MEASURED,
-    TOPIC_PRESSURE_NEG_MBAR,
-    TOPIC_PRESSURE_POS_MBAR,
-    TOPIC_PRESSURE_STATE,
-    TOPIC_PRESSURE_STATE_CMD,
+    TOPIC_PRESSURE_TARGET,
     TOPIC_UMP_LIVE,
     TOPIC_UMP_TARGET,
     TOPIC_UMP2_LIVE,
@@ -92,12 +78,16 @@ MOTOR_MIN, MOTOR_MAX = -1_000_000, 1_000_000
 # pressure node clamps to whatever the connected controller actually reports.
 PRESSURE_LIMIT_MBAR = 1000.0
 
+# ── Pressure preset buttons ────────────────────────────────────────────────
+# Clicking a preset only fills the pressure box; press Send to apply it.
+# Edit this tuple to change which shortcuts appear, in this order.
+PRESSURE_PRESETS_MBAR = (50, 20, 0, -10, -20, -30, -100)
+
 DEFAULT_AXIS_STEP = 50
 DEFAULT_AXIS_TARGET = 10000
 DEFAULT_SPEED = 1000
 DEFAULT_MOTOR_STEP = 500
-DEFAULT_POSITIVE_MBAR = 20.0
-DEFAULT_NEGATIVE_MBAR = -20.0
+DEFAULT_PRESSURE_MBAR = 0.0
 
 LIVE_POLL_MS = 50
 SEND_THROTTLE_MS = 60
@@ -128,16 +118,10 @@ class GuiNode(Node):
             Int32MultiArray, TOPIC_UMP2_TARGET, 10
         )
         self.pub_motor_tgt = self.create_publisher(Int32, TOPIC_MOTOR_TGT, 10)
-        self.pub_pressure_state_cmd = self.create_publisher(
-            Bool, TOPIC_PRESSURE_STATE_CMD, 10
-        )
-        # Latched so the pressure node picks up the dialed-in setpoints even if
-        # it (re)starts after the GUI.
-        self.pub_pressure_pos = self.create_publisher(
-            Float32, TOPIC_PRESSURE_POS_MBAR, latched_qos()
-        )
-        self.pub_pressure_neg = self.create_publisher(
-            Float32, TOPIC_PRESSURE_NEG_MBAR, latched_qos()
+        # Latched so the pressure node and the logger pick up the last commanded
+        # pressure even if they (re)start after the GUI sent it.
+        self.pub_pressure_mbar = self.create_publisher(
+            Float32, TOPIC_PRESSURE_MBAR, latched_qos()
         )
 
         self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE, self._on_ump_live, 10)
@@ -149,10 +133,10 @@ class GuiNode(Node):
             CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self._on_cam_image, 10
         )
         self.create_subscription(
-            Int8, TOPIC_PRESSURE_STATE, self._on_pressure_state, latched_qos()
+            Float32, TOPIC_PRESSURE_MEASURED, self._on_pressure_measured, 10
         )
         self.create_subscription(
-            Float32, TOPIC_PRESSURE_MEASURED, self._on_pressure_measured, 10
+            Float32, TOPIC_PRESSURE_TARGET, self._on_pressure_target, latched_qos()
         )
         self.create_subscription(
             Float32MultiArray, TOPIC_HEKA_VOLTAGE_RAW, self._on_heka_voltage, 10
@@ -168,14 +152,13 @@ class GuiNode(Node):
         self.cli_acq_stop = self.create_client(Trigger, SRV_ACQ_STOP)
         self.cli_zero = self.create_client(Trigger, SRV_ZERO)
         self.cli_zero2 = self.create_client(Trigger, SRV_ZERO2)
-        self.cli_pressure_vent = self.create_client(Trigger, SRV_PRESSURE_VENT)
 
         self.latest_live_ump = [0, 0, 0, 0]
         self.latest_live_ump2 = [0, 0, 0, 0]
         self.latest_live_motor = 0
         self.latest_frame_bgr = None
-        self.latest_pressure_state = None  # PRESSURE_STATE_*, None until reported
         self.latest_pressure_mbar = None
+        self.latest_pressure_target = None
         self.latest_heka_voltage = None
         self.latest_heka_current = None
         self.latest_heka_resistance = None
@@ -191,13 +174,15 @@ class GuiNode(Node):
     def _on_motor_live(self, msg: Int32):
         self.latest_live_motor = int(msg.data)
 
-    def _on_pressure_state(self, msg: Int8):
-        self.latest_pressure_state = int(msg.data)
-
     def _on_pressure_measured(self, msg: Float32):
         value = float(msg.data)
         if math.isfinite(value):
             self.latest_pressure_mbar = value
+
+    def _on_pressure_target(self, msg: Float32):
+        value = float(msg.data)
+        if math.isfinite(value):
+            self.latest_pressure_target = value
 
     def _on_cam_image(self, msg: CompressedImage):
         try:
@@ -276,28 +261,18 @@ class GuiNode(Node):
 
 
 class StatusPill(QLabel):
-    """Small colored state badge used for pressure and acquisition state."""
-
-    # tone -> (foreground, background, border)
-    TONES = {
-        "idle": ("#475569", "#f1f5f9", "#cbd5e1"),
-        "on": ("#166534", "#dcfce7", "#86efac"),
-        "positive": ("#9a3412", "#fff7ed", "#fdba74"),
-        "negative": ("#1e40af", "#eff6ff", "#93c5fd"),
-        "vented": ("#334155", "#e2e8f0", "#94a3b8"),
-    }
+    """Small colored state badge used for acquisition state."""
 
     def __init__(self, text="--", parent=None):
         super().__init__(text, parent)
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumWidth(74)
-        self.set_tone(text, "idle")
+        self.set_on(False, text)
 
     def set_on(self, on, text):
-        self.set_tone(text, "on" if on else "idle")
-
-    def set_tone(self, text, tone):
-        fg, bg, border = self.TONES[tone]
+        bg = "#dcfce7" if on else "#f1f5f9"
+        fg = "#166534" if on else "#475569"
+        border = "#86efac" if on else "#cbd5e1"
         self.setText(text)
         self.setStyleSheet(
             f"""
@@ -619,15 +594,16 @@ class UMPGuiApp(QMainWindow):
 
         self.status = QLabel("Ready")
         self.acq_pill = StatusPill("STOPPED")
-        self.pressure_pill = StatusPill("--")
         self.live_pressure = QLabel("-- mbar")
         self.live_pressure.setObjectName("liveValue")
         self.live_pressure.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.positive_mbar = self._double_spin(
-            DEFAULT_POSITIVE_MBAR, 0.0, PRESSURE_LIMIT_MBAR
-        )
-        self.negative_mbar = self._double_spin(
-            DEFAULT_NEGATIVE_MBAR, -PRESSURE_LIMIT_MBAR, 0.0
+        # What the node actually applied, so a clamped value is visible.
+        self.live_pressure_target = QLabel("-- mbar")
+        self.live_pressure_target.setObjectName("liveValue")
+        self.live_pressure_target.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # One box for the exact pressure; type a leading '-' for suction.
+        self.pressure_mbar = self._double_spin(
+            DEFAULT_PRESSURE_MBAR, -PRESSURE_LIMIT_MBAR, PRESSURE_LIMIT_MBAR
         )
         self.live_motor = QLabel("--")
         self.live_motor.setObjectName("liveValue")
@@ -678,10 +654,6 @@ class UMPGuiApp(QMainWindow):
         )
 
         self._build_ui()
-
-        # Hand the pressure node the setpoints it should resolve states against,
-        # so a state command works before the operator touches the spin boxes.
-        self._publish_pressure_setpoints()
 
         self.live_timer = QTimer(self)
         self.live_timer.timeout.connect(self._poll_live_to_gui)
@@ -837,40 +809,53 @@ class UMPGuiApp(QMainWindow):
 
     def _pressure_group(self):
         group = QGroupBox("Pressure (Fluigent)")
-        layout = QGridLayout(group)
+        layout = QVBoxLayout(group)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setHorizontalSpacing(6)
-        layout.setVerticalSpacing(6)
+        layout.setSpacing(6)
 
-        layout.addWidget(QLabel("Positive"), 0, 0)
-        layout.addWidget(self.positive_mbar, 0, 1)
-        layout.addWidget(self._pressure_button("Positive", True), 0, 2)
+        hint = QLabel("Type a value in mbar (use a leading '-' to pull), then Send.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
-        layout.addWidget(QLabel("Negative"), 1, 0)
-        layout.addWidget(self.negative_mbar, 1, 1)
-        layout.addWidget(self._pressure_button("Negative", False), 1, 2)
+        entry = QHBoxLayout()
+        entry.setSpacing(6)
+        entry.addWidget(QLabel("Pressure"))
+        entry.addWidget(self.pressure_mbar)
+        send = QPushButton("Send")
+        send.setProperty("kind", "primary")
+        send.setToolTip("Apply the value in the box")
+        send.clicked.connect(self._send_pressure)
+        entry.addWidget(send)
+        entry.addStretch(1)
+        layout.addLayout(entry)
 
-        vent = QPushButton("Vent (0 mbar)")
-        vent.setToolTip("Drop the channel to 0 mbar")
-        vent.setProperty("kind", "secondary")
-        vent.clicked.connect(self._vent_pressure)
-        layout.addWidget(vent, 2, 0, 1, 3)
+        # Preset buttons only fill the box; the operator still presses Send.
+        presets = QGridLayout()
+        presets.setHorizontalSpacing(4)
+        presets.setVerticalSpacing(4)
+        for i, value in enumerate(PRESSURE_PRESETS_MBAR):
+            presets.addWidget(self._preset_button(value), i // 4, i % 4)
+        layout.addLayout(presets)
 
-        layout.addWidget(QLabel("State"), 3, 0)
-        layout.addWidget(self.pressure_pill, 3, 1)
-        layout.addWidget(QLabel("Measured"), 3, 2)
-        layout.addWidget(self.live_pressure, 3, 3)
-
-        # Re-publish setpoints when edited; the pressure node applies the new
-        # value immediately if that state is the one currently active.
-        self.positive_mbar.editingFinished.connect(self._publish_pressure_setpoints)
-        self.negative_mbar.editingFinished.connect(self._publish_pressure_setpoints)
+        readback = QHBoxLayout()
+        readback.setSpacing(6)
+        readback.addWidget(QLabel("Applied"))
+        readback.addWidget(self.live_pressure_target)
+        readback.addWidget(QLabel("Measured"))
+        readback.addWidget(self.live_pressure)
+        readback.addStretch(1)
+        layout.addLayout(readback)
         return group
 
-    def _pressure_button(self, text, positive):
-        button = QPushButton(text)
-        button.setProperty("kind", "danger" if positive else "primary")
-        button.clicked.connect(lambda _checked=False: self._set_pressure_state(positive))
+    def _preset_button(self, value):
+        # Signed label, except 0 which reads better unsigned.
+        label = f"{value:g}" if value == 0 else f"{value:+g}"
+        button = QPushButton(label)
+        button.setToolTip(f"Fill the box with {label} mbar")
+        button.setProperty("kind", "secondary")
+        button.setFixedHeight(26)
+        button.clicked.connect(lambda _checked=False, v=value: self._fill_pressure(v))
         return button
 
     def _acquisition_group(self):
@@ -915,28 +900,15 @@ class UMPGuiApp(QMainWindow):
         self.motor_target.setValue(new_val)
         self._publish_motor_target()
 
-    def _publish_pressure_setpoints(self):
-        positive = float(self.positive_mbar.value())
-        negative = float(self.negative_mbar.value())
-        self.node.pub_pressure_pos.publish(Float32(data=positive))
-        self.node.pub_pressure_neg.publish(Float32(data=negative))
-        self.set_status(
-            f"Pressure setpoints: {positive:+.1f} / {negative:+.1f} mbar"
-        )
+    def _fill_pressure(self, value):
+        """Preset click: load the box only, so nothing reaches the device yet."""
+        self.pressure_mbar.setValue(float(value))
+        self.set_status(f"Pressure box set to {value:+g} mbar (press Send to apply)")
 
-    def _set_pressure_state(self, positive):
-        # Make sure the node is resolving against what is on screen right now,
-        # then command the binary state.
-        self._publish_pressure_setpoints()
-        self.node.pub_pressure_state_cmd.publish(Bool(data=bool(positive)))
-        target = self.positive_mbar.value() if positive else self.negative_mbar.value()
-        self.set_status(
-            f"Pressure: {'POSITIVE' if positive else 'NEGATIVE'} ({target:+.1f} mbar)"
-        )
-
-    def _vent_pressure(self):
-        ok, msg = self.node.call_trigger(self.node.cli_pressure_vent)
-        self.set_status(f"Pressure vent: {ok} ({msg})")
+    def _send_pressure(self):
+        value = float(self.pressure_mbar.value())
+        self.node.pub_pressure_mbar.publish(Float32(data=value))
+        self.set_status(f"Pressure command: {value:+.1f} mbar")
 
     def _acq_start(self):
         ok, msg = self.node.call_trigger(self.node.cli_acq_start)
@@ -953,19 +925,13 @@ class UMPGuiApp(QMainWindow):
         self.panel2.update_live_display()
         self.live_motor.setText(f"{int(self.node.latest_live_motor):d}")
 
-        state = self.node.latest_pressure_state
-        if state == PRESSURE_STATE_POSITIVE:
-            self.pressure_pill.set_tone("POSITIVE", "positive")
-        elif state == PRESSURE_STATE_NEGATIVE:
-            self.pressure_pill.set_tone("NEGATIVE", "negative")
-        elif state == PRESSURE_STATE_VENTED:
-            self.pressure_pill.set_tone("VENTED", "vented")
-        else:
-            self.pressure_pill.set_tone("--", "idle")
-
         measured = self.node.latest_pressure_mbar
         self.live_pressure.setText(
             "-- mbar" if measured is None else f"{measured:+.1f} mbar"
+        )
+        applied = self.node.latest_pressure_target
+        self.live_pressure_target.setText(
+            "-- mbar" if applied is None else f"{applied:+.1f} mbar"
         )
 
         resistance = self.node.latest_heka_resistance

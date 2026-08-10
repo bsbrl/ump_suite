@@ -52,18 +52,15 @@ All names live in [ros_interfaces.py](ump_suite/ros_interfaces.py).
 | `/camera/image/compressed` | `sensor_msgs/CompressedImage` | publish | JPEG preview from PySpin grabber |
 | `/camera/fps` | `std_msgs/Float32` | publish | Effective grabber FPS |
 | `/camera/record_cmd` | `std_msgs/String` | subscribe | Path = start mp4 recording, `""` = stop |
-| `/pressure/state_cmd` | `std_msgs/Bool` | subscribe | Binary pressure state: `True` = apply positive setpoint, `False` = apply negative setpoint |
-| `/pressure/state` | `std_msgs/Int8` | publish | State actually applied (latched): `1` = positive, `0` = negative, `-1` = vented |
-| `/pressure/positive_mbar` | `std_msgs/Float32` | subscribe | Positive setpoint in mbar, clamped to `[0, device max]` (latched) |
-| `/pressure/negative_mbar` | `std_msgs/Float32` | subscribe | Negative setpoint in mbar, clamped to `[device min, 0]` (latched) |
-| `/pressure/measured_mbar` | `std_msgs/Float32` | publish | Pressure measured by the controller |
+| `/pressure/mbar` | `std_msgs/Float32` | subscribe | Requested pressure in mbar; negative pulls, positive pushes, `0` vents (latched) |
+| `/pressure/target_mbar` | `std_msgs/Float32` | publish | Pressure actually written to the device, i.e. the request after clamping (latched) |
+| `/pressure/measured_mbar` | `std_msgs/Float32` | publish | Pressure measured by the controller's sensor |
 | `/heka/voltage_raw_v` | `std_msgs/Float32MultiArray` | publish | HEKA voltage sample packet: `[sample_rate_hz, v0, v1, ...]` |
 | `/heka/current_pa` | `std_msgs/Float32MultiArray` | publish | HEKA current sample packet: `[sample_rate_hz, i0, i1, ...]` |
 | `/heka/monitor_v` | `std_msgs/Float32` | publish | Latest voltage sample from binary packets; mean monitor voltage for legacy packets |
 | `/heka/monitor_step_v` | `std_msgs/Float32` | publish | Legacy monitor step voltage |
 | `/heka/resistance_mohm` | `std_msgs/Float32` | publish | Live resistance estimate in MOhm |
 | `/ump/calibrate_zero`, `/ump2/calibrate_zero` | `std_srvs/Trigger` | service | Calibrate zero at the current pose |
-| `/pressure/vent` | `std_srvs/Trigger` | service | Drop the channel to 0 mbar |
 | `/acq/start`, `/acq/stop` | `std_srvs/Trigger` | service | Begin / end a logged trial |
 
 The UMP driver publishes and accepts raw absolute Sensapex device coordinates. There is no `10000` count centering offset in the ROS topics.
@@ -95,18 +92,24 @@ PySpin needs the system Spinnaker `.so` libraries plus a dedicated virtualenv, s
 ### `pressure_node`
 Drives a **Fluigent push-pull pressure controller** (LineUP) through the Fluigent Python SDK. `fgt_detect()` → `fgt_init()` on startup, then the channel's real range is read with `fgt_get_pressureRange()` and used as the hard clamp.
 
-Pressure is commanded as a **binary state**, not a value:
+Pressure is commanded as an **exact value in mbar** on one topic:
 
 ```
-/pressure/state_cmd = True   ->  fgt_set_pressure(channel, positive_mbar)
-/pressure/state_cmd = False  ->  fgt_set_pressure(channel, negative_mbar)
+/pressure/mbar = -20.0  ->  fgt_set_pressure(channel, -20.0)   (pull)
+/pressure/mbar =  50.0  ->  fgt_set_pressure(channel,  50.0)   (push)
+/pressure/mbar =   0.0  ->  vented
 ```
 
-The two mbar setpoints arrive on their own latched topics (published by the GUI), so an operator *or* a policy only has to decide push vs. pull and the node resolves that against whatever values are currently dialed in. Editing a setpoint while that state is active re-applies it immediately; editing one while vented does not re-pressurize.
+One number, sign carries the direction. The topic is latched, so the node picks up the last commanded pressure even if it restarts.
 
-**Venting** (0 mbar) is the third condition the channel can be in, and it is exposed as the `/pressure/vent` **service** rather than a third value on the command topic. That keeps a policy's action space strictly binary — it cannot vent — while an operator always has one click back to neutral. The reported state on `/pressure/state` is therefore tri-state (`1` / `0` / `-1`), even though the commanded state is binary.
+Incoming values are clamped to the range the controller reports for its channel (intersected with the `min_mbar` / `max_mbar` parameters), and non-finite values are rejected outright, both with a warning. The channel is set to **0 mbar on connect**, and vented to 0 mbar before `fgt_close()` on shutdown — including on Ctrl+C and on the SIGTERM `ros2 launch` sends.
 
-Sign is enforced on both setpoints — the positive setpoint is clamped to `[0, max]` and the negative one to `[min, 0]` — so a mistyped value can never turn a push into a pull on a pipette. The channel is set to **0 mbar on connect**, and vented to 0 mbar before `fgt_close()` on shutdown.
+Two readbacks come back out:
+
+- **`/pressure/target_mbar`** — the value actually written to the device, published only after `fgt_set_pressure` succeeded. Because it is the post-clamp value, the dataset can never claim a pressure the controller never received.
+- **`/pressure/measured_mbar`** — the controller's own sensor, polled every `poll_ms`.
+
+Comparing the two is how you see the channel settling, or spot a request that got clamped.
 
 Parameters:
 
@@ -114,10 +117,8 @@ Parameters:
 |---|---|---|
 | `channel` | `0` | Fluigent pressure channel index. |
 | `poll_ms` | `100` | How often `/pressure/measured_mbar` is published. |
-| `positive_mbar` | `20.0` | Setpoint used until the GUI publishes one. |
-| `negative_mbar` | `-20.0` | Setpoint used until the GUI publishes one. |
-| `max_positive_mbar` | `1000.0` | Safety ceiling, intersected with the device range. |
-| `min_negative_mbar` | `-1000.0` | Safety floor, intersected with the device range. |
+| `max_mbar` | `1000.0` | Safety ceiling, intersected with the device range. |
+| `min_mbar` | `-1000.0` | Safety floor, intersected with the device range. |
 
 If no controller is detected the node logs an error and stays inert rather than killing the launch, matching the ODrive driver's behaviour.
 
@@ -142,7 +143,7 @@ For now, the GUI plots voltage and current and shows the live resistance estimat
 ### `logger_node`
 Builds a synchronized dataset:
 1. Subscribes to **live** topics (UMP1, UMP2) and to **target** topics published by the GUI / policy.
-2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value when available, and to `/pressure/state` for the binary pressure column.
+2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value when available, and to `/pressure/mbar` for the pressure column.
 3. On `/acq/start`, picks the next free `trial_N` ID under `logs/`, opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and tells the camera to record `saved_videos/trial_N.mp4`.
 4. Every `log_interval_ms` it saves the latest JPEG to `saved_frames/trial_N/frame_NNNNNN.png` and appends one CSV row with the live pose, the most-recent commanded target, the saved image's path, and the latest resistance when available.
 5. On `/acq/stop` it closes the file and sends an empty record command to the camera.
@@ -161,23 +162,29 @@ current_x2, current_y2, current_z2, current_d2,
 target_x2,  target_y2,  target_z2,  target_d2,
 image_path,
 resistance_mohm,
-pressure_state
+target_pressure,
+measured_pressure
 ```
 
-`pressure_state` is binary — `1` = positive pressure, `0` = negative pressure — never the mbar value, so the column stays valid when the setpoints are re-dialed between trials.
+The two pressure columns, both in mbar with negative meaning pull:
 
-It is **blank** whenever the channel is vented (including before the first state is commanded, since the node starts vented), because "vented" is neither push nor pull and must not be mislabelled as either. So **set a pressure state before starting a trial** if you want every row populated, and expect blanks for any stretch where you vented mid-trial.
+- **`target_pressure`** — from `/pressure/target_mbar`: the pressure actually applied to the device. This is the action label to train on.
+- **`measured_pressure`** — from `/pressure/measured_mbar`: the controller's sensor reading. Expect it to lag `target_pressure` by a poll tick or two while the channel settles, and to sit slightly off the target.
+
+Both are blank until the pressure node publishes, which it does as soon as it connects (it applies 0 mbar on startup), so in practice they are populated from the first row of any trial where the pressure node is running.
 
 ### `gui_node`
 A PyQt5 control panel split into a controls column and a live camera / HEKA preview column. Two `UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D controls, nudge buttons, axis step, speed, **Send Now**, **Home**, **Sync Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Fluigent)** panel, Start / Stop buttons that call `/acq/start` and `/acq/stop`, rolling voltage/current plots from `/heka/voltage_raw_v` and `/heka/current_pa`, and a live resistance readout.
 
-The pressure panel has a positive and a negative mbar spin box (range ±1000 mbar, sign-locked per box) and one button each:
+The pressure panel is one box plus a Send button:
 
-- **Positive** — publishes `/pressure/state_cmd = True`, so the controller goes to the positive setpoint
-- **Negative** — publishes `/pressure/state_cmd = False`, so it goes to the negative setpoint
-- **Vent (0 mbar)** — calls `/pressure/vent` to drop the channel to neutral
+- **Pressure box** — type the exact value in mbar, with a leading `-` to pull. Range ±1000 mbar, one decimal.
+- **Send** — publishes the box's value on `/pressure/mbar`. Nothing reaches the device until you press it.
+- **Preset buttons** — `+50`, `+20`, `0`, `-10`, `-20`, `-30`, `-100`. These only **fill the box**; press Send to apply. Use the `0` preset plus Send to vent.
 
-A colored badge shows the state the node actually applied (`POSITIVE` / `NEGATIVE` / `VENTED` / `--`), next to the live measured pressure. Editing a setpoint republishes it, and the node re-applies it on the spot if that state is currently active. Both setpoints are published once at startup so a state command works before you touch the boxes.
+Underneath, **Applied** shows `/pressure/target_mbar` (what the node actually wrote, so a clamped value is visible) and **Measured** shows `/pressure/measured_mbar` (the sensor), so you can confirm the controller reached the value you asked for.
+
+To change which presets appear, edit the `PRESSURE_PRESETS_MBAR` tuple near the top of [gui_node.py](ump_suite/gui_node.py) — the buttons and their layout are generated from it, so adding or removing entries is all that is needed.
 
 The panel is **mouse-only** — there are deliberately no keyboard shortcuts, so keystrokes always go to the widget you are editing.
 
@@ -203,12 +210,12 @@ All UMP commands are absolute Sensapex targets. The bump buttons mutate the loca
 | Topic | Use |
 |---|---|
 | `/ump/target`, `/ump2/target` | `[x, y, z, d, speed]` absolute counts |
-| `/pressure/state_cmd` | `Bool` binary pressure state |
+| `/pressure/mbar` | `Float32` exact pressure in mbar |
 
-So the action is **8 motion values + 1 binary pressure state**:
+So the action is **8 motion values + 1 pressure value**:
 
 - The 8 motion values are the two 4-axis UMPs only. The ODrive focusing knob is driven separately through `/motor/target_counts` and is not part of the action vector.
-- Pressure is the extra binary value: the model predicts push vs. pull, publishes it on `/pressure/state_cmd`, and the pressure node converts it to whichever mbar setpoint the GUI has dialed in at that moment. The policy never emits mbar — that is why `pressure_state` is logged binary. Venting is a service, not a topic, so a policy cannot vent; that stays an operator control.
+- Pressure is the 9th value, in mbar, matching the `target_pressure` column the logger writes — so the policy predicts the same quantity it was trained on. Negative pulls, positive pushes, `0` vents.
 
 This matches the dataset columns the logger writes, so state/action shapes line up between training and inference.
 
@@ -217,6 +224,7 @@ This matches the dataset columns the logger writes, so state/action shapes line 
 These lived in the deleted `main.py` and are now the client's job — worth re-checking whichever repo you roll out from:
 
 - **Workspace clamping** — per-stage min/max boxes on each of the 8 axes. ⚠️ These are tied to one physical setup; they must be set for *your* stage before any rollout.
+- **Pressure clamping** — keep the predicted mbar inside what the pipette tolerates. The node clamps to the device range (±1000 on this LineUP) as a backstop, and `target_pressure` logs the post-clamp value, so the dataset stays honest either way — but the pipette does not care that the clamp saved the controller.
 - **Per-tick step limiting** — cap the delta on each axis so a bad prediction cannot command a large jump.
 - **Control rate** — the dataset was collected at ~2.5 Hz and stored at 3 Hz; running much faster tends to overshoot on real hardware.
 - **E-stop** — a way to stop sending actions and hold the current pose.
@@ -280,8 +288,8 @@ This starts the dual UMP driver (`device_id=1` and `device_id=2` in one process)
 ### Collect a dataset trial
 
 1. Launch the suite as above.
-2. Use the GUI (or publish on `/ump/target`, `/ump2/target`, `/motor/target_counts` and `/pressure/state_cmd` directly) to drive the rig. The CSV logger records UMP state/targets, HEKA resistance and the binary pressure state, but not the ODrive motor.
-   Set the pressure state before step 3 so the `pressure_state` column is populated from the first row.
+2. Use the GUI (or publish on `/ump/target`, `/ump2/target`, `/motor/target_counts` and `/pressure/mbar` directly) to drive the rig. The CSV logger records UMP state/targets, HEKA resistance and the commanded pressure, but not the ODrive motor.
+   The pressure columns populate as soon as the pressure node is up, since it publishes its startup 0 mbar.
 3. Click **Start Data Acquisition** — this calls `/acq/start`, which opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and asks the camera to record `saved_videos/trial_N.mp4`.
 4. Perform the trial. The logger writes one row per `log_interval_ms` (default 200 ms).
 5. Click **Stop Data Acquisition** — this calls `/acq/stop`, closes the CSV, and stops the mp4.
@@ -300,12 +308,11 @@ saved_videos/trial_1.mp4
 
 The rollout client is **not part of this package** — run it from whichever policy repo you are using (`~/SmolVLA`, `~/MicroVLA*/rollout`). From this side:
 
-1. Launch this suite, so the client has `/camera/image/compressed`, `/ump/live` and `/ump2/live` to read and `/ump/target`, `/ump2/target`, `/pressure/state_cmd` to write.
-2. Set the positive / negative mbar setpoints in the GUI. The policy only emits the binary pressure state, so these values decide what that state physically means for the whole rollout.
-3. **Check the client's workspace limits and per-tick step caps for this stage before starting.**
-4. Start the policy client (and its policy server, if it uses one).
+1. Launch this suite, so the client has `/camera/image/compressed`, `/ump/live` and `/ump2/live` to read and `/ump/target`, `/ump2/target`, `/pressure/mbar` to write.
+2. **Check the client's workspace limits, per-tick step caps and pressure range for this stage before starting.**
+3. Start the policy client (and its policy server, if it uses one).
 
-Keep the GUI up during a rollout: the **Vent (0 mbar)** button and the manual UMP controls stay live, so you can intervene without stopping the client.
+Keep the GUI up during a rollout: the pressure box and the manual UMP controls stay live, so you can intervene without stopping the client — hit the `0` preset and **Send** to vent.
 
 ---
 

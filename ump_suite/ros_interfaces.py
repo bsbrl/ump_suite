@@ -16,26 +16,21 @@ TOPIC_MOTOR_LIVE = "/motor/live_counts"     # Int32 current counts
 
 # Pressure control (Fluigent LineUP push-pull controller)
 #
-# The *commanded* state is binary: True = apply the positive setpoint,
-# False = apply the negative setpoint. The two setpoints live on their own
-# latched topics, so a policy only has to emit the binary state and the
-# pressure node resolves it against whatever the GUI has dialed in.
+# Commands carry the exact pressure in mbar; negative values pull, positive
+# values push, 0 vents.
 #
-# The *reported* state adds a third value for "vented" (0 mbar), which is how
-# the node starts up and where the vent service puts it. Venting is an operator
-# action exposed as a service, deliberately not on the command topic, so a
-# policy's action space stays strictly binary.
-TOPIC_PRESSURE_STATE_CMD = "/pressure/state_cmd"       # Bool: True=positive, False=negative
-TOPIC_PRESSURE_STATE     = "/pressure/state"           # Int8 PRESSURE_STATE_*, latched
-TOPIC_PRESSURE_POS_MBAR  = "/pressure/positive_mbar"   # Float32 setpoint (>= 0), latched
-TOPIC_PRESSURE_NEG_MBAR  = "/pressure/negative_mbar"   # Float32 setpoint (<= 0), latched
-TOPIC_PRESSURE_MEASURED  = "/pressure/measured_mbar"   # Float32 measured pressure
-
-# Values published on TOPIC_PRESSURE_STATE. Positive/negative are logged as the
-# binary 1/0 dataset column; vented is logged as blank because it is neither.
-PRESSURE_STATE_NEGATIVE = 0
-PRESSURE_STATE_POSITIVE = 1
-PRESSURE_STATE_VENTED = -1
+#   /pressure/mbar         <- what a client asks for (GUI, policy)
+#   /pressure/target_mbar  -> what the node actually wrote to the device, after
+#                             clamping to the hardware range. This is the
+#                             logged/learned target, so the dataset can never
+#                             claim a pressure the controller never received.
+#   /pressure/measured_mbar-> what the controller's sensor reads back
+#
+# The command and target topics are latched, so the node and the logger pick up
+# the last value even if they start after it was sent.
+TOPIC_PRESSURE_MBAR     = "/pressure/mbar"             # Float32 requested mbar, latched
+TOPIC_PRESSURE_TARGET   = "/pressure/target_mbar"      # Float32 applied mbar, latched
+TOPIC_PRESSURE_MEASURED = "/pressure/measured_mbar"    # Float32 measured pressure
 
 # Camera (Blackfly via PySpin)
 TOPIC_CAM_IMAGE_COMPRESSED = "/camera/image/compressed"   # CompressedImage (jpeg)
@@ -47,7 +42,6 @@ SRV_ACQ_START = "/acq/start"
 SRV_ACQ_STOP  = "/acq/stop"
 SRV_ZERO      = "/ump/calibrate_zero"
 SRV_ZERO2     = "/ump2/calibrate_zero"
-SRV_PRESSURE_VENT = "/pressure/vent"   # Drop to 0 mbar (operator safety control)
 
 TOPIC_HEKA_RESISTANCE = "/heka/resistance_mohm"      # std_msgs/Float32 computed/live
 TOPIC_HEKA_MONITOR_V = "/heka/monitor_v"            # std_msgs/Float32
@@ -57,13 +51,12 @@ TOPIC_HEKA_CURRENT_PA = "/heka/current_pa"          # Float32MultiArray [rate_hz
 
 
 def latched_qos(depth=1):
-    """QoS for set-and-forget values (pressure setpoints, pressure state).
+    """QoS for set-and-forget values (the commanded pressure).
 
     Transient-local durability means a node that starts *after* the value was
-    published still receives the last one. Without it, restarting the pressure
-    node would leave it using its parameter defaults until the GUI happened to
-    republish, and the logger would miss the pressure state of a trial that
-    started before it subscribed.
+    published still receives the last one. Without it, a restarted pressure node
+    would sit at 0 mbar until the GUI happened to resend, and the logger would
+    miss the pressure of a trial whose command predates its subscription.
     """
     return QoSProfile(
         depth=depth,

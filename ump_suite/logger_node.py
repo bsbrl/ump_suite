@@ -6,13 +6,14 @@ When acquisition is running, this node periodically writes one CSV row per
   * the most recent commanded *target* for each of them (latest, not consumed)
   * the path of the camera frame that was saved on this tick
   * the latest HEKA resistance estimate, when one is available
-  * the binary pressure state (1 = positive, 0 = negative; blank when vented)
+  * the pressure applied to the device and the pressure measured back, in mbar
 
 It also forwards a record path to the camera node so that the matching mp4
 video file is captured for the same trial.
 """
 
 import csv
+import math
 import os
 
 import cv2
@@ -20,18 +21,17 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float32, Int8, Int32MultiArray, String
+from std_msgs.msg import Float32, Int32MultiArray, String
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
-    PRESSURE_STATE_NEGATIVE,
-    PRESSURE_STATE_POSITIVE,
     SRV_ACQ_START,
     SRV_ACQ_STOP,
     TOPIC_CAM_IMAGE_COMPRESSED,
     TOPIC_CAM_REC_CMD,
     TOPIC_HEKA_RESISTANCE,
-    TOPIC_PRESSURE_STATE,
+    TOPIC_PRESSURE_MEASURED,
+    TOPIC_PRESSURE_TARGET,
     TOPIC_UMP_LIVE,
     TOPIC_UMP_TARGET,
     TOPIC_UMP2_LIVE,
@@ -48,7 +48,8 @@ CSV_HEADER = [
     "target_x2",  "target_y2",  "target_z2",  "target_d2",
     "image_path",
     "resistance_mohm",
-    "pressure_state",
+    "target_pressure",
+    "measured_pressure",
 ]
 
 
@@ -69,9 +70,10 @@ class LoggerNode(Node):
         self.latest_live_ump2 = None
         self.latest_image_msg = None
         self.latest_resistance_mohm = None
-        # PRESSURE_STATE_* as reported by the pressure node; None until it
-        # reports anything. Only positive/negative reach the CSV.
-        self.latest_pressure_state = None
+        # Pressure in mbar; None until the pressure node publishes. The target
+        # is the value actually written to the device, not the raw request.
+        self.latest_target_pressure = None
+        self.latest_measured_pressure = None
 
         # Latest commanded target. These are *not* cleared after each tick:
         # if the user stops issuing commands, the most recent target keeps
@@ -101,7 +103,10 @@ class LoggerNode(Node):
         self.create_subscription(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, self.on_img, 10)
         self.create_subscription(Float32, TOPIC_HEKA_RESISTANCE, self.on_resistance, 10)
         self.create_subscription(
-            Int8, TOPIC_PRESSURE_STATE, self.on_pressure_state, latched_qos()
+            Float32, TOPIC_PRESSURE_TARGET, self.on_target_pressure, latched_qos()
+        )
+        self.create_subscription(
+            Float32, TOPIC_PRESSURE_MEASURED, self.on_measured_pressure, 10
         )
 
         self.pub_rec_cmd = self.create_publisher(String, TOPIC_CAM_REC_CMD, 10)
@@ -132,8 +137,15 @@ class LoggerNode(Node):
     def on_resistance(self, msg: Float32):
         self.latest_resistance_mohm = float(msg.data)
 
-    def on_pressure_state(self, msg: Int8):
-        self.latest_pressure_state = int(msg.data)
+    def on_target_pressure(self, msg: Float32):
+        value = float(msg.data)
+        if math.isfinite(value):
+            self.latest_target_pressure = value
+
+    def on_measured_pressure(self, msg: Float32):
+        value = float(msg.data)
+        if math.isfinite(value):
+            self.latest_measured_pressure = value
 
     # ── Trial setup ────────────────────────────────────────────────────────
     def _setup_trial(self):
@@ -237,13 +249,17 @@ class LoggerNode(Node):
             if self.latest_resistance_mohm is not None
             else ""
         )
-        # 1 = positive pressure, 0 = negative pressure. Left blank while vented
-        # or before the pressure node reports anything, so the column only ever
-        # holds a real binary push/pull state.
-        pressure_state = (
-            self.latest_pressure_state
-            if self.latest_pressure_state
-            in (PRESSURE_STATE_POSITIVE, PRESSURE_STATE_NEGATIVE)
+        # Pressure in mbar, negative = pull. The target is what the pressure
+        # node actually wrote to the device (post-clamp), so it can never claim
+        # a pressure the controller never received. Blank until first published.
+        target_pressure = (
+            float(self.latest_target_pressure)
+            if self.latest_target_pressure is not None
+            else ""
+        )
+        measured_pressure = (
+            float(self.latest_measured_pressure)
+            if self.latest_measured_pressure is not None
             else ""
         )
 
@@ -257,7 +273,8 @@ class LoggerNode(Node):
             tx2, ty2, tz2, td2,
             image_path,
             resistance,
-            pressure_state,
+            target_pressure,
+            measured_pressure,
         ])
         self.timestep += 1
 
