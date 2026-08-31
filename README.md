@@ -87,6 +87,73 @@ Initializes the first PySpin camera, prefers `BGR8` and `NewestOnly` stream buff
 
 Recording is toggled by sending a path on `/camera/record_cmd` (empty string to stop).
 
+#### Brightness and exposure
+
+The camera powers up with `ExposureAuto = Continuous` aiming at roughly **mid
+grey**, and with `BalanceWhiteAuto = Continuous`. On a brightfield scope under
+white light that renders a bright field at about half scale, which is why the
+live view can look far dimmer than the eyepiece even when the light path is
+perfectly fine. Measured here: the auto loop settled at 3.5 ms and 0 dB gain
+while the sensor fully saturates at ~6 ms — the light was never the limit.
+
+Both auto loops are also **content-dependent**, which is a problem for dataset
+collection. With average metering, a dark pipette entering the frame lowers the
+average and the loop brightens the whole scene, so background brightness encodes
+manipulator position. Measured on the recorded trials: **r = −0.99** between
+frame mean and pipette x, a swing of ~15 grey levels. Continuous white balance
+drifts the same way, in colour.
+
+The node therefore calibrates once at startup and then holds both fixed:
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `target_mean_grey` | `200.0` | Measures the delivered image and bisects exposure until its mean grey matches, then holds it. `0` disables. |
+| `exposure_time_us` | `0.0` | `> 0` states the exposure outright and skips calibration. |
+| `gain_db` | `0.0` | Prefer exposure over gain; gain amplifies noise. |
+| `exposure_search_max_us` | `15000.0` | Upper bound for the search. |
+| `use_auto_exposure` | `false` | Hand brightness back to the camera's own loop. |
+| `target_grey_percent` | `80.0` | Target for that loop. Only used when `use_auto_exposure` is true. |
+| `lock_exposure_while_recording` | `true` | Freezes exposure per trial. Only meaningful with `use_auto_exposure`. |
+| `white_balance` | `Once` | `Once` converges on the field then holds; `Continuous` keeps adapting; `Off` freezes as-is. |
+| `balance_ratio_red` / `_blue` | `0.0` | `> 0` pins exact gains, reproducing a previous session. |
+
+Startup then reports what it settled on, and those numbers are what you pin to
+reproduce a session later:
+
+```
+Exposure calibrated to 4110 us for mean grey 200.8 (target 200); held fixed
+White balance held at red=1.469 blue=2.876
+```
+
+Under white light that yields R/G/B = 200.8 / 200.8 / 200.7, no saturation, and
+a frame-to-frame drift of 0.02–0.06 grey levels.
+
+> **Filters change everything.** The 153-episode `OocyteTargetting` dataset was
+> shot through a **green filter**: its frames are R≈10, G≈217, B≈48, effectively
+> single-channel. That green channel was itself well exposed (mean 216, no
+> clipping) — the low *grey* mean of 130 was the filter, not under-exposure. But
+> the exposure/position coupling above is present in that data regardless, and
+> a model trained on green-filtered frames will not transfer to white light.
+> Re-calibrate whenever the filter or illumination changes; the startup
+> calibration does this for you automatically.
+
+Calibration is driven entirely by measuring frames. The camera's `ExposureTime`
+readback is cached on this model and cannot be trusted — it reported a constant
+2223 µs while the delivered image swung between mean 123 and 235 — so any logic
+that reads it back and writes it somewhere else silently corrupts the setting.
+
+If even the longest allowed exposure cannot reach the target, the node says so
+and names the likely causes rather than quietly under-exposing:
+
+```
+[WARN] cannot reach mean grey 250 even at 600 us (best 43.4); holding the longest
+       allowed exposure. Check the light path, the beam splitter and any ND filter.
+```
+
+That message is the dividing line between a settings problem and a real optical
+one. Note also that full-resolution BGR8 is capped near **12.9 fps** by
+`DeviceLinkThroughputLimit` (60 MB/s), regardless of `publish_hz`.
+
 PySpin needs the system Spinnaker `.so` libraries plus a dedicated virtualenv, so the launch file starts the camera node via `ExecuteProcess` with the venv activated rather than as a normal `ament_python` executable. Edit the `CAMERA_BOOTSTRAP` string in [launch/app.launch.py](launch/app.launch.py) to match your setup.
 
 ### `pressure_node`

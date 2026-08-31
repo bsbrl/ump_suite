@@ -12,11 +12,40 @@ from launch_ros.actions import Node
 
 # PySpin requires the bundled Spinnaker .so files and is installed in a
 # separate virtualenv. Activate it before running the camera node.
+# Brightness parameters are passed on the command line because the camera runs
+# as an ExecuteProcess (for the PySpin venv) rather than a launch_ros Node, so
+# it cannot take a `parameters=[{...}]` block.
+#
+#   target_mean_grey     at startup the node measures the delivered image and
+#                        solves for the exposure whose mean grey level is this,
+#                        then holds it. The camera's own auto-exposure aims at
+#                        roughly mid grey, which is why the live view looks far
+#                        dimmer than the eyepiece. 200 of 255 is bright without
+#                        clipping; raise toward 235 for a brighter field, and
+#                        keep an eye on saturation.
+#   exposure_time_us     set > 0 to state the exposure outright and skip the
+#                        calibration entirely.
+#   use_auto_exposure    hand brightness back to the camera's own loop. Handy
+#                        when the illumination changes mid-session, but it
+#                        couples background brightness to what is in frame.
+#   lock_exposure_while_recording
+#                        only meaningful with use_auto_exposure; freezes
+#                        exposure for each logged trial.
+CAMERA_PARAMS = (
+    "--ros-args"
+    " -p publish_hz:=30.0"
+    " -p target_mean_grey:=200.0"
+    " -p exposure_time_us:=0.0"
+    " -p gain_db:=0.0"
+    " -p use_auto_exposure:=false"
+    " -p lock_exposure_while_recording:=true"
+)
+
 CAMERA_BOOTSTRAP = (
     "export PYTHONNOUSERSITE=1; "
     "export LD_LIBRARY_PATH=/opt/spinnaker/lib:$LD_LIBRARY_PATH; "
     "source ~/venvs/pyspin_cam/bin/activate; "
-    "python -m ump_suite.camera_node"
+    f"python -m ump_suite.camera_node {CAMERA_PARAMS}"
 )
 
 

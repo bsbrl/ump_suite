@@ -7,6 +7,20 @@ Each frame is grabbed in a worker thread, then:
 
 Recording is controlled by a String message on /camera/record_cmd: a non-empty
 path starts recording to that file, an empty string stops it.
+
+=== Image brightness ===
+The camera powers up with ``ExposureAuto = Continuous`` and an automatically
+chosen target grey level, which renders a bright brightfield background at
+roughly mid grey. That is why the live view looks much dimmer than the eyepiece
+even when the light path is fine. ``target_grey_percent`` sets that target
+explicitly; ``exposure_time_us`` overrides the loop entirely.
+
+Auto exposure also has a subtler cost for dataset collection. With average
+metering, a dark pipette entering the frame lowers the average, so the loop
+brightens the whole scene: background brightness ends up encoding manipulator
+position. Measured on this rig, frame mean correlates with pipette x at
+r = -0.99. ``lock_exposure_while_recording`` freezes exposure and gain for the
+duration of each trial so recorded frames are photometrically consistent.
 """
 
 import threading
@@ -43,6 +57,42 @@ class CameraNode(Node):
         self.declare_parameter("publish_hz", 30.0)
         self.declare_parameter("record_fps", 20.0)
         self.declare_parameter("jpeg_quality", 80)
+
+        # --- Image quality ------------------------------------------------
+        # Target for the auto-exposure loop, in percent of full scale. The
+        # camera default (~50%) is what makes a white field look mid grey.
+        # 0 or less leaves whatever the camera is already doing.
+        # Default path: measure the delivered image and solve for the exposure
+        # that puts its mean grey level here, then hold it for the session.
+        # Deterministic, and independent of the vendor auto loop, whose
+        # ExposureTime readback on this model is cached and untrustworthy.
+        self.declare_parameter("target_mean_grey", 200.0)
+        # Set > 0 to state the exposure outright and skip calibration.
+        self.declare_parameter("exposure_time_us", 0.0)
+        self.declare_parameter("gain_db", 0.0)
+        self.declare_parameter("exposure_search_max_us", 15000.0)
+        # Opt back in to the camera's own auto-exposure loop. Useful when the
+        # illumination changes during a session; not recommended while
+        # recording, because it couples brightness to what is in frame.
+        self.declare_parameter("use_auto_exposure", False)
+        self.declare_parameter("target_grey_percent", 80.0)
+        # Raise the ceiling the auto loop may use; 0 leaves it alone.
+        self.declare_parameter("auto_exposure_max_us", 0.0)
+        # White balance is the colour analogue of exposure: left on
+        # Continuous it keeps re-adapting to whatever is in frame, so the same
+        # scene yields different colours over a trial. "Once" converges on the
+        # empty field at startup and then holds. Pin balance_ratio_* to
+        # reproduce an exact previous session.
+        self.declare_parameter("white_balance", "Once")   # Once | Continuous | Off
+        self.declare_parameter("balance_ratio_red", 0.0)  # 0 = leave to the above
+        self.declare_parameter("balance_ratio_blue", 0.0)
+        self.declare_parameter("gamma", 0.0)  # 0 = leave the camera's value
+        # Freeze exposure/gain for the duration of a recorded trial so the
+        # pipette cannot modulate background brightness.
+        self.declare_parameter("lock_exposure_while_recording", True)
+
+        self._exposure_locked = False
+        self._held_exposure_us = 0.0
 
         self.pub_img = self.create_publisher(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, 10)
         self.pub_fps = self.create_publisher(Float32, TOPIC_CAM_FPS, 10)
@@ -83,8 +133,271 @@ class CameraNode(Node):
         except PySpin.SpinnakerException:
             pass
 
+        self._configure_image_quality()
+
         self.cam.BeginAcquisition()
         self.get_logger().info("Camera acquisition started.")
+        # Calibration needs live frames, so it has to follow BeginAcquisition.
+        # Exposure first so white balance sees a sanely exposed image, then
+        # exposure again because the white-balance gains move the mean.
+        self._calibrate_exposure()
+        self._calibrate_white_balance()
+        self._calibrate_exposure()
+        self._log_exposure("after startup")
+
+    # ── Exposure / brightness ──────────────────────────────────────────────
+    def _node_map(self):
+        return self.cam.GetNodeMap()
+
+    def _set_enum(self, name, entry) -> bool:
+        """Set one enumeration node, returning False instead of raising."""
+        try:
+            node = PySpin.CEnumerationPtr(self._node_map().GetNode(name))
+            if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
+                return False
+            value = node.GetEntryByName(entry)
+            if not PySpin.IsAvailable(value) or not PySpin.IsReadable(value):
+                return False
+            node.SetIntValue(value.GetValue())
+            return True
+        except PySpin.SpinnakerException as exc:
+            self.get_logger().warn(f"could not set {name}={entry}: {exc}")
+            return False
+
+    def _set_float(self, name, value) -> bool:
+        """Set one float node, clamped to the range the camera reports."""
+        try:
+            node = PySpin.CFloatPtr(self._node_map().GetNode(name))
+            if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
+                return False
+            node.SetValue(float(min(max(float(value), node.GetMin()), node.GetMax())))
+            return True
+        except PySpin.SpinnakerException as exc:
+            self.get_logger().warn(f"could not set {name}={value}: {exc}")
+            return False
+
+    def _get_float(self, name):
+        try:
+            node = PySpin.CFloatPtr(self._node_map().GetNode(name))
+            if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+                return node.GetValue()
+        except PySpin.SpinnakerException:
+            pass
+        return float("nan")
+
+    def _get_enum(self, name):
+        try:
+            node = PySpin.CEnumerationPtr(self._node_map().GetNode(name))
+            if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+                return node.GetCurrentEntry().GetSymbolic()
+        except PySpin.SpinnakerException:
+            pass
+        return "?"
+
+    def _configure_image_quality(self):
+        """Apply the brightness parameters. Every step degrades gracefully."""
+        manual_us = float(self.get_parameter("exposure_time_us").value)
+        gain_db = float(self.get_parameter("gain_db").value)
+        target = float(self.get_parameter("target_grey_percent").value)
+        ceiling = float(self.get_parameter("auto_exposure_max_us").value)
+
+        if ceiling > 0:
+            self._set_float("AutoExposureExposureTimeUpperLimit", ceiling)
+
+        if manual_us > 0:
+            # Fixed exposure: the same scene always produces the same pixels.
+            self._apply_fixed_exposure(manual_us)
+            self.get_logger().info(
+                f"Exposure fixed at {manual_us:.0f} us, gain {gain_db:.2f} dB"
+            )
+        elif bool(self.get_parameter("use_auto_exposure").value):
+            # The order matters: the target is only honoured once both loops
+            # have been handed authority and the target's own auto is off.
+            self._set_enum("ExposureAuto", "Continuous")
+            self._set_enum("GainAuto", "Continuous")
+            if target > 0:
+                # The target is only writable once its own 'auto' is off.
+                self._set_enum("AutoExposureTargetGreyValueAuto", "Off")
+                if self._set_float("AutoExposureTargetGreyValue", target):
+                    self.get_logger().info(
+                        f"Auto exposure targeting {target:.0f}% grey "
+                        "(camera default is ~50%, which looks dim on a bright field)"
+                    )
+
+        gamma = float(self.get_parameter("gamma").value)
+        if gamma > 0:
+            self._set_enum("GammaEnable", "On")
+            self._set_float("Gamma", gamma)
+
+        # White balance is handled after acquisition starts; see
+        # _calibrate_white_balance, which needs live frames to converge.
+
+    def _apply_fixed_exposure(self, microseconds: float) -> None:
+        """Pin exposure and gain, recording what we asked for."""
+        self._set_enum("ExposureAuto", "Off")
+        self._set_enum("ExposureMode", "Timed")
+        self._set_float("ExposureTime", microseconds)
+        self._set_enum("GainAuto", "Off")
+        self._set_float("Gain", float(self.get_parameter("gain_db").value))
+        self._held_exposure_us = float(microseconds)
+
+    def _frame_mean(self, discard: int = 4) -> float:
+        """Mean grey of a freshly grabbed frame, after flushing the pipeline."""
+        value = float("nan")
+        for _ in range(max(1, discard)):
+            try:
+                image = self.cam.GetNextImage(2000)
+            except PySpin.SpinnakerException:
+                return value
+            if not image.IsIncomplete():
+                value = float(image.GetNDArray().mean())
+            image.Release()
+        return value
+
+    def _solve_exposure_for(self, target_mean: float) -> float:
+        """Bisect exposure time until the delivered frame mean matches.
+
+        Brightness is monotonic in exposure, so this converges quickly. It is
+        driven entirely by measurement because the camera's ExposureTime
+        readback is cached and can disagree with what is really in effect.
+        """
+        low = 12.0
+        high = float(self.get_parameter("exposure_search_max_us").value)
+        for _ in range(10):
+            middle = 0.5 * (low + high)
+            self._apply_fixed_exposure(middle)
+            mean = self._frame_mean()
+            if mean != mean:  # NaN: grabbing failed, stop rather than thrash
+                return float("nan")
+            if mean > target_mean:
+                high = middle
+            else:
+                low = middle
+            if abs(mean - target_mean) <= 1.0:
+                break
+        return self._frame_mean()
+
+    def _calibrate_exposure(self):
+        """Hold the exposure that delivers ``target_mean_grey``."""
+        target = float(self.get_parameter("target_mean_grey").value)
+        if target <= 0:
+            return
+        if float(self.get_parameter("exposure_time_us").value) > 0:
+            return
+        if bool(self.get_parameter("use_auto_exposure").value):
+            return
+
+        ceiling = float(self.get_parameter("exposure_search_max_us").value)
+        self._apply_fixed_exposure(ceiling)
+        brightest = self._frame_mean()
+        if brightest == brightest and brightest < target:
+            # Even the longest allowed exposure falls short: the light really is
+            # insufficient, which is a rig problem rather than a settings one.
+            self.get_logger().warn(
+                f"cannot reach mean grey {target:.0f} even at {ceiling:.0f} us "
+                f"(best {brightest:.1f}); holding the longest allowed exposure. "
+                "Check the light path, the beam splitter and any ND filter."
+            )
+            return
+
+        achieved = self._solve_exposure_for(target)
+        if achieved != achieved:
+            self.get_logger().warn("exposure calibration could not read frames")
+            return
+        self.get_logger().info(
+            f"Exposure calibrated to {self._held_exposure_us:.0f} us for mean grey "
+            f"{achieved:.1f} (target {target:.0f}); held fixed for this session"
+        )
+
+    def _balance_ratio(self, channel, value=None):
+        """Read or write one BalanceRatio channel ("Red" or "Blue")."""
+        if not self._set_enum("BalanceRatioSelector", channel):
+            return float("nan")
+        if value is not None:
+            self._set_float("BalanceRatio", value)
+        return self._get_float("BalanceRatio")
+
+    def _calibrate_white_balance(self):
+        """Fix the colour balance for the session.
+
+        Continuous white balance re-adapts to frame content, so a dark pipette
+        or a stained sample shifts the colour of the whole image over a trial -
+        the same kind of content-dependent drift that auto exposure causes.
+        """
+        red = float(self.get_parameter("balance_ratio_red").value)
+        blue = float(self.get_parameter("balance_ratio_blue").value)
+        mode = str(self.get_parameter("white_balance").value).strip().capitalize()
+
+        if red > 0 and blue > 0:
+            self._set_enum("BalanceWhiteAuto", "Off")
+            self._balance_ratio("Red", red)
+            self._balance_ratio("Blue", blue)
+            self.get_logger().info(
+                f"White balance pinned at red={red:.3f} blue={blue:.3f}"
+            )
+            return
+
+        if mode == "Continuous":
+            self._set_enum("BalanceWhiteAuto", "Continuous")
+            self.get_logger().warn(
+                "white_balance=Continuous keeps adapting to frame content; "
+                "colours will drift within a trial. Prefer Once for datasets."
+            )
+            return
+
+        if mode == "Once":
+            # Let the camera's own algorithm converge on the current field,
+            # then it latches itself to Off and holds those gains.
+            self._set_enum("BalanceWhiteAuto", "Continuous")
+            self._frame_mean(discard=25)
+            self._set_enum("BalanceWhiteAuto", "Off")
+        else:
+            self._set_enum("BalanceWhiteAuto", "Off")
+
+        got_red = self._balance_ratio("Red")
+        got_blue = self._balance_ratio("Blue")
+        self.get_logger().info(
+            f"White balance held at red={got_red:.3f} blue={got_blue:.3f} "
+            "(set balance_ratio_red/blue to reproduce this exactly)"
+        )
+
+    def _log_exposure(self, when):
+        self.get_logger().info(
+            f"Exposure {when}: ExposureAuto={self._get_enum('ExposureAuto')} "
+            f"time={self._get_float('ExposureTime'):.0f}us "
+            f"GainAuto={self._get_enum('GainAuto')} gain={self._get_float('Gain'):.2f}dB"
+        )
+
+    def _lock_exposure(self):
+        """Freeze the converged auto values so a trial is photometrically stable."""
+        if self._exposure_locked or self.cam is None:
+            return
+        if not bool(self.get_parameter("lock_exposure_while_recording").value):
+            return
+        if float(self.get_parameter("exposure_time_us").value) > 0:
+            self._exposure_locked = True   # already fixed; nothing to freeze
+            return
+        # Reproduce the brightness the auto loop had reached, by measurement.
+        # The ExposureTime readback cannot be used: it reports a cached value,
+        # and writing it back visibly darkens the image.
+        before = self._frame_mean()
+        achieved = self._solve_exposure_for(before)
+        self._exposure_locked = True
+        self.get_logger().info(
+            f"Exposure locked for this trial at {self._held_exposure_us:.0f} us "
+            f"(mean grey {achieved:.1f}, was {before:.1f}) so the pipette cannot "
+            "modulate background brightness"
+        )
+
+    def _unlock_exposure(self):
+        """Hand exposure back to the auto loop between trials."""
+        if not self._exposure_locked or self.cam is None:
+            return
+        self._exposure_locked = False
+        if float(self.get_parameter("exposure_time_us").value) > 0:
+            return
+        self._configure_image_quality()
+        self.get_logger().info("Exposure returned to auto between trials")
 
     @staticmethod
     def _set_stream_newest_only(cam):
@@ -112,11 +425,13 @@ class CameraNode(Node):
             self.recording = False
             self.record_path = None
             self._close_writer()
+            self._unlock_exposure()
             self.get_logger().info("Recording stopped.")
             return
 
         # Switching to a new file: drop any previous writer first.
         self._close_writer()
+        self._lock_exposure()
         self.recording = True
         self.record_path = path
         self.get_logger().info(f"Recording started: {self.record_path}")
