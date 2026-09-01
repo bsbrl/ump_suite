@@ -88,11 +88,17 @@ def generate_launch_description():
 
         ExecuteProcess(cmd=["bash", "-lc", CAMERA_BOOTSTRAP], output="screen"),
 
+        # The logging period, the dataset fps recorded by the converter, and the
+        # policy's CONTROL_HZ all describe the same quantity and must agree. At
+        # 200 ms (5 Hz) a chunk whose steps are 200 ms apart in the demonstration
+        # was replayed at the policy's 3 Hz, i.e. ~40% slower than it was
+        # performed. 333 ms is 3 Hz, matching `--fps 3` and CONTROL_HZ = 3.0.
+        # If you change this, change those two as well.
         Node(
             package="ump_suite",
             executable="logger_node",
             output="screen",
-            parameters=[{"log_interval_ms": 200}],
+            parameters=[{"log_interval_ms": 333}],
         ),
 
         Node(

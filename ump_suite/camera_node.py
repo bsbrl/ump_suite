@@ -93,6 +93,13 @@ class CameraNode(Node):
 
         self._exposure_locked = False
         self._held_exposure_us = 0.0
+        # PySpin image acquisition and node-map access are not thread safe, and
+        # two threads reach the camera: the grab loop below, and the ROS
+        # executor thread whenever a record command triggers a recalibration.
+        # Every camera access is therefore taken under this lock. It is held per
+        # access rather than for a whole calibration, so a bisection cannot
+        # stall the preview stream for seconds at a time.
+        self._cam_lock = threading.Lock()
 
         self.pub_img = self.create_publisher(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, 10)
         self.pub_fps = self.create_publisher(Float32, TOPIC_CAM_FPS, 10)
@@ -152,13 +159,14 @@ class CameraNode(Node):
     def _set_enum(self, name, entry) -> bool:
         """Set one enumeration node, returning False instead of raising."""
         try:
-            node = PySpin.CEnumerationPtr(self._node_map().GetNode(name))
-            if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
-                return False
-            value = node.GetEntryByName(entry)
-            if not PySpin.IsAvailable(value) or not PySpin.IsReadable(value):
-                return False
-            node.SetIntValue(value.GetValue())
+            with self._cam_lock:
+                node = PySpin.CEnumerationPtr(self._node_map().GetNode(name))
+                if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
+                    return False
+                value = node.GetEntryByName(entry)
+                if not PySpin.IsAvailable(value) or not PySpin.IsReadable(value):
+                    return False
+                node.SetIntValue(value.GetValue())
             return True
         except PySpin.SpinnakerException as exc:
             self.get_logger().warn(f"could not set {name}={entry}: {exc}")
@@ -167,10 +175,13 @@ class CameraNode(Node):
     def _set_float(self, name, value) -> bool:
         """Set one float node, clamped to the range the camera reports."""
         try:
-            node = PySpin.CFloatPtr(self._node_map().GetNode(name))
-            if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
-                return False
-            node.SetValue(float(min(max(float(value), node.GetMin()), node.GetMax())))
+            with self._cam_lock:
+                node = PySpin.CFloatPtr(self._node_map().GetNode(name))
+                if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
+                    return False
+                node.SetValue(
+                    float(min(max(float(value), node.GetMin()), node.GetMax()))
+                )
             return True
         except PySpin.SpinnakerException as exc:
             self.get_logger().warn(f"could not set {name}={value}: {exc}")
@@ -178,18 +189,20 @@ class CameraNode(Node):
 
     def _get_float(self, name):
         try:
-            node = PySpin.CFloatPtr(self._node_map().GetNode(name))
-            if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
-                return node.GetValue()
+            with self._cam_lock:
+                node = PySpin.CFloatPtr(self._node_map().GetNode(name))
+                if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+                    return node.GetValue()
         except PySpin.SpinnakerException:
             pass
         return float("nan")
 
     def _get_enum(self, name):
         try:
-            node = PySpin.CEnumerationPtr(self._node_map().GetNode(name))
-            if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
-                return node.GetCurrentEntry().GetSymbolic()
+            with self._cam_lock:
+                node = PySpin.CEnumerationPtr(self._node_map().GetNode(name))
+                if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+                    return node.GetCurrentEntry().GetSymbolic()
         except PySpin.SpinnakerException:
             pass
         return "?"
@@ -245,13 +258,14 @@ class CameraNode(Node):
         """Mean grey of a freshly grabbed frame, after flushing the pipeline."""
         value = float("nan")
         for _ in range(max(1, discard)):
-            try:
-                image = self.cam.GetNextImage(2000)
-            except PySpin.SpinnakerException:
-                return value
-            if not image.IsIncomplete():
-                value = float(image.GetNDArray().mean())
-            image.Release()
+            with self._cam_lock:
+                try:
+                    image = self.cam.GetNextImage(2000)
+                except PySpin.SpinnakerException:
+                    return value
+                if not image.IsIncomplete():
+                    value = float(image.GetNDArray().mean())
+                image.Release()
         return value
 
     def _solve_exposure_for(self, target_mean: float) -> float:
@@ -368,13 +382,35 @@ class CameraNode(Node):
             f"GainAuto={self._get_enum('GainAuto')} gain={self._get_float('Gain'):.2f}dB"
         )
 
+    def _exposure_is_already_deterministic(self) -> bool:
+        """True when exposure is already fixed and cannot drift during a trial.
+
+        Three configurations pin it: an explicit ``exposure_time_us``, the
+        startup ``target_mean_grey`` bisection, and simply having the vendor auto
+        loop switched off. In all three the brightness is already independent of
+        frame content, so there is nothing to freeze.
+        """
+        if float(self.get_parameter("exposure_time_us").value) > 0:
+            return True
+        if float(self.get_parameter("target_mean_grey").value) > 0:
+            return True
+        return not bool(self.get_parameter("use_auto_exposure").value)
+
     def _lock_exposure(self):
-        """Freeze the converged auto values so a trial is photometrically stable."""
+        """Freeze the converged auto values so a trial is photometrically stable.
+
+        This is only meaningful when the vendor auto-exposure loop is actually
+        running, which is what the parameter documentation has always said. When
+        exposure is already deterministic, re-solving would be actively harmful:
+        the bisection re-targets the CURRENT frame mean, which at the start of a
+        trial may already contain the pipette, partially undoing the
+        content-independence the startup calibration exists to guarantee.
+        """
         if self._exposure_locked or self.cam is None:
             return
         if not bool(self.get_parameter("lock_exposure_while_recording").value):
             return
-        if float(self.get_parameter("exposure_time_us").value) > 0:
+        if self._exposure_is_already_deterministic():
             self._exposure_locked = True   # already fixed; nothing to freeze
             return
         # Reproduce the brightness the auto loop had reached, by measurement.
@@ -394,7 +430,10 @@ class CameraNode(Node):
         if not self._exposure_locked or self.cam is None:
             return
         self._exposure_locked = False
-        if float(self.get_parameter("exposure_time_us").value) > 0:
+        # Nothing was taken away in a deterministic configuration, so nothing is
+        # handed back. Saying otherwise used to log a plainly false statement on
+        # every trial stop.
+        if self._exposure_is_already_deterministic():
             return
         self._configure_image_quality()
         self.get_logger().info("Exposure returned to auto between trials")
@@ -468,13 +507,15 @@ class CameraNode(Node):
 
         while self.running and rclpy.ok():
             try:
-                img = self.cam.GetNextImage(CAM_GET_TIMEOUT_MS)
-                if img.IsIncomplete():
+                with self._cam_lock:
+                    img = self.cam.GetNextImage(CAM_GET_TIMEOUT_MS)
+                    if img.IsIncomplete():
+                        img.Release()
+                        continue
+                    # GetNDArray() aliases the buffer, so it must be copied
+                    # before Release() and before the lock is dropped.
+                    frame = img.GetNDArray().copy()
                     img.Release()
-                    continue
-
-                frame = img.GetNDArray()
-                img.Release()
 
                 now = time.time()
                 fps = 1.0 / max(1e-6, (now - last))

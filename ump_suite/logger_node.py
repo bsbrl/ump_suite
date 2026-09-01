@@ -7,6 +7,9 @@ When acquisition is running, this node periodically writes one CSV row per
   * the path of the camera frame that was saved on this tick
   * the latest HEKA resistance estimate, when one is available
   * the pressure applied to the device and the pressure measured back, in mbar
+  * wall-clock, camera and state timestamps, so a late tick or a stalled camera
+    is detectable after the fact rather than silently producing a well-formed
+    row whose image does not match its position
 
 It also forwards a record path to the camera node so that the matching mp4
 video file is captured for the same trial.
@@ -15,6 +18,7 @@ video file is captured for the same trial.
 import csv
 import math
 import os
+import time
 
 import cv2
 import numpy as np
@@ -50,6 +54,17 @@ CSV_HEADER = [
     "resistance_mohm",
     "target_pressure",
     "measured_pressure",
+    # Timing. Without these there is no way, after the fact, to tell a late tick
+    # or a stalled camera from a healthy row: a frozen camera silently writes the
+    # same frame into many rows and the dataset still looks well formed.
+    #   wall_time    - POSIX time this row was written
+    #   image_stamp  - POSIX time the camera stamped this frame, blank if unknown
+    #   state_stamp  - POSIX time the newest manipulator state arrived
+    #   image_age_s  - wall_time - image_stamp, the staleness of the saved frame
+    "wall_time",
+    "image_stamp",
+    "state_stamp",
+    "image_age_s",
 ]
 
 
@@ -64,10 +79,13 @@ class LoggerNode(Node):
     def __init__(self):
         super().__init__("logger_node")
         self.declare_parameter("log_interval_ms", 500)
+        # Warn when the saved frame is older than this relative to the row.
+        self.declare_parameter("stale_image_warn_s", 0.5)
 
-        # Latest live state.
+        # Latest live state, each with the POSIX time it arrived.
         self.latest_live_ump = None
         self.latest_live_ump2 = None
+        self.latest_state_stamp = None
         self.latest_image_msg = None
         self.latest_resistance_mohm = None
         # Pressure in mbar; None until the pressure node publishes. The target
@@ -91,6 +109,12 @@ class LoggerNode(Node):
 
         self.log_file = None
         self.writer = None
+        self._stale_image_warn_s = float(
+            self.get_parameter("stale_image_warn_s").value
+        )
+        self._stale_rows = 0
+        self._first_row_time = None
+        self._last_row_time = None
 
         # Live state subscribers.
         self.create_subscription(Int32MultiArray, TOPIC_UMP_LIVE,   self.on_ump_live,   10)
@@ -120,9 +144,11 @@ class LoggerNode(Node):
     # ── Subscriber callbacks ───────────────────────────────────────────────
     def on_ump_live(self, msg: Int32MultiArray):
         self.latest_live_ump = list(msg.data)
+        self.latest_state_stamp = time.time()
 
     def on_ump2_live(self, msg: Int32MultiArray):
         self.latest_live_ump2 = list(msg.data)
+        self.latest_state_stamp = time.time()
 
     def on_ump_target(self, msg: Int32MultiArray):
         # /ump/target carries [x,y,z,d,speed]; we only log [x,y,z,d].
@@ -148,19 +174,33 @@ class LoggerNode(Node):
             self.latest_measured_pressure = value
 
     # ── Trial setup ────────────────────────────────────────────────────────
+    @staticmethod
+    def _next_trial_id():
+        """Lowest unused trial number across every output directory.
+
+        Scanning only `logs/` is not enough: deleting a CSV while its frame
+        directory survives would hand the number back out, and the new run would
+        write `frame_000000.png` straight over the old trial's frames.
+        """
+        used = set()
+
+        def note(stem):
+            if stem.startswith("trial_") and stem[len("trial_"):].isdigit():
+                used.add(int(stem[len("trial_"):]))
+
+        for folder, suffix in (("logs", ".csv"), ("saved_frames", ""), ("saved_videos", ".mp4")):
+            if not os.path.isdir(folder):
+                continue
+            for name in os.listdir(folder):
+                note(name[: -len(suffix)] if suffix and name.endswith(suffix) else name)
+        return max(used, default=0) + 1
+
     def _setup_trial(self):
         os.makedirs("logs", exist_ok=True)
         os.makedirs("saved_frames", exist_ok=True)
         os.makedirs("saved_videos", exist_ok=True)
 
-        # Pick the next free trial number by inspecting `logs/`.
-        existing = []
-        for fn in os.listdir("logs"):
-            if fn.startswith("trial_") and fn.endswith(".csv"):
-                mid = fn[len("trial_"):-4]
-                if mid.isdigit():
-                    existing.append(int(mid))
-        next_trial = max(existing, default=0) + 1
+        next_trial = self._next_trial_id()
 
         self.trial_name = f"trial_{next_trial}"
         self.log_path   = os.path.join("logs",         f"{self.trial_name}.csv")
@@ -170,6 +210,9 @@ class LoggerNode(Node):
 
         self.frame_index = 0
         self.timestep = 0
+        self._stale_rows = 0
+        self._first_row_time = None
+        self._last_row_time = None
 
     def _open_csv(self):
         self.log_file = open(self.log_path, "w", newline="")
@@ -201,6 +244,7 @@ class LoggerNode(Node):
 
         self.acquiring = False
         self.pub_rec_cmd.publish(String(data=""))
+        self._report_achieved_rate()
 
         try:
             if self.log_file:
@@ -235,6 +279,64 @@ class LoggerNode(Node):
             self.get_logger().warn(f"Frame save error: {e}")
             return ""
 
+    def _report_achieved_rate(self):
+        """Compare the rate actually achieved with the configured one.
+
+        The timer is best effort and `_save_current_frame` encodes a PNG inside
+        the callback, so the configured period is a request rather than a fact.
+        The dataset fps and the policy control rate are both derived from what
+        actually happened here, so a drift is worth stating out loud.
+        """
+        if (self._first_row_time is None or self._last_row_time is None
+                or self.timestep < 2):
+            return
+        span = self._last_row_time - self._first_row_time
+        if span <= 0:
+            return
+        achieved = (self.timestep - 1) / span
+        configured = 1000.0 / max(
+            1, int(self.get_parameter("log_interval_ms").value)
+        )
+        self.get_logger().info(
+            f"{self.trial_name}: {self.timestep} rows in {span:.1f}s = "
+            f"{achieved:.2f} Hz (configured {configured:.2f} Hz)"
+        )
+        if achieved < 0.9 * configured:
+            self.get_logger().warn(
+                f"logging ran at {achieved:.2f} Hz, below 90% of the configured "
+                f"{configured:.2f} Hz. Convert this data with --fps "
+                f"{achieved:.0f} and match the policy control rate to it, or "
+                "reduce the load on this node."
+            )
+
+    def _image_stamp(self):
+        """POSIX time from the camera frame header, or "" when unavailable."""
+        if self.latest_image_msg is None:
+            return ""
+        try:
+            stamp = self.latest_image_msg.header.stamp
+            value = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        except AttributeError:
+            return ""
+        return value if math.isfinite(value) and value > 0 else ""
+
+    def _warn_if_stale(self, image_age):
+        """Say so when the saved frame is much older than the row it belongs to.
+
+        A stalled camera is otherwise invisible: the logger keeps writing the
+        last frame it received, and every row still looks complete.
+        """
+        if image_age == "" or image_age <= self._stale_image_warn_s:
+            self._stale_rows = 0
+            return
+        self._stale_rows += 1
+        if self._stale_rows % 10 == 1:
+            self.get_logger().warn(
+                f"camera frame is {image_age:.2f}s older than this row "
+                f"({self._stale_rows} consecutive); the recorded images may not "
+                "match the recorded positions"
+            )
+
     def tick(self):
         if not self.acquiring or self.writer is None:
             return
@@ -263,7 +365,12 @@ class LoggerNode(Node):
             else ""
         )
 
+        # Stamp the frame that is about to be written, not the one that may
+        # arrive while it is being encoded.
+        image_stamp = self._image_stamp()
         image_path = self._save_current_frame()
+        wall_time = time.time()
+        image_age = "" if image_stamp == "" else round(wall_time - image_stamp, 6)
 
         self.writer.writerow([
             self.timestep,
@@ -275,8 +382,16 @@ class LoggerNode(Node):
             resistance,
             target_pressure,
             measured_pressure,
+            round(wall_time, 6),
+            "" if image_stamp == "" else round(image_stamp, 6),
+            "" if self.latest_state_stamp is None else round(self.latest_state_stamp, 6),
+            image_age,
         ])
+        if self._first_row_time is None:
+            self._first_row_time = wall_time
+        self._last_row_time = wall_time
         self.timestep += 1
+        self._warn_if_stale(image_age)
 
         try:
             self.log_file.flush()

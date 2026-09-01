@@ -21,6 +21,10 @@ from .ros_interfaces import (
 PACKET_MAGIC = b"HEKA1"
 PACKET_HEADER = struct.Struct("<5sdfH")
 DEFAULT_VOLTAGE_MONITOR_SCALE = 10.0
+# Upper bound on packets handled per timer tick. Large enough to absorb
+# ordinary jitter at 100 packets/s, small enough that a flooded socket
+# cannot block the executor.
+MAX_PACKETS_PER_TICK = 64
 
 
 class HekaUdpReceiverNode(Node):
@@ -47,29 +51,55 @@ class HekaUdpReceiverNode(Node):
         )
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Absorb bursts while the executor is busy elsewhere. Best effort: the
+        # kernel may cap this below what is requested.
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        except OSError:
+            pass
         self.sock.bind(("0.0.0.0", port))
         self.sock.setblocking(False)
 
         self._res_voltage = deque()
         self._res_current = deque()
+        self._backlog_ticks = 0
 
         self.timer = self.create_timer(0.01, self.loop)
         self.get_logger().info(f"Listening for HEKA UDP on port {port}")
 
     def loop(self):
-        try:
-            data, addr = self.sock.recvfrom(65535)
-        except BlockingIOError:
-            return
+        """Drain the socket each tick rather than taking a single packet.
 
-        try:
-            if data.startswith(PACKET_MAGIC):
-                self._handle_binary_packet(data, addr)
-            else:
-                self._handle_legacy_text_packet(data, addr)
+        The Windows sender emits one packet per 10 ms, and this timer also fires
+        every 10 ms, so handling exactly one packet per tick leaves zero rate
+        headroom: any scheduling jitter accumulates in the socket buffer as
+        growing latency and then as silent drops. Draining is bounded so one
+        tick can never starve the executor.
+        """
+        for _ in range(MAX_PACKETS_PER_TICK):
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except BlockingIOError:
+                return
 
-        except Exception as e:
-            self.get_logger().warn(f"Bad HEKA UDP packet from {addr}: {e}")
+            try:
+                if data.startswith(PACKET_MAGIC):
+                    self._handle_binary_packet(data, addr)
+                else:
+                    self._handle_legacy_text_packet(data, addr)
+            except Exception as e:
+                self.get_logger().warn(f"Bad HEKA UDP packet from {addr}: {e}")
+        else:
+            # Reaching the cap (rather than emptying the socket) means packets
+            # are arriving faster than they can be processed, which shows up as
+            # a lagging resistance estimate.
+            self._backlog_ticks += 1
+            if self._backlog_ticks % 100 == 1:
+                self.get_logger().warn(
+                    f"HEKA receiver hit its per-tick cap of {MAX_PACKETS_PER_TICK} "
+                    f"packets ({self._backlog_ticks} tick(s) so far); samples may be "
+                    "arriving faster than they can be processed"
+                )
 
     def _handle_binary_packet(self, data, addr):
         if len(data) < PACKET_HEADER.size:

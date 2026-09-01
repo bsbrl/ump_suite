@@ -7,8 +7,15 @@ The pressure is commanded as an exact value in mbar on a single topic:
     /pressure/mbar =   0.0  ->  vented
 
 Whatever arrives is clamped to the range the controller reports for its channel,
-so a mistyped or out-of-range value cannot exceed the hardware limits. The topic
-is latched, so this node picks up the last commanded pressure even if it restarts.
+so a mistyped or out-of-range value cannot exceed the hardware limits.
+
+The topic is latched, so this node picks up the last commanded pressure even if
+it restarts. Because `/pressure/mbar` has more than one publisher (the GUI and
+the rollout client), a restart delivers the last sample from EACH of them in an
+order ROS does not define. Startup therefore collects that history for
+`startup_grace_s` and only restores it when every publisher agrees; a conflict
+holds at 0 mbar and says so, rather than resurrecting whichever stale command
+happened to arrive last.
 
 Two readbacks are published:
 
@@ -53,6 +60,10 @@ IDLE_MBAR = 0.0
 # Fallback device limits, used only if the controller will not report its range.
 FALLBACK_RANGE_MBAR = (-1000.0, 1000.0)
 
+# How long to collect latched command history at startup before acting on it.
+# See _resolve_startup_commands for why a window is needed at all.
+DEFAULT_STARTUP_GRACE_S = 1.0
+
 
 def clamp(v, vmin, vmax):
     return max(vmin, min(vmax, v))
@@ -68,6 +79,10 @@ class PressureNode(Node):
         # Tighten these to keep well inside what the pipette can take.
         self.declare_parameter("max_mbar", 1000.0)
         self.declare_parameter("min_mbar", -1000.0)
+        # Startup window during which latched commands are collected rather than
+        # applied immediately. 0 disables the window and restores the historical
+        # apply-whatever-arrives-last behaviour.
+        self.declare_parameter("startup_grace_s", DEFAULT_STARTUP_GRACE_S)
 
         self.channel = int(self.get_parameter("channel").value)
         poll_ms = int(self.get_parameter("poll_ms").value)
@@ -75,6 +90,17 @@ class PressureNode(Node):
         self.enabled = False
         self.commanded_mbar = IDLE_MBAR
         self.pressure_min, self.pressure_max = FALLBACK_RANGE_MBAR
+
+        # `/pressure/mbar` is latched and has more than one publisher (the GUI
+        # and the rollout client). On startup this node therefore receives the
+        # last sample from EACH of them, in an order ROS does not define, so
+        # "apply whatever arrives last" can resurrect a stale command. Collect
+        # them instead and only act once the picture is unambiguous.
+        grace = float(self.get_parameter("startup_grace_s").value)
+        self._startup_grace_s = grace if math.isfinite(grace) and grace > 0 else 0.0
+        self._startup_open = self._startup_grace_s > 0.0
+        self._startup_commands = []
+        self._startup_timer = None
 
         self.pub_measured = self.create_publisher(Float32, TOPIC_PRESSURE_MEASURED, 10)
         # Latched: the logger must see the applied pressure even if it starts
@@ -88,6 +114,11 @@ class PressureNode(Node):
         self.create_subscription(
             Float32, TOPIC_PRESSURE_MBAR, self._on_pressure_cmd, latched_qos()
         )
+
+        if self._startup_open:
+            self._startup_timer = self.create_timer(
+                self._startup_grace_s, self._resolve_startup_commands
+            )
 
         self.timer = self.create_timer(poll_ms / 1000.0, self._poll_measured)
 
@@ -137,12 +168,58 @@ class PressureNode(Node):
             return 0.0, 0.0
         return lower, upper
 
+    def _resolve_startup_commands(self):
+        """Decide what the latched startup history actually means.
+
+        Unanimous history is the intended single-publisher restore and is
+        applied. Conflicting history is genuinely ambiguous - it is exactly the
+        case where applying the wrong one re-pressurises a pipette the operator
+        believes is vented - so this fails closed at the idle pressure and says
+        which values it saw.
+        """
+        if self._startup_timer is not None:
+            self._startup_timer.cancel()
+            self._startup_timer = None
+        self._startup_open = False
+
+        seen = list(self._startup_commands)
+        self._startup_commands.clear()
+        if not seen:
+            return
+
+        distinct = sorted(set(seen))
+        if len(distinct) == 1:
+            self.get_logger().info(
+                f"Restoring latched pressure {distinct[0]:+.1f} mbar from startup history"
+            )
+            self._apply_pressure(distinct[0])
+            return
+
+        self.get_logger().warn(
+            "Conflicting latched pressure commands at startup "
+            f"({', '.join(f'{v:+.1f}' for v in distinct)} mbar) - `/pressure/mbar` has "
+            "more than one publisher and their order is undefined. Holding "
+            f"{IDLE_MBAR:+.1f} mbar; send the intended pressure explicitly."
+        )
+
     def _on_pressure_cmd(self, msg: Float32):
         requested = float(msg.data)
         if not math.isfinite(requested):
             self.get_logger().warn(f"Ignoring non-finite pressure {requested}")
             return
 
+        if self._startup_open:
+            # Collected, not applied. _resolve_startup_commands decides.
+            self._startup_commands.append(requested)
+            self.get_logger().info(
+                f"Deferring pressure {requested:+.1f} mbar until the startup "
+                "window closes"
+            )
+            return
+
+        self._apply_pressure(requested)
+
+    def _apply_pressure(self, requested: float):
         lower, upper = self._safe_limits()
         target = clamp(requested, lower, upper)
         if target != requested:
