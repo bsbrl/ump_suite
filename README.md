@@ -113,7 +113,7 @@ The node therefore calibrates once at startup and then holds both fixed:
 | `exposure_search_max_us` | `15000.0` | Upper bound for the search. |
 | `use_auto_exposure` | `false` | Hand brightness back to the camera's own loop. |
 | `target_grey_percent` | `80.0` | Target for that loop. Only used when `use_auto_exposure` is true. |
-| `lock_exposure_while_recording` | `true` | Freezes exposure per trial. Only meaningful with `use_auto_exposure`. |
+| `lock_exposure_while_recording` | `true` | Freezes exposure per trial. Applies **only** when `use_auto_exposure` is true — with `target_mean_grey` or an explicit `exposure_time_us`, exposure is already deterministic and re-solving would re-target the current frame mean, which at the start of a trial may already contain the pipette. |
 | `white_balance` | `Once` | `Once` converges on the field then holds; `Continuous` keeps adapting; `Off` freezes as-is. |
 | `balance_ratio_red` / `_blue` | `0.0` | `> 0` pins exact gains, reproducing a previous session. |
 
@@ -136,6 +136,11 @@ a frame-to-frame drift of 0.02–0.06 grey levels.
 > a model trained on green-filtered frames will not transfer to white light.
 > Re-calibrate whenever the filter or illumination changes; the startup
 > calibration does this for you automatically.
+
+Every camera access — the grab loop and any recalibration triggered from the ROS
+executor thread — is serialized behind one lock, because PySpin acquisition is not
+thread safe. The lock is held per access rather than for a whole calibration, so a
+bisection cannot stall the preview stream.
 
 Calibration is driven entirely by measuring frames. The camera's `ExposureTime`
 readback is cached on this model and cannot be trusted — it reported a constant
@@ -169,6 +174,16 @@ Pressure is commanded as an **exact value in mbar** on one topic:
 
 One number, sign carries the direction. The topic is latched, so the node picks up the last commanded pressure even if it restarts.
 
+Because `/pressure/mbar` has **more than one publisher** (the GUI and the rollout client), a restart delivers the last latched sample from *each* of them, in an order ROS does not define — so "apply whatever arrives last" could resurrect a stale command over a vent. Startup therefore collects that history for `startup_grace_s` (default 1.0 s) and only restores it when every publisher agrees. A conflict holds at 0 mbar and names the values it saw:
+
+```
+Conflicting latched pressure commands at startup (-30.0, +0.0 mbar) -
+`/pressure/mbar` has more than one publisher and their order is undefined.
+Holding +0.0 mbar; send the intended pressure explicitly.
+```
+
+Set `startup_grace_s: 0.0` to restore the historical apply-whatever-arrives-last behaviour.
+
 Incoming values are clamped to the range the controller reports for its channel (intersected with the `min_mbar` / `max_mbar` parameters), and non-finite values are rejected outright, both with a warning. The channel is set to **0 mbar on connect**, and vented to 0 mbar before `fgt_close()` on shutdown — including on Ctrl+C and on the SIGTERM `ros2 launch` sends.
 
 Two readbacks come back out:
@@ -186,11 +201,16 @@ Parameters:
 | `poll_ms` | `100` | How often `/pressure/measured_mbar` is published. |
 | `max_mbar` | `1000.0` | Safety ceiling, intersected with the device range. |
 | `min_mbar` | `-1000.0` | Safety floor, intersected with the device range. |
+| `startup_grace_s` | `1.0` | Window for collecting latched commands at startup before acting on them. `0` disables it. |
 
 If no controller is detected the node logs an error and stays inert rather than killing the launch, matching the ODrive driver's behaviour.
 
 ### `heka_udp_receiver_node`
-Listens for UDP packets on `port` (default `5005`). The current Windows sender emits binary packets:
+Listens for UDP packets on `port` (default `5005`), draining the socket each tick
+(bounded at 64 packets) rather than taking one packet per 10 ms timer tick. The
+sender emits 100 packets/s and the timer fires at the same rate, so handling a
+single packet per tick left zero headroom: any jitter accumulated as latency and
+then as silent drops. It warns if it keeps hitting the per-tick cap. The current Windows sender emits binary packets:
 
 ```
 header = "<5sdfH": magic=b"HEKA1", first_sample_time, sample_rate_hz, sample_count
@@ -211,9 +231,9 @@ For now, the GUI plots voltage and current and shows the live resistance estimat
 Builds a synchronized dataset:
 1. Subscribes to **live** topics (UMP1, UMP2) and to **target** topics published by the GUI / policy.
 2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value when available, and to `/pressure/mbar` for the pressure column.
-3. On `/acq/start`, picks the next free `trial_N` ID under `logs/`, opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and tells the camera to record `saved_videos/trial_N.mp4`.
-4. Every `log_interval_ms` it saves the latest JPEG to `saved_frames/trial_N/frame_NNNNNN.png` and appends one CSV row with the live pose, the most-recent commanded target, the saved image's path, and the latest resistance when available.
-5. On `/acq/stop` it closes the file and sends an empty record command to the camera.
+3. On `/acq/start`, picks the next free `trial_N` ID by inspecting **`logs/`, `saved_frames/` and `saved_videos/` together**, opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and tells the camera to record `saved_videos/trial_N.mp4`. Scanning all three matters: deleting a CSV while its frame directory survives would otherwise hand the number back out and the new run would overwrite the old frames.
+4. Every `log_interval_ms` it saves the latest JPEG to `saved_frames/trial_N/frame_NNNNNN.png` and appends one CSV row with the live pose, the most-recent commanded target, the saved image's path, the latest resistance when available, and the timing columns below.
+5. On `/acq/stop` it closes the file, sends an empty record command to the camera, and reports the logging rate it actually achieved.
 
 The latest target is **not cleared** between ticks, so even if the user stops issuing commands the most recent target keeps appearing in the log and `(target − current)` is always meaningful.
 
@@ -230,8 +250,24 @@ target_x2,  target_y2,  target_z2,  target_d2,
 image_path,
 resistance_mohm,
 target_pressure,
-measured_pressure
+measured_pressure,
+wall_time,
+image_stamp,
+state_stamp,
+image_age_s
 ```
+
+The four timing columns exist so a late tick or a stalled camera is detectable
+after the fact. Without them a frozen camera silently writes the same frame into
+many rows and the dataset still looks perfectly well formed:
+
+- **`wall_time`** — POSIX time the row was written.
+- **`image_stamp`** — POSIX time the camera stamped this frame, from the
+  `CompressedImage` header. Blank if unavailable.
+- **`state_stamp`** — POSIX time the newest manipulator state arrived.
+- **`image_age_s`** — `wall_time − image_stamp`, i.e. how stale the saved frame
+  is. The node also warns live once this exceeds `stale_image_warn_s`
+  (default 0.5 s).
 
 The two pressure columns, both in mbar with negative meaning pull:
 
@@ -239,6 +275,14 @@ The two pressure columns, both in mbar with negative meaning pull:
 - **`measured_pressure`** — from `/pressure/measured_mbar`: the controller's sensor reading. Expect it to lag `target_pressure` by a poll tick or two while the channel settles, and to sit slightly off the target.
 
 Both are blank until the pressure node publishes, which it does as soon as it connects (it applies 0 mbar on startup), so in practice they are populated from the first row of any trial where the pressure node is running.
+
+**Logging rate.** `log_interval_ms` defaults to **333 ms (3 Hz)** in the launch
+file, matching the converter's `--fps 3` and the policy's `CONTROL_HZ`. These
+three describe the same quantity and must agree: at 200 ms a chunk whose steps
+were 200 ms apart in the demonstration got replayed at 3 Hz, about 40% slower
+than it was performed. Because a ROS timer is best effort and the PNG encode runs
+inside the callback, the node measures what actually happened and reports it at
+`/acq/stop`, warning if it fell below 90% of the configured rate.
 
 ### `gui_node`
 A PyQt5 control panel split into a controls column and a live camera / HEKA preview column. Two `UmpPanel` instances drive UMP1 and UMP2 (each with X / Y / Z / D controls, nudge buttons, axis step, speed, **Send Now**, **Home**, **Sync Live**, **Calibrate Zero**), a row for the ODrive motor, a **Pressure (Fluigent)** panel, Start / Stop buttons that call `/acq/start` and `/acq/stop`, rolling voltage/current plots from `/heka/voltage_raw_v` and `/heka/current_pa`, and a live resistance readout.
@@ -261,7 +305,7 @@ All UMP commands are absolute Sensapex targets. The bump buttons mutate the loca
 
 ## Closed-loop VLA rollouts
 
-> ⓘ **The rollout client no longer lives in this package.** `main.py` and `sensapex_env.py` were deleted in commit `699bd1f`, along with the `sensapex_rollout` console script. The policy code now sits in the separate training / inference repos (`~/SmolVLA`, `~/MicroVLA*/rollout`).
+> ⓘ **The rollout client no longer lives in this package.** `main.py` and `sensapex_env.py` were deleted in commit `699bd1f`, along with the `sensapex_rollout` console script. The policy code now sits in the separate training / inference repo (`~/MicroVLA2/rollout`; `~/SmolVLA` for the older SmolVLA experiments).
 >
 > This package is now purely the **robot side**. What follows is the interface a policy client has to speak — not documentation of code in this repo.
 
@@ -358,7 +402,7 @@ This starts the dual UMP driver (`device_id=1` and `device_id=2` in one process)
 2. Use the GUI (or publish on `/ump/target`, `/ump2/target`, `/motor/target_counts` and `/pressure/mbar` directly) to drive the rig. The CSV logger records UMP state/targets, HEKA resistance and the commanded pressure, but not the ODrive motor.
    The pressure columns populate as soon as the pressure node is up, since it publishes its startup 0 mbar.
 3. Click **Start Data Acquisition** — this calls `/acq/start`, which opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and asks the camera to record `saved_videos/trial_N.mp4`.
-4. Perform the trial. The logger writes one row per `log_interval_ms` (default 200 ms).
+4. Perform the trial. The logger writes one row per `log_interval_ms` (default 333 ms = 3 Hz).
 5. Click **Stop Data Acquisition** — this calls `/acq/stop`, closes the CSV, and stops the mp4.
 
 Output layout:
@@ -373,7 +417,7 @@ saved_videos/trial_1.mp4
 
 ### Run a closed-loop policy rollout
 
-The rollout client is **not part of this package** — run it from whichever policy repo you are using (`~/SmolVLA`, `~/MicroVLA*/rollout`). From this side:
+The rollout client is **not part of this package** — run it from the policy repo (`~/MicroVLA2/rollout`, or `~/SmolVLA` for the older experiments). From this side:
 
 1. Launch this suite, so the client has `/camera/image/compressed`, `/ump/live` and `/ump2/live` to read and `/ump/target`, `/ump2/target`, `/pressure/mbar` to write.
 2. **Check the client's workspace limits, per-tick step caps and pressure range for this stage before starting.**
