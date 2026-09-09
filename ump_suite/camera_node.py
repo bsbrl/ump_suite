@@ -390,11 +390,16 @@ class CameraNode(Node):
         loop switched off. In all three the brightness is already independent of
         frame content, so there is nothing to freeze.
         """
+        # Order matters. use_auto_exposure wins: when it is on,
+        # _configure_image_quality hands the camera its own continuous loop and
+        # _calibrate_exposure returns early, so nothing is pinned no matter what
+        # target_mean_grey says. Testing the target first reported a running auto
+        # loop as fixed and skipped the per-trial lock entirely.
+        if bool(self.get_parameter("use_auto_exposure").value):
+            return False
         if float(self.get_parameter("exposure_time_us").value) > 0:
             return True
-        if float(self.get_parameter("target_mean_grey").value) > 0:
-            return True
-        return not bool(self.get_parameter("use_auto_exposure").value)
+        return float(self.get_parameter("target_mean_grey").value) > 0
 
     def _lock_exposure(self):
         """Freeze the converged auto values so a trial is photometrically stable.

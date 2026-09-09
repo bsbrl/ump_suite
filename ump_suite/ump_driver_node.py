@@ -1,9 +1,13 @@
 """ROS2 driver for one Sensapex UMP micromanipulator stage.
 
-The Sensapex SDK reports positions in unsigned device units. This node exposes
-those same absolute device coordinates on the ROS topics and forwards absolute
+The Sensapex SDK reports positions in MICROMETRES as floats, and speeds in um/s.
+This node exposes those absolute coordinates on the ROS topics, truncated to
+whole micrometres by the Int32MultiArray message type, and forwards absolute
 targets directly to the device. Topic names are built from a `topic_prefix`
 parameter, allowing one process per device.
+
+Units matter for safety: a step cap of 50 is 50 um per tick, which is several
+cell diameters. Do not read these as unspecified encoder counts.
 """
 
 import rclpy
@@ -43,7 +47,13 @@ class UMPDriverNode(Node):
         self.timer = self.create_timer(poll_ms / 1000.0, self.poll_live)
 
     def _read_absolute_pos(self):
-        """Return the current [x, y, z, d] position in absolute device counts."""
+        """Return the current [x, y, z, d] absolute position in MICROMETRES.
+
+        The Sensapex SDK documents positions in um and returns floats. They are
+        truncated to whole micrometres here because the ROS message is an
+        Int32MultiArray; sub-micrometre feedback is lost. Anything that needs it
+        must change the message type, not just this function.
+        """
         pos = self.stage.get_pos()
         return [int(pos[i]) for i in range(4)]
 

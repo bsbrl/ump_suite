@@ -88,7 +88,17 @@ class ODriveDriverNode(Node):
             else:
                 self.axis.controller.input_vel = goto_speed * (1.0 if err > 0 else -1.0)
         except Exception as e:
-            self.get_logger().warn(f"ODrive loop error: {e}")
+            # Do not leave a previously commanded velocity running. If the read
+            # or write failed we no longer know the state, so command zero and
+            # latch out of the loop rather than coasting on a stale setpoint.
+            self.get_logger().error(f"ODrive loop error, commanding zero: {e}")
+            try:
+                self.axis.controller.input_vel = 0.0
+            except Exception as stop_error:
+                self.get_logger().error(
+                    f"ODrive could not be stopped in software: {stop_error}"
+                )
+            self.enabled = False
 
     def destroy_node(self):
         try:

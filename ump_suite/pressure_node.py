@@ -221,7 +221,14 @@ class PressureNode(Node):
 
     def _apply_pressure(self, requested: float):
         lower, upper = self._safe_limits()
-        target = clamp(requested, lower, upper)
+        # Venting is always permitted, whatever the envelope. An operator may
+        # legitimately configure a wholly negative window (say -80..-20 mbar for
+        # a seal); clamping a vent into that window would leave the pipette
+        # pressurised at exactly the moment it must not be.
+        if requested == IDLE_MBAR:
+            target = IDLE_MBAR
+        else:
+            target = clamp(requested, lower, upper)
         if target != requested:
             self.get_logger().warn(
                 f"Pressure {requested:+.1f} mbar clamped to {target:+.1f} mbar "

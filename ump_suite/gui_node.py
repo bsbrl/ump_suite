@@ -440,6 +440,10 @@ class UmpPanel(QGroupBox):
             "D": self._spin(DEFAULT_AXIS_TARGET, AXIS_MIN, AXIS_MAX),
         }
         self.live_labels = {axis: QLabel("--") for axis in self.target_spins}
+        # The target boxes start at a placeholder. Until they have adopted the
+        # real pose, nudging one axis would publish the placeholder on the other
+        # three - a large, unrequested move on first use.
+        self._adopted_live = False
 
         self._send_timer = QTimer(self)
         self._send_timer.setSingleShot(True)
@@ -546,6 +550,12 @@ class UmpPanel(QGroupBox):
         self.send_now()
 
     def send_now(self):
+        if not self._adopted_live:
+            self.app.set_status(
+                f"{self.label}: waiting for live position before commanding "
+                "(targets still hold their placeholder)"
+            )
+            return
         self._send_timer.stop()
         x, y, z, d = (self._axis_value(axis) for axis in ("X", "Y", "Z", "D"))
         speed = self._resolved_speed()
@@ -574,8 +584,18 @@ class UmpPanel(QGroupBox):
         self.app.set_status(f"{self.label} targets synced to live")
 
     def update_live_display(self):
-        for axis, value in zip(("X", "Y", "Z", "D"), self._live_getter()):
+        values = list(self._live_getter())
+        for axis, value in zip(("X", "Y", "Z", "D"), values):
             self.live_labels[axis].setText(f"{int(value):d}")
+        # First real feedback: adopt it, so the first nudge is relative to where
+        # the stage actually is rather than to the placeholder.
+        if not self._adopted_live and any(int(v) for v in values):
+            self._updating = True
+            for axis, value in zip(("X", "Y", "Z", "D"), values):
+                self.target_spins[axis].setValue(int(value))
+            self._updating = False
+            self._adopted_live = True
+            self.app.set_status(f"{self.label} targets adopted from live position")
 
     def calibrate_zero(self):
         ok, msg = self.app.node.call_trigger(self.zero_client)
