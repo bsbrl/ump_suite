@@ -1,4 +1,5 @@
-"""ROS2 driver for a FLIR Blackfly camera via PySpin.
+"""
+ROS2 driver for a FLIR Blackfly camera via PySpin.
 
 Each frame is grabbed in a worker thread, then:
   * a JPEG-compressed copy is published at `publish_hz` for the GUI / VLA client
@@ -100,6 +101,7 @@ class CameraNode(Node):
         # access rather than for a whole calibration, so a bisection cannot
         # stall the preview stream for seconds at a time.
         self._cam_lock = threading.Lock()
+        self._record_lock = threading.RLock()
 
         self.pub_img = self.create_publisher(CompressedImage, TOPIC_CAM_IMAGE_COMPRESSED, 10)
         self.pub_fps = self.create_publisher(Float32, TOPIC_CAM_FPS, 10)
@@ -269,7 +271,8 @@ class CameraNode(Node):
         return value
 
     def _solve_exposure_for(self, target_mean: float) -> float:
-        """Bisect exposure time until the delivered frame mean matches.
+        """
+        Bisect exposure time until the delivered frame mean matches.
 
         Brightness is monotonic in exposure, so this converges quickly. It is
         driven entirely by measurement because the camera's ExposureTime
@@ -332,7 +335,8 @@ class CameraNode(Node):
         return self._get_float("BalanceRatio")
 
     def _calibrate_white_balance(self):
-        """Fix the colour balance for the session.
+        """
+        Fix the colour balance for the session.
 
         Continuous white balance re-adapts to frame content, so a dark pipette
         or a stained sample shifts the colour of the whole image over a trial -
@@ -383,26 +387,24 @@ class CameraNode(Node):
         )
 
     def _exposure_is_already_deterministic(self) -> bool:
-        """True when exposure is already fixed and cannot drift during a trial.
+        """
+        Report whether exposure is fixed and cannot drift during a trial.
 
         Three configurations pin it: an explicit ``exposure_time_us``, the
         startup ``target_mean_grey`` bisection, and simply having the vendor auto
         loop switched off. In all three the brightness is already independent of
         frame content, so there is nothing to freeze.
         """
-        # Order matters. use_auto_exposure wins: when it is on,
-        # _configure_image_quality hands the camera its own continuous loop and
-        # _calibrate_exposure returns early, so nothing is pinned no matter what
-        # target_mean_grey says. Testing the target first reported a running auto
-        # loop as fixed and skipped the per-trial lock entirely.
-        if bool(self.get_parameter("use_auto_exposure").value):
-            return False
+        # Match _configure_image_quality: a positive manual exposure takes
+        # precedence over the auto flag. Otherwise only continuous auto needs
+        # freezing; auto-off is already fixed, even without a target grey level.
         if float(self.get_parameter("exposure_time_us").value) > 0:
             return True
-        return float(self.get_parameter("target_mean_grey").value) > 0
+        return not bool(self.get_parameter("use_auto_exposure").value)
 
     def _lock_exposure(self):
-        """Freeze the converged auto values so a trial is photometrically stable.
+        """
+        Freeze the converged auto values so a trial is photometrically stable.
 
         This is only meaningful when the vendor auto-exposure loop is actually
         running, which is what the parameter documentation has always said. When
@@ -463,6 +465,10 @@ class CameraNode(Node):
             self.video_writer = None
 
     def on_rec_cmd(self, msg: String):
+        with self._record_lock:
+            self._handle_rec_cmd(msg)
+
+    def _handle_rec_cmd(self, msg: String):
         path = (msg.data or "").strip()
 
         if path == "":
@@ -496,6 +502,11 @@ class CameraNode(Node):
         self.pub_fps.publish(Float32(data=float(fps)))
 
     def _record_frame(self, frame_bgr):
+        with self._record_lock:
+            if self.recording and self.record_path:
+                self._write_record_frame(frame_bgr)
+
+    def _write_record_frame(self, frame_bgr):
         if self.video_writer is None:
             h, w = frame_bgr.shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -514,13 +525,13 @@ class CameraNode(Node):
             try:
                 with self._cam_lock:
                     img = self.cam.GetNextImage(CAM_GET_TIMEOUT_MS)
-                    if img.IsIncomplete():
+                    try:
+                        if img.IsIncomplete():
+                            continue
+                        # SDK memory must be copied before releasing this image.
+                        frame = img.GetNDArray().copy()
+                    finally:
                         img.Release()
-                        continue
-                    # GetNDArray() aliases the buffer, so it must be copied
-                    # before Release() and before the lock is dropped.
-                    frame = img.GetNDArray().copy()
-                    img.Release()
 
                 now = time.time()
                 fps = 1.0 / max(1e-6, (now - last))
@@ -548,6 +559,12 @@ class CameraNode(Node):
     # ── Shutdown ───────────────────────────────────────────────────────────
     def destroy_node(self):
         self.running = False
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=max(2.0, CAM_GET_TIMEOUT_MS / 1000.0 + 1.0))
+            if self.thread.is_alive():
+                raise RuntimeError(
+                    "Camera worker did not stop; refusing to release SDK buffers in use"
+                )
         self._close_writer()
 
         try:

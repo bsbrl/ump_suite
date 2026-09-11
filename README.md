@@ -41,25 +41,27 @@ ump_suite/
 
 ### ROS topics & services
 
-All names live in [ros_interfaces.py](ump_suite/ros_interfaces.py).
+Shared names live in [ros_interfaces.py](ump_suite/ros_interfaces.py); the UMP
+driver also constructs service names from its configured prefix.
 
 | Name | Type | Direction | Notes |
 |---|---|---|---|
-| `/ump/live`, `/ump2/live` | `std_msgs/Int32MultiArray` | publish | Current `[x, y, z, d]` in absolute Sensapex device counts |
+| `/ump/live`, `/ump2/live` | `std_msgs/Int32MultiArray` | publish | Current `[x, y, z, d]` in absolute micrometres (integer ROS fields) |
 | `/ump/target`, `/ump2/target` | `std_msgs/Int32MultiArray` | subscribe | Absolute Sensapex target `[x, y, z, d, speed]` |
 | `/motor/live_counts` | `std_msgs/Int32` | publish | Current ODrive shadow encoder count |
 | `/motor/target_counts` | `std_msgs/Int32` | subscribe | Absolute target encoder count |
 | `/camera/image/compressed` | `sensor_msgs/CompressedImage` | publish | JPEG preview from PySpin grabber |
 | `/camera/fps` | `std_msgs/Float32` | publish | Effective grabber FPS |
 | `/camera/record_cmd` | `std_msgs/String` | subscribe | Path = start mp4 recording, `""` = stop |
-| `/pressure/mbar` | `std_msgs/Float32` | subscribe | Requested pressure in mbar; negative pulls, positive pushes, `0` vents (latched) |
-| `/pressure/target_mbar` | `std_msgs/Float32` | publish | Pressure actually written to the device, i.e. the request after clamping (latched) |
+| `/pressure/mbar` | `std_msgs/Float32` | subscribe | Requested mbar; negative pulls, positive pushes, `0` requests vent. Driver subscription is volatile and ignores history |
+| `/pressure/target_mbar` | `std_msgs/Float32` | publish | SDK-acknowledged setpoint after clamping (latched); physical settling requires measurement |
 | `/pressure/measured_mbar` | `std_msgs/Float32` | publish | Pressure measured by the controller's sensor |
 | `/heka/voltage_raw_v` | `std_msgs/Float32MultiArray` | publish | HEKA voltage sample packet: `[sample_rate_hz, v0, v1, ...]` |
 | `/heka/current_pa` | `std_msgs/Float32MultiArray` | publish | HEKA current sample packet: `[sample_rate_hz, i0, i1, ...]` |
 | `/heka/monitor_v` | `std_msgs/Float32` | publish | Latest voltage sample from binary packets; mean monitor voltage for legacy packets |
 | `/heka/monitor_step_v` | `std_msgs/Float32` | publish | Legacy monitor step voltage |
 | `/heka/resistance_mohm` | `std_msgs/Float32` | publish | Live resistance estimate in MOhm |
+| `/ump/stop`, `/ump2/stop` | `std_srvs/Trigger` | service | Request SDK stop; does not latch out future publishers |
 | `/ump/calibrate_zero`, `/ump2/calibrate_zero` | `std_srvs/Trigger` | service | Calibrate zero at the current pose |
 | `/acq/start`, `/acq/stop` | `std_srvs/Trigger` | service | Begin / end a logged trial |
 
@@ -72,10 +74,17 @@ The UMP driver publishes and accepts raw absolute Sensapex device coordinates. T
 ### `ump_driver_node`
 Connects to the UMP at the configured `device_id`, publishes the live absolute pose at `poll_ms`, and forwards `[x, y, z, d, speed]` targets directly to `stage.goto_pos`. Topic names are derived from the `topic_prefix` parameter so devices can expose `/ump/*` and `/ump2/*`.
 
+The `/ump/stop` and `/ump2/stop` Trigger services call the SDK's actual stop API,
+without depending on camera images or cached coordinates. Read/move failures stop
+the affected stage and latch further targets off until the driver is restarted.
+Driver shutdown also attempts a stop. Updated MicroVLA live rollout requires
+these services before starting. Acknowledgment confirms the SDK call, not a
+measurement that physical motion has ceased.
+
 The `ump_dual_driver_node` entry point runs both devices in one process so they share the Sensapex SDK singleton / UDP socket. This is what [launch/app.launch.py](launch/app.launch.py) uses, because separate UMP processes can conflict on the SDK socket.
 
 ### `odrive_driver_node`
-Connects via `odrive.find_any()`, puts axis 0 into closed-loop velocity control, and implements a software bang-bang position controller on top: every tick it diffs the latest target against `encoder.shadow_count` and commands `±goto_speed_turns_s` until inside `deadband_counts`. The axis is returned to idle on shutdown.
+Connects via `odrive.find_any()`, puts axis 0 into closed-loop velocity control, and implements a software bang-bang position controller on top: every tick it diffs the latest target against `encoder.shadow_count` and commands `±goto_speed_turns_s` until inside `deadband_counts`. The mode and zero velocity are configured while idle before entering closed-loop control. Read/write failures and partial initialization attempt both zero velocity and idle independently; faults disable further control until restart.
 
 The ODrive remains available for manual focusing-knob control from the GUI, but it is not included in the policy rollout action vector and is not written into the CSV logger.
 
@@ -172,17 +181,16 @@ Pressure is commanded as an **exact value in mbar** on one topic:
 /pressure/mbar =   0.0  ->  vented
 ```
 
-One number, sign carries the direction. The topic is latched, so the node picks up the last commanded pressure even if it restarts.
+One number, sign carries the direction. The command subscriber uses volatile
+QoS: startup vents and waits for a fresh command. Cached commands from GUI or
+rollout publishers are never restored after a driver restart. The former
+`startup_grace_s` restoration mechanism has been removed.
 
-Because `/pressure/mbar` has **more than one publisher** (the GUI and the rollout client), a restart delivers the last latched sample from *each* of them, in an order ROS does not define — so "apply whatever arrives last" could resurrect a stale command over a vent. Startup therefore collects that history for `startup_grace_s` (default 1.0 s) and only restores it when every publisher agrees. A conflict holds at 0 mbar and names the values it saw:
-
-```
-Conflicting latched pressure commands at startup (-30.0, +0.0 mbar) -
-`/pressure/mbar` has more than one publisher and their order is undefined.
-Holding +0.0 mbar; send the intended pressure explicitly.
-```
-
-Set `startup_grace_s: 0.0` to restore the historical apply-whatever-arrives-last behaviour.
+SDK return codes are checked on initialization, range lookup, writes, reads, and
+close. A failed write is not reported as applied; a failed read is not published
+as a sensor measurement. Read/write failures attempt to vent and latch nonzero
+commands off until the driver is restarted. Failure to confirm a vent is logged
+as an error. An unreadable or invalid device range disables the driver.
 
 Incoming values are clamped to the range the controller reports for its channel (intersected with the `min_mbar` / `max_mbar` parameters), and non-finite values are rejected outright, both with a warning. The channel is set to **0 mbar on connect**, and vented to 0 mbar before `fgt_close()` on shutdown — including on Ctrl+C and on the SIGTERM `ros2 launch` sends.
 
@@ -201,7 +209,6 @@ Parameters:
 | `poll_ms` | `100` | How often `/pressure/measured_mbar` is published. |
 | `max_mbar` | `1000.0` | Safety ceiling, intersected with the device range. |
 | `min_mbar` | `-1000.0` | Safety floor, intersected with the device range. |
-| `startup_grace_s` | `1.0` | Window for collecting latched commands at startup before acting on them. `0` disables it. |
 
 If no controller is detected the node logs an error and stays inert rather than killing the launch, matching the ODrive driver's behaviour.
 
@@ -228,14 +235,16 @@ timestamp, mean_voltage_V, monitor_step_V, resistance_MOhm
 For now, the GUI plots voltage and current and shows the live resistance estimate in the left control column. The logger includes the same value in the `resistance_mohm` CSV column.
 
 ### `logger_node`
-Builds a synchronized dataset:
+Records the latest received observations and targets with timing diagnostics:
 1. Subscribes to **live** topics (UMP1, UMP2) and to **target** topics published by the GUI / policy.
-2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value when available, and to `/pressure/mbar` for the pressure column.
+2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value when available, and to `/pressure/target_mbar` and `/pressure/measured_mbar` for applied setpoints and sensor values.
 3. On `/acq/start`, picks the next free `trial_N` ID by inspecting **`logs/`, `saved_frames/` and `saved_videos/` together**, opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and tells the camera to record `saved_videos/trial_N.mp4`. Scanning all three matters: deleting a CSV while its frame directory survives would otherwise hand the number back out and the new run would overwrite the old frames.
 4. Every `log_interval_ms` it saves the latest JPEG to `saved_frames/trial_N/frame_NNNNNN.png` and appends one CSV row with the live pose, the most-recent commanded target, the saved image's path, the latest resistance when available, and the timing columns below.
 5. On `/acq/stop` it closes the file, sends an empty record command to the camera, and reports the logging rate it actually achieved.
 
-The latest target is **not cleared** between ticks, so even if the user stops issuing commands the most recent target keeps appearing in the log and `(target − current)` is always meaningful.
+The latest target is **not cleared** between ticks. Validity fields distinguish
+missing commands from intentional zero targets. Receipt does not establish driver
+acceptance or freshness; stale values can persist until new feedback arrives.
 
 The ODrive motor is intentionally excluded from the CSV rows. It can still be driven from the GUI, but the dataset state/target columns below are UMP-only.
 
@@ -254,8 +263,11 @@ measured_pressure,
 wall_time,
 image_stamp,
 state_stamp,
-image_age_s
+image_age_s,
+target_valid, target_valid2, state_valid, state_valid2
 ```
+
+The current CSV has **29 columns**.
 
 The four timing columns exist so a late tick or a stalled camera is detectable
 after the fact. Without them a frozen camera silently writes the same frame into
@@ -271,12 +283,14 @@ many rows and the dataset still looks perfectly well formed:
 
 The two pressure columns, both in mbar with negative meaning pull:
 
-- **`target_pressure`** — from `/pressure/target_mbar`: the pressure actually applied to the device. This is the action label to train on.
+- **`target_pressure`** — from `/pressure/target_mbar`: the setpoint acknowledged by the SDK, not a measurement of achieved pressure. This is the action label to train on.
 - **`measured_pressure`** — from `/pressure/measured_mbar`: the controller's sensor reading. Expect it to lag `target_pressure` by a poll tick or two while the channel settles, and to sit slightly off the target.
 
-Both are blank until the pressure node publishes, which it does as soon as it connects (it applies 0 mbar on startup), so in practice they are populated from the first row of any trial where the pressure node is running.
+Each column stays blank until its first valid message. Startup attempts a zero
+setpoint; connection or SDK faults can prevent publication. Once received, the
+logger retains pressure/resistance values without expiring them.
 
-**Logging rate.** `log_interval_ms` defaults to **333 ms (3 Hz)** in the launch
+**Logging rate.** `log_interval_ms` defaults to **333 ms (approximately 3 Hz)** standalone and in the launch
 file, matching the converter's `--fps 3` and the policy's `CONTROL_HZ`. These
 three describe the same quantity and must agree: at 200 ms a chunk whose steps
 were 200 ms apart in the demonstration got replayed at 3 Hz, about 40% slower
@@ -299,7 +313,7 @@ To change which presets appear, edit the `PRESSURE_PRESETS_MBAR` tuple near the 
 
 The panel is **mouse-only** — there are deliberately no keyboard shortcuts, so keystrokes always go to the widget you are editing.
 
-All UMP commands are absolute Sensapex targets. The bump buttons mutate the locally-held target and republish the full vector; the GUI spin boxes use the raw device range (`0` to `20000` counts).
+All UMP commands are absolute Sensapex targets. The bump buttons mutate the locally-held target and republish the full vector; the GUI spin boxes use the raw device range (`0` to `20000` micrometres); this UI range is not calibrated workspace protection.
 
 ---
 
@@ -320,13 +334,14 @@ All UMP commands are absolute Sensapex targets. The bump buttons mutate the loca
 
 | Topic | Use |
 |---|---|
-| `/ump/target`, `/ump2/target` | `[x, y, z, d, speed]` absolute counts |
+| `/ump/target`, `/ump2/target` | `[x, y, z, d, speed]` absolute micrometres plus speed |
 | `/pressure/mbar` | `Float32` exact pressure in mbar |
 
-So the action is **8 motion values + 1 pressure value**:
+A dual-arm client controls **8 motion coordinates and a separate pressure channel**:
 
 - The 8 motion values are the two 4-axis UMPs only. The ODrive focusing knob is driven separately through `/motor/target_counts` and is not part of the action vector.
-- Pressure is the 9th value, in mbar, matching the `target_pressure` column the logger writes — so the policy predicts the same quantity it was trained on. Negative pulls, positive pushes, `0` vents.
+- Pressure has a separate scalar head/chunk and normalization in MicroVLA; it is
+  not appended to the Sensapex action vector. Its mbar target matches the `target_pressure` column the logger writes — so the policy predicts the same quantity it was trained on. Negative pulls, positive pushes, `0` vents.
 
 This matches the dataset columns the logger writes, so state/action shapes line up between training and inference.
 
@@ -335,10 +350,15 @@ This matches the dataset columns the logger writes, so state/action shapes line 
 These lived in the deleted `main.py` and are now the client's job — worth re-checking whichever repo you roll out from:
 
 - **Workspace clamping** — per-stage min/max boxes on each of the 8 axes. ⚠️ These are tied to one physical setup; they must be set for *your* stage before any rollout.
-- **Pressure clamping** — keep the predicted mbar inside what the pipette tolerates. The node clamps to the device range (±1000 on this LineUP) as a backstop, and `target_pressure` logs the post-clamp value, so the dataset stays honest either way — but the pipette does not care that the clamp saved the controller.
+- **Pressure clamping** — keep the predicted mbar inside what the pipette tolerates. The node reads device limits and intersects them with its configured envelope.
+  `target_pressure` records the SDK-acknowledged setpoint. Device range is not a
+  substitute for a calibrated pipette envelope.
 - **Per-tick step limiting** — cap the delta on each axis so a bad prediction cannot command a large jump.
-- **Control rate** — the dataset was collected at ~2.5 Hz and stored at 3 Hz; running much faster tends to overshoot on real hardware.
-- **E-stop** — a way to stop sending actions and hold the current pose.
+- **Control rate** — inspect actual timestamps and match training/inference timing.
+  The requested logger interval is 333 ms; irregular cadence is not repaired by
+  merely relabeling frames with an average FPS.
+- **Stop** — stop client publication and call the UMP SDK stop services. Physical
+  stop/vent behavior and process-death protection still require validation.
 - **Optional EMA smoothing** on the action stream to reduce jitter.
 
 ---
@@ -423,7 +443,10 @@ The rollout client is **not part of this package** — run it from the policy re
 2. **Check the client's workspace limits, per-tick step caps and pressure range for this stage before starting.**
 3. Start the policy client (and its policy server, if it uses one).
 
-Keep the GUI up during a rollout: the pressure box and the manual UMP controls stay live, so you can intervene without stopping the client — hit the `0` preset and **Send** to vent.
+Manual and policy publishers can compete; the package has no exclusive command
+owner or takeover lease. Stop the policy before manual intervention. The `0`
+preset and **Send** request a vent, but a competing publisher can overwrite it
+and physical pressure must be checked independently.
 
 ---
 
@@ -447,3 +470,18 @@ Defined in [setup.py](setup.py):
 ## Maintainer
 
 Raian Haider Chowdhury — `chowd207@umn.edu`
+
+### Log validity and manual feedback
+
+New CSVs append `target_valid`, `target_valid2`, `state_valid`, and `state_valid2`.
+A valid zero target means Home; an absent target is recorded as invalid. Each arm
+is handled independently during conversion. Frames whose PNG write fails have
+no reported image path, so conversion detects the missing frame. The standalone
+logger defaults to 333 ms, matching the launch's requested rate; actual achieved
+rate still depends on acquisition and disk throughput.
+
+The manual GUI waits for received, fresh feedback, including an all-zero pose,
+before issuing UMP or motor commands. Coordinate zeroing invalidates the cached
+UMP target until feedback from the new coordinate frame arrives. The camera's
+recording lock follows manual exposure precedence, recording writes are serialized,
+and shutdown joins the capture worker before releasing SDK buffers.

@@ -156,6 +156,9 @@ class GuiNode(Node):
         self.latest_live_ump = [0, 0, 0, 0]
         self.latest_live_ump2 = [0, 0, 0, 0]
         self.latest_live_motor = 0
+        self.live_ump_stamp = None
+        self.live_ump2_stamp = None
+        self.live_motor_stamp = None
         self.latest_frame_bgr = None
         self.latest_pressure_mbar = None
         self.latest_pressure_target = None
@@ -166,13 +169,16 @@ class GuiNode(Node):
     def _on_ump_live(self, msg: Int32MultiArray):
         if len(msg.data) >= 4:
             self.latest_live_ump = [int(v) for v in msg.data[:4]]
+            self.live_ump_stamp = time.monotonic()
 
     def _on_ump2_live(self, msg: Int32MultiArray):
         if len(msg.data) >= 4:
             self.latest_live_ump2 = [int(v) for v in msg.data[:4]]
+            self.live_ump2_stamp = time.monotonic()
 
     def _on_motor_live(self, msg: Int32):
         self.latest_live_motor = int(msg.data)
+        self.live_motor_stamp = time.monotonic()
 
     def _on_pressure_measured(self, msg: Float32):
         value = float(msg.data)
@@ -422,13 +428,15 @@ class HekaPlot(QWidget):
 class UmpPanel(QGroupBox):
     """Qt controls for one Sensapex UMP."""
 
-    def __init__(self, app, *, label, pub_target, zero_client, live_getter, subtitle):
+    def __init__(self, app, *, label, pub_target, zero_client, live_getter,
+                 live_stamp_getter, subtitle):
         super().__init__(label)
         self.app = app
         self.label = label
         self.pub_target = pub_target
         self.zero_client = zero_client
         self._live_getter = live_getter
+        self._live_stamp_getter = live_stamp_getter
         self._updating = False
 
         self.axis_step = self._spin(DEFAULT_AXIS_STEP, 1, 5000)
@@ -550,7 +558,7 @@ class UmpPanel(QGroupBox):
         self.send_now()
 
     def send_now(self):
-        if not self._adopted_live:
+        if not self._adopted_live or not self._live_is_fresh():
             self.app.set_status(
                 f"{self.label}: waiting for live position before commanding "
                 "(targets still hold their placeholder)"
@@ -583,13 +591,21 @@ class UmpPanel(QGroupBox):
         self._updating = False
         self.app.set_status(f"{self.label} targets synced to live")
 
+    def _live_is_fresh(self):
+        stamp = self._live_stamp_getter()
+        return (stamp is not None and stamp > getattr(self, "_live_after", float("-inf"))
+                and 0 <= time.monotonic() - stamp <= 2.0)
+
     def update_live_display(self):
+        if not self._live_is_fresh():
+            self._adopted_live = False
+            return
         values = list(self._live_getter())
         for axis, value in zip(("X", "Y", "Z", "D"), values):
             self.live_labels[axis].setText(f"{int(value):d}")
         # First real feedback: adopt it, so the first nudge is relative to where
         # the stage actually is rather than to the placeholder.
-        if not self._adopted_live and any(int(v) for v in values):
+        if not self._adopted_live:
             self._updating = True
             for axis, value in zip(("X", "Y", "Z", "D"), values):
                 self.target_spins[axis].setValue(int(value))
@@ -598,7 +614,11 @@ class UmpPanel(QGroupBox):
             self.app.set_status(f"{self.label} targets adopted from live position")
 
     def calibrate_zero(self):
+        self._send_timer.stop()
+        self._adopted_live = False
         ok, msg = self.app.node.call_trigger(self.zero_client)
+        if ok:
+            self._live_after = time.monotonic()
         self.app.set_status(f"{self.label} zero: {ok} ({msg})")
 
 
@@ -662,6 +682,7 @@ class UMPGuiApp(QMainWindow):
             pub_target=node.pub_ump_target,
             zero_client=node.cli_zero,
             live_getter=lambda: node.latest_live_ump,
+            live_stamp_getter=lambda: node.live_ump_stamp,
             subtitle=None,
         )
         self.panel2 = UmpPanel(
@@ -670,6 +691,7 @@ class UMPGuiApp(QMainWindow):
             pub_target=node.pub_ump2_target,
             zero_client=node.cli_zero2,
             live_getter=lambda: node.latest_live_ump2,
+            live_stamp_getter=lambda: node.live_ump2_stamp,
             subtitle=None,
         )
 
@@ -906,7 +928,14 @@ class UMPGuiApp(QMainWindow):
     def set_status(self, text):
         self.status.setText(text)
 
+    def _motor_is_fresh(self):
+        stamp = self.node.live_motor_stamp
+        return stamp is not None and 0 <= time.monotonic() - stamp <= 2.0
+
     def _publish_motor_target(self):
+        if not getattr(self, "_motor_adopted", False) or not self._motor_is_fresh():
+            self.set_status("Motor: waiting for fresh live position")
+            return
         target = int(self.motor_target.value())
         self.node.pub_motor_tgt.publish(Int32(data=target))
         self.set_status(f"Motor target: {target}")
@@ -944,6 +973,11 @@ class UMPGuiApp(QMainWindow):
         self.panel1.update_live_display()
         self.panel2.update_live_display()
         self.live_motor.setText(f"{int(self.node.latest_live_motor):d}")
+        if not self._motor_is_fresh():
+            self._motor_adopted = False
+        elif not getattr(self, "_motor_adopted", False):
+            self.motor_target.setValue(int(self.node.latest_live_motor))
+            self._motor_adopted = True
 
         measured = self.node.latest_pressure_mbar
         self.live_pressure.setText(

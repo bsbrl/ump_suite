@@ -1,4 +1,5 @@
-"""Brings up every node in the ump_suite at once.
+"""
+Brings up every node in the ump_suite at once.
 
 Most nodes are launched normally; the camera is started via ExecuteProcess
 because PySpin needs the system Spinnaker libraries and a dedicated venv

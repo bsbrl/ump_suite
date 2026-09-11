@@ -1,4 +1,5 @@
-"""ROS2 driver for one Sensapex UMP micromanipulator stage.
+"""
+ROS2 driver for one Sensapex UMP micromanipulator stage.
 
 The Sensapex SDK reports positions in MICROMETRES as floats, and speeds in um/s.
 This node exposes those absolute coordinates on the ROS topics, truncated to
@@ -44,10 +45,13 @@ class UMPDriverNode(Node):
         self.srv_zero = self.create_service(
             Trigger, f"/{prefix}/calibrate_zero", self.on_zero
         )
+        self.srv_stop = self.create_service(Trigger, f"/{prefix}/stop", self.on_stop)
+        self._faulted = False
         self.timer = self.create_timer(poll_ms / 1000.0, self.poll_live)
 
     def _read_absolute_pos(self):
-        """Return the current [x, y, z, d] absolute position in MICROMETRES.
+        """
+        Return the current [x, y, z, d] absolute position in MICROMETRES.
 
         The Sensapex SDK documents positions in um and returns floats. They are
         truncated to whole micrometres here because the ROS message is an
@@ -63,17 +67,42 @@ class UMPDriverNode(Node):
             msg.data = self._read_absolute_pos()
             self.pub_live.publish(msg)
         except Exception as e:
-            self.get_logger().warn(f"UMP live read error: {e}")
+            self.get_logger().error(f"UMP live read failed; stopping and latching fault: {e}")
+            self._faulted = True
+            self._stop_stage()
 
     def on_target(self, msg: Int32MultiArray):
+        if self._faulted:
+            self.get_logger().error("UMP fault latched; restart driver after resolving the fault")
+            return
         if len(msg.data) < 5:
             self.get_logger().warn("UMP target msg requires [x,y,z,d,speed]")
             return
         try:
             x, y, z, d, speed = (int(v) for v in msg.data[:5])
+            if speed <= 0:
+                raise ValueError("speed must be positive")
             self.stage.goto_pos([x, y, z, d], speed=speed)
         except Exception as e:
             self.get_logger().error(f"UMP goto_pos error: {e}")
+            self._faulted = True
+            self._stop_stage()
+
+    def _stop_stage(self):
+        try:
+            self.stage.stop()
+            return True, "SDK acknowledged stop"
+        except Exception as exc:
+            self.get_logger().error(f"UMP stop failed: {exc}")
+            return False, str(exc)
+
+    def on_stop(self, _req, res):
+        res.success, res.message = self._stop_stage()
+        return res
+
+    def destroy_node(self):
+        self._stop_stage()
+        super().destroy_node()
 
     def on_zero(self, _req, res):
         try:

@@ -68,7 +68,8 @@ class HekaUdpReceiverNode(Node):
         self.get_logger().info(f"Listening for HEKA UDP on port {port}")
 
     def loop(self):
-        """Drain the socket each tick rather than taking a single packet.
+        """
+        Drain the socket each tick rather than taking a single packet.
 
         The Windows sender emits one packet per 10 ms, and this timer also fires
         every 10 ms, so handling exactly one packet per tick leaves zero rate

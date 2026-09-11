@@ -1,4 +1,5 @@
-"""Dataset logger.
+"""
+Dataset logger.
 
 When acquisition is running, this node periodically writes one CSV row per
 "timestep" containing:
@@ -65,6 +66,7 @@ CSV_HEADER = [
     "image_stamp",
     "state_stamp",
     "image_age_s",
+    "target_valid", "target_valid2", "state_valid", "state_valid2",
 ]
 
 
@@ -78,7 +80,7 @@ def _xyzd(values):
 class LoggerNode(Node):
     def __init__(self):
         super().__init__("logger_node")
-        self.declare_parameter("log_interval_ms", 500)
+        self.declare_parameter("log_interval_ms", 333)
         # Warn when the saved frame is older than this relative to the row.
         self.declare_parameter("stale_image_warn_s", 0.5)
 
@@ -152,10 +154,12 @@ class LoggerNode(Node):
 
     def on_ump_target(self, msg: Int32MultiArray):
         # /ump/target carries [x,y,z,d,speed]; we only log [x,y,z,d].
-        self.latest_target_ump = list(msg.data)
+        if len(msg.data) >= 5:
+            self.latest_target_ump = list(msg.data)
 
     def on_ump2_target(self, msg: Int32MultiArray):
-        self.latest_target_ump2 = list(msg.data)
+        if len(msg.data) >= 5:
+            self.latest_target_ump2 = list(msg.data)
 
     def on_img(self, msg: CompressedImage):
         self.latest_image_msg = msg
@@ -176,7 +180,8 @@ class LoggerNode(Node):
     # ── Trial setup ────────────────────────────────────────────────────────
     @staticmethod
     def _next_trial_id():
-        """Lowest unused trial number across every output directory.
+        """
+        Lowest unused trial number across every output directory.
 
         Scanning only `logs/` is not enough: deleting a CSV while its frame
         directory survives would hand the number back out, and the new run would
@@ -203,7 +208,7 @@ class LoggerNode(Node):
         next_trial = self._next_trial_id()
 
         self.trial_name = f"trial_{next_trial}"
-        self.log_path   = os.path.join("logs",         f"{self.trial_name}.csv")
+        self.log_path = os.path.join("logs",         f"{self.trial_name}.csv")
         self.frames_dir = os.path.join("saved_frames", self.trial_name)
         self.video_path = os.path.join("saved_videos", f"{self.trial_name}.mp4")
         os.makedirs(self.frames_dir, exist_ok=True)
@@ -272,7 +277,8 @@ class LoggerNode(Node):
             if frame_bgr is None:
                 return ""
             fname = os.path.join(self.frames_dir, f"frame_{self.frame_index:06d}.png")
-            cv2.imwrite(fname, frame_bgr)
+            if not cv2.imwrite(fname, frame_bgr):
+                raise IOError(f"could not write frame {fname}")
             self.frame_index += 1
             return fname
         except Exception as e:
@@ -280,7 +286,8 @@ class LoggerNode(Node):
             return ""
 
     def _report_achieved_rate(self):
-        """Compare the rate actually achieved with the configured one.
+        """
+        Compare the rate actually achieved with the configured one.
 
         The timer is best effort and `_save_current_frame` encodes a PNG inside
         the callback, so the configured period is a request rather than a fact.
@@ -321,7 +328,8 @@ class LoggerNode(Node):
         return value if math.isfinite(value) and value > 0 else ""
 
     def _warn_if_stale(self, image_age):
-        """Say so when the saved frame is much older than the row it belongs to.
+        """
+        Say so when the saved frame is much older than the row it belongs to.
 
         A stalled camera is otherwise invisible: the logger keeps writing the
         last frame it received, and every row still looks complete.
@@ -341,10 +349,10 @@ class LoggerNode(Node):
         if not self.acquiring or self.writer is None:
             return
 
-        cx,  cy,  cz,  cd  = _xyzd(self.latest_live_ump)
+        cx,  cy,  cz,  cd = _xyzd(self.latest_live_ump)
         cx2, cy2, cz2, cd2 = _xyzd(self.latest_live_ump2)
 
-        tx,  ty,  tz,  td  = _xyzd(self.latest_target_ump)
+        tx,  ty,  tz,  td = _xyzd(self.latest_target_ump)
         tx2, ty2, tz2, td2 = _xyzd(self.latest_target_ump2)
         resistance = (
             float(self.latest_resistance_mohm)
@@ -386,6 +394,10 @@ class LoggerNode(Node):
             "" if image_stamp == "" else round(image_stamp, 6),
             "" if self.latest_state_stamp is None else round(self.latest_state_stamp, 6),
             image_age,
+            int(self.latest_target_ump is not None),
+            int(self.latest_target_ump2 is not None),
+            int(self.latest_live_ump is not None and len(self.latest_live_ump) >= 4),
+            int(self.latest_live_ump2 is not None and len(self.latest_live_ump2) >= 4),
         ])
         if self._first_row_time is None:
             self._first_row_time = wall_time
