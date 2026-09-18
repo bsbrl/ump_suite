@@ -30,6 +30,7 @@ import time
 import cv2
 import PySpin
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float32, String
@@ -553,6 +554,8 @@ class CameraNode(Node):
             except PySpin.SpinnakerException:
                 time.sleep(0.01)
             except Exception as e:
+                if not self.running or not rclpy.ok():
+                    break
                 self.get_logger().warn(f"Camera loop error: {e}")
                 time.sleep(0.01)
 
@@ -574,32 +577,46 @@ class CameraNode(Node):
                 except Exception:
                     pass
                 self.cam.DeInit()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.get_logger().error(f"Camera deinitialization failed: {exc}")
+        finally:
+            # A CameraPtr retains its interface even after DeInit. Drop it
+            # before clearing the list or releasing the System singleton.
+            self.cam = None
 
         try:
             if self.cams is not None:
                 self.cams.Clear()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.get_logger().error(f"Camera list cleanup failed: {exc}")
+        finally:
+            self.cams = None
 
         try:
             if self.system is not None:
                 self.system.ReleaseInstance()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.get_logger().error(f"Spinnaker system release failed: {exc}")
+        finally:
+            self.system = None
 
         super().destroy_node()
 
 
 def main():
+    from .runtime_guard import acquire_process_lock
+    acquire_process_lock("camera")
+
     rclpy.init()
     node = CameraNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

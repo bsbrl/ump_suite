@@ -31,6 +31,8 @@ TOPIC_MOTOR_LIVE = "/motor/live_counts"     # Int32 current counts
 # ignores cached requests when it starts.
 TOPIC_PRESSURE_MBAR = "/pressure/mbar"             # Float32 requested mbar, latched
 TOPIC_PRESSURE_TARGET = "/pressure/target_mbar"      # Float32 applied mbar, latched
+TOPIC_PRESSURE_STATUS = "/pressure/status"  # String JSON health/fault status, latched
+SRV_PRESSURE_RESET = "/pressure/reset_fault"  # Trigger: reconnect and request 0 mbar
 TOPIC_PRESSURE_MEASURED = "/pressure/measured_mbar"    # Float32 measured pressure
 
 # Camera (Blackfly via PySpin)

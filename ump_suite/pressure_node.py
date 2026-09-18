@@ -26,13 +26,15 @@ Requires the Fluigent Python SDK (`fluigent_sdk`), which bundles its own
 libfgt_SDK.so, so no system library setup is needed.
 """
 
+import json
 import math
 import time
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
+from std_srvs.srv import Trigger
 
 from Fluigent.SDK import (
     fgt_close,
@@ -44,6 +46,8 @@ from Fluigent.SDK import (
 )
 
 from .ros_interfaces import (
+    SRV_PRESSURE_RESET,
+    TOPIC_PRESSURE_STATUS,
     TOPIC_PRESSURE_MBAR,
     TOPIC_PRESSURE_MEASURED,
     TOPIC_PRESSURE_TARGET,
@@ -83,6 +87,9 @@ class PressureNode(Node):
         self.pressure_min = self.pressure_max = IDLE_MBAR
         self._sdk_initialized = False
         self._faulted = False
+        self._last_error = ""
+        self._last_fault_log = 0.0
+        self._last_fault_poll = 0.0
 
         self.pub_measured = self.create_publisher(Float32, TOPIC_PRESSURE_MEASURED, 10)
         # Latched: the logger must see the applied pressure even if it starts
@@ -91,13 +98,55 @@ class PressureNode(Node):
             Float32, TOPIC_PRESSURE_TARGET, latched_qos()
         )
 
+        self.pub_status = self.create_publisher(String, TOPIC_PRESSURE_STATUS, latched_qos())
+        self.create_service(Trigger, SRV_PRESSURE_RESET, self._on_reset_fault)
+        self.create_timer(1.0, self._publish_status)
         self._connect()
+        self._publish_status()
 
         self.create_subscription(
             Float32, TOPIC_PRESSURE_MBAR, self._on_pressure_cmd, 10
         )
 
         self.timer = self.create_timer(poll_ms / 1000.0, self._poll_measured)
+
+    def _publish_status(self):
+        """Expose faults independently of still-readable pressure measurements."""
+        publisher = getattr(self, 'pub_status', None)
+        if publisher is None:
+            return
+        publisher.publish(String(data=json.dumps({
+            'connected': self.enabled,
+            'faulted': self._faulted,
+            'ready': self.enabled and not self._faulted,
+            'message': getattr(self, '_last_error', ''),
+            'target_mbar': self.commanded_mbar,
+        })))
+
+    def _set_fault(self, message):
+        """Latch nonzero commands off and publish an actionable explanation."""
+        self._faulted = True
+        changed = message != getattr(self, '_last_error', '')
+        self._last_error = message
+        now = time.monotonic()
+        if changed or now - getattr(self, '_last_fault_log', 0.0) >= 5.0:
+            self.get_logger().error(message)
+            self._last_fault_log = now
+        self._publish_status()
+
+    def _on_reset_fault(self, _request, response):
+        """Reconnect explicitly; never restore a previous nonzero setpoint."""
+        self._close_sdk()
+        self._faulted = False
+        self._last_error = ''
+        self._connect()
+        response.success = bool(self.enabled and not self._faulted)
+        response.message = (
+            'Reconnected; SDK accepted 0 mbar. Check measured pressure before Send.'
+            if response.success else self._last_error
+        )
+        self._publish_status()
+        return response
 
     # ── Device setup ───────────────────────────────────────────────────────
     def _connect(self):
@@ -119,14 +168,13 @@ class PressureNode(Node):
             self._safe_limits()  # Reject malformed parameter envelopes on connect.
             self.enabled = True
             if not self._write_pressure(IDLE_MBAR):
-                raise RuntimeError("controller did not acknowledge startup vent")
+                raise RuntimeError(f"startup zero request failed: {self._last_error}")
             self.get_logger().info(
                 f"Pressure channel {self.channel} range: {lower:.1f} .. {upper:.1f} mbar"
             )
         except Exception as exc:
             self.enabled = False
-            self._faulted = True
-            self.get_logger().error(f"Fluigent controller unavailable: {exc}")
+            self._set_fault(f"Fluigent controller unavailable: {exc}")
             self._close_sdk()
 
     # ── Command handling ───────────────────────────────────────────────────
@@ -154,8 +202,7 @@ class PressureNode(Node):
         try:
             lower, upper = self._safe_limits()
         except Exception as exc:
-            self.get_logger().error(str(exc))
-            self._faulted = True
+            self._set_fault(str(exc))
             self._write_pressure(IDLE_MBAR)
             return
         # Venting is always permitted, whatever the envelope. An operator may
@@ -180,7 +227,9 @@ class PressureNode(Node):
         """Write to the device and announce what was applied. False on failure."""
         if not self.enabled or (self._faulted and mbar != IDLE_MBAR):
             self.get_logger().warn(
-                f"Fluigent not connected; dropping {mbar:+.1f} mbar command"
+                f"Pressure command {mbar:+.1f} mbar rejected: "
+                f"{getattr(self, '_last_error', 'not connected')}. "
+                "Resolve the device fault, then use Reconnect / reset."
             )
             return False
         try:
@@ -189,8 +238,7 @@ class PressureNode(Node):
                 raise ValueError("non-finite setpoint")
             require_sdk_ok(fgt_set_pressure(self.channel, target), "fgt_set_pressure")
         except Exception as e:
-            self._faulted = True
-            self.get_logger().error(f"fgt_set_pressure failed; nonzero commands latched off: {e}")
+            self._set_fault(f"fgt_set_pressure failed; nonzero commands latched off: {e}")
             if mbar != IDLE_MBAR:
                 self._write_pressure(IDLE_MBAR)
             return False
@@ -198,11 +246,17 @@ class PressureNode(Node):
         # Only announce a target the device really accepted.
         self.commanded_mbar = target
         self.pub_target.publish(Float32(data=target))
+        self._publish_status()
         return True
 
     def _poll_measured(self):
         if not self.enabled:
             return
+        now = time.monotonic()
+        if self._faulted:
+            if now - getattr(self, '_last_fault_poll', 0.0) < 1.0:
+                return
+            self._last_fault_poll = now
         try:
             status, measured = fgt_get_pressure(self.channel, get_error=True)
             require_sdk_ok(status, "fgt_get_pressure")
@@ -211,9 +265,9 @@ class PressureNode(Node):
                 raise RuntimeError("non-finite pressure readback")
             self.pub_measured.publish(Float32(data=measured))
         except Exception as exc:
-            self.get_logger().error(f"Pressure readback failed; venting and latching fault: {exc}")
-            if not self._faulted:
-                self._faulted = True
+            was_faulted = self._faulted
+            self._set_fault(f"Pressure readback failed; nonzero commands latched off: {exc}")
+            if not was_faulted:
                 self._write_pressure(IDLE_MBAR)
 
     def _close_sdk(self):
@@ -237,6 +291,9 @@ class PressureNode(Node):
 
 
 def main():
+    from .runtime_guard import acquire_process_lock
+    acquire_process_lock("pressure")
+
     rclpy.init()
     node = PressureNode()
     try:

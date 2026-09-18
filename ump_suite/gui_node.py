@@ -15,6 +15,7 @@ the ROS environment on this machine and gives the app a more polished desktop
 feel without requiring a separate web server.
 """
 
+import json
 import math
 import sys
 import threading
@@ -43,9 +44,11 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float32, Float32MultiArray, Int32, Int32MultiArray
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from .ros_interfaces import (
@@ -59,6 +62,8 @@ from .ros_interfaces import (
     TOPIC_HEKA_VOLTAGE_RAW,
     TOPIC_MOTOR_LIVE,
     TOPIC_MOTOR_TGT,
+    SRV_PRESSURE_RESET,
+    TOPIC_PRESSURE_STATUS,
     TOPIC_PRESSURE_MBAR,
     TOPIC_PRESSURE_MEASURED,
     TOPIC_PRESSURE_TARGET,
@@ -118,8 +123,8 @@ class GuiNode(Node):
             Int32MultiArray, TOPIC_UMP2_TARGET, 10
         )
         self.pub_motor_tgt = self.create_publisher(Int32, TOPIC_MOTOR_TGT, 10)
-        # Latched so the pressure node and the logger pick up the last commanded
-        # pressure even if they (re)start after the GUI sent it.
+        # Applied readbacks are latched. The pressure driver deliberately
+        # requests volatile commands, so restart never restores an old request.
         self.pub_pressure_mbar = self.create_publisher(
             Float32, TOPIC_PRESSURE_MBAR, latched_qos()
         )
@@ -147,6 +152,14 @@ class GuiNode(Node):
         self.create_subscription(
             Float32, TOPIC_HEKA_RESISTANCE, self._on_heka_resistance, 10
         )
+
+        self.create_subscription(String, TOPIC_PRESSURE_STATUS, self._on_pressure_status,
+                                 latched_qos())
+        self.cli_pressure_reset = self.create_client(Trigger, SRV_PRESSURE_RESET)
+        self.latest_pressure_status = None
+        self.latest_pressure_status_stamp = 0.0
+        self.latest_pressure_measured_stamp = 0.0
+        self.latest_pressure_target_stamp = 0.0
 
         self.cli_acq_start = self.create_client(Trigger, SRV_ACQ_START)
         self.cli_acq_stop = self.create_client(Trigger, SRV_ACQ_STOP)
@@ -180,15 +193,27 @@ class GuiNode(Node):
         self.latest_live_motor = int(msg.data)
         self.live_motor_stamp = time.monotonic()
 
+    def _on_pressure_status(self, msg):
+        try:
+            status = json.loads(msg.data)
+            if not isinstance(status, dict) or not isinstance(status.get('ready'), bool):
+                return
+        except (TypeError, ValueError):
+            return
+        self.latest_pressure_status = status
+        self.latest_pressure_status_stamp = time.monotonic()
+
     def _on_pressure_measured(self, msg: Float32):
         value = float(msg.data)
         if math.isfinite(value):
             self.latest_pressure_mbar = value
+            self.latest_pressure_measured_stamp = time.monotonic()
 
     def _on_pressure_target(self, msg: Float32):
         value = float(msg.data)
         if math.isfinite(value):
             self.latest_pressure_target = value
+            self.latest_pressure_target_stamp = time.monotonic()
 
     def _on_cam_image(self, msg: CompressedImage):
         try:
@@ -882,12 +907,19 @@ class UMPGuiApp(QMainWindow):
 
         readback = QHBoxLayout()
         readback.setSpacing(6)
-        readback.addWidget(QLabel("Applied"))
+        readback.addWidget(QLabel("SDK target"))
         readback.addWidget(self.live_pressure_target)
         readback.addWidget(QLabel("Measured"))
         readback.addWidget(self.live_pressure)
         readback.addStretch(1)
         layout.addLayout(readback)
+        self.pressure_health = QLabel("Waiting for pressure driver status")
+        self.pressure_health.setWordWrap(True)
+        layout.addWidget(self.pressure_health)
+        reset = QPushButton("Reconnect / reset (0 mbar)")
+        reset.setToolTip("Reconnect after resolving a fault; requests zero pressure")
+        reset.clicked.connect(self._reset_pressure)
+        layout.addWidget(reset)
         return group
 
     def _preset_button(self, value):
@@ -955,9 +987,24 @@ class UMPGuiApp(QMainWindow):
         self.set_status(f"Pressure box set to {value:+g} mbar (press Send to apply)")
 
     def _send_pressure(self):
+        self.pressure_mbar.interpretText()
         value = float(self.pressure_mbar.value())
+        status = self.node.latest_pressure_status
+        fresh = time.monotonic() - self.node.latest_pressure_status_stamp <= 3.0
+        if value != 0.0 and (not fresh or not status or not status.get('ready')):
+            reason = status.get('message') if fresh and status else 'driver status unavailable'
+            self.set_status(
+                f"Pressure not sent: {reason}. Use Reconnect / reset after resolving it."
+            )
+            return
+        self._pending_pressure = (value, time.monotonic())
         self.node.pub_pressure_mbar.publish(Float32(data=value))
-        self.set_status(f"Pressure command: {value:+.1f} mbar")
+        self.set_status(f"Pressure request sent: {value:+.1f} mbar; awaiting SDK acknowledgment")
+
+    def _reset_pressure(self):
+        ok, message = self.node.call_trigger(self.node.cli_pressure_reset)
+        self._pending_pressure = None
+        self.set_status(f"Pressure reset: {'OK' if ok else 'FAILED'} ({message})")
 
     def _acq_start(self):
         ok, msg = self.node.call_trigger(self.node.cli_acq_start)
@@ -980,13 +1027,37 @@ class UMPGuiApp(QMainWindow):
             self._motor_adopted = True
 
         measured = self.node.latest_pressure_mbar
+        measured_fresh = time.monotonic() - self.node.latest_pressure_measured_stamp <= 2.0
         self.live_pressure.setText(
-            "-- mbar" if measured is None else f"{measured:+.1f} mbar"
+            "-- mbar" if measured is None else
+            f"{measured:+.1f} mbar" + ("" if measured_fresh else " (stale)")
         )
         applied = self.node.latest_pressure_target
         self.live_pressure_target.setText(
             "-- mbar" if applied is None else f"{applied:+.1f} mbar"
         )
+
+        status = self.node.latest_pressure_status
+        fresh = time.monotonic() - self.node.latest_pressure_status_stamp <= 3.0
+        if not fresh or not status:
+            health = "Pressure driver offline or status unavailable"
+        elif not status.get('ready'):
+            health = "FAULT: " + status.get('message', 'not ready')
+        else:
+            health = "Pressure driver ready; compare SDK target with measured pressure"
+        self.pressure_health.setText(health)
+        pending = getattr(self, '_pending_pressure', None)
+        if pending is not None:
+            value, sent = pending
+            if fresh and status and not status.get('ready'):
+                self.set_status("Pressure request failed: " + status.get('message', 'not ready'))
+                self._pending_pressure = None
+            elif self.node.latest_pressure_target_stamp >= sent:
+                self.set_status(f"SDK acknowledged {applied:+.1f} mbar; verify measured pressure")
+                self._pending_pressure = None
+            elif time.monotonic() - sent > 3.0:
+                self.set_status(f"No SDK acknowledgment for {value:+.1f} mbar pressure request")
+                self._pending_pressure = None
 
         resistance = self.node.latest_heka_resistance
         if resistance is None:
@@ -1166,13 +1237,25 @@ class UMPGuiApp(QMainWindow):
 
 
 def main():
+    from .runtime_guard import acquire_process_lock
+    acquire_process_lock("gui")
+
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     rclpy.init()
     node = GuiNode()
 
-    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+
+    def spin():
+        try:
+            executor.spin()
+        except ExternalShutdownException:
+            pass
+
+    spin_thread = threading.Thread(target=spin, daemon=True)
     spin_thread.start()
 
     app = QApplication(sys.argv)
@@ -1181,8 +1264,11 @@ def main():
     window.showMaximized()
     rc = app.exec_()
 
+    executor.shutdown()
+    spin_thread.join()
     node.destroy_node()
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
     sys.exit(rc)
 
 

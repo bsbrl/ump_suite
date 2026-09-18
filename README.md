@@ -56,6 +56,8 @@ driver also constructs service names from its configured prefix.
 | `/pressure/mbar` | `std_msgs/Float32` | subscribe | Requested mbar; negative pulls, positive pushes, `0` requests vent. Driver subscription is volatile and ignores history |
 | `/pressure/target_mbar` | `std_msgs/Float32` | publish | SDK-acknowledged setpoint after clamping (latched); physical settling requires measurement |
 | `/pressure/measured_mbar` | `std_msgs/Float32` | publish | Pressure measured by the controller's sensor |
+| `/pressure/status` | `std_msgs/String` | publish | Latched JSON health (`ready`, `connected`, `faulted`, `message`, `target_mbar`), refreshed every second |
+| `/pressure/reset_fault` | `std_srvs/Trigger` | service | Explicit reconnect at 0 mbar; never restores an old nonzero target |
 | `/heka/voltage_raw_v` | `std_msgs/Float32MultiArray` | publish | HEKA voltage sample packet: `[sample_rate_hz, v0, v1, ...]` |
 | `/heka/current_pa` | `std_msgs/Float32MultiArray` | publish | HEKA current sample packet: `[sample_rate_hz, i0, i1, ...]` |
 | `/heka/monitor_v` | `std_msgs/Float32` | publish | Latest voltage sample from binary packets; mean monitor voltage for legacy packets |
@@ -178,21 +180,21 @@ Pressure is commanded as an **exact value in mbar** on one topic:
 ```
 /pressure/mbar = -20.0  ->  fgt_set_pressure(channel, -20.0)   (pull)
 /pressure/mbar =  50.0  ->  fgt_set_pressure(channel,  50.0)   (push)
-/pressure/mbar =   0.0  ->  vented
+/pressure/mbar =   0.0  ->  requests 0 mbar (verify measured pressure)
 ```
 
 One number, sign carries the direction. The command subscriber uses volatile
-QoS: startup vents and waits for a fresh command. Cached commands from GUI or
+QoS: startup requests 0 mbar and waits for a fresh command. Cached commands from GUI or
 rollout publishers are never restored after a driver restart. The former
 `startup_grace_s` restoration mechanism has been removed.
 
 SDK return codes are checked on initialization, range lookup, writes, reads, and
 close. A failed write is not reported as applied; a failed read is not published
 as a sensor measurement. Read/write failures attempt to vent and latch nonzero
-commands off until the driver is restarted. Failure to confirm a vent is logged
+commands off until an explicit reconnect/reset or driver restart. Failure to confirm a vent is logged
 as an error. An unreadable or invalid device range disables the driver.
 
-Incoming values are clamped to the range the controller reports for its channel (intersected with the `min_mbar` / `max_mbar` parameters), and non-finite values are rejected outright, both with a warning. The channel is set to **0 mbar on connect**, and vented to 0 mbar before `fgt_close()` on shutdown — including on Ctrl+C and on the SIGTERM `ros2 launch` sends.
+Incoming values are clamped to the range the controller reports for its channel (intersected with the `min_mbar` / `max_mbar` parameters), and non-finite values are rejected outright, both with a warning. The channel requests **0 mbar on connect** and again before `fgt_close()` on shutdown — including on Ctrl+C and on the SIGTERM `ros2 launch` sends.
 
 Two readbacks come back out:
 
@@ -200,6 +202,8 @@ Two readbacks come back out:
 - **`/pressure/measured_mbar`** — the controller's own sensor, polled every `poll_ms`.
 
 Comparing the two is how you see the channel settling, or spot a request that got clamped.
+
+The GUI displays **SDK target** separately from measured pressure, waits for a new target acknowledgement after Send, marks measurements stale after 2 seconds, and shows driver faults/offline status. Nonzero GUI requests require a fresh ready status (3-second timeout). **Reconnect / reset (0 mbar)** calls `/pressure/reset_fault`; it reconnects and requests zero without replaying the old target. Success means the SDK accepted zero, not that the measured pressure reached zero. A device protection error must still be resolved at the controller/supply level. Faulted read polling is limited to 1 Hz; nonzero commands remain disabled even if sensor readings resume.
 
 Parameters:
 
@@ -238,11 +242,11 @@ For now, the GUI plots voltage and current and shows the live resistance estimat
 Records the latest received observations and targets with timing diagnostics:
 1. Subscribes to **live** topics (UMP1, UMP2) and to **target** topics published by the GUI / policy.
 2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value when available, and to `/pressure/target_mbar` and `/pressure/measured_mbar` for applied setpoints and sensor values.
-3. On `/acq/start`, picks the next free `trial_N` ID by inspecting **`logs/`, `saved_frames/` and `saved_videos/` together**, opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and tells the camera to record `saved_videos/trial_N.mp4`. Scanning all three matters: deleting a CSV while its frame directory survives would otherwise hand the number back out and the new run would overwrite the old frames.
+3. On `/acq/start`, picks the next free `trial_N` ID by inspecting **`logs/`, `saved_frames/` and `saved_videos/` together**, atomically reserves `saved_frames/trial_N/`, exclusively creates `logs/trial_N.csv`, and tells the camera to record `saved_videos/trial_N.mp4`. Scanning all three matters: deleting a CSV while its frame directory survives would otherwise hand the number back out and the new run would overwrite the old frames.
 4. Every `log_interval_ms` it saves the latest JPEG to `saved_frames/trial_N/frame_NNNNNN.png` and appends one CSV row with the live pose, the most-recent commanded target, the saved image's path, the latest resistance when available, and the timing columns below.
 5. On `/acq/stop` it closes the file, sends an empty record command to the camera, and reports the logging rate it actually achieved.
 
-The latest target is **not cleared** between ticks. Validity fields distinguish
+The latest UMP target is **not cleared** between ticks. Validity fields distinguish
 missing commands from intentional zero targets. Receipt does not establish driver
 acceptance or freshness; stale values can persist until new feedback arrives.
 
@@ -286,9 +290,10 @@ The two pressure columns, both in mbar with negative meaning pull:
 - **`target_pressure`** — from `/pressure/target_mbar`: the setpoint acknowledged by the SDK, not a measurement of achieved pressure. This is the action label to train on.
 - **`measured_pressure`** — from `/pressure/measured_mbar`: the controller's sensor reading. Expect it to lag `target_pressure` by a poll tick or two while the channel settles, and to sit slightly off the target.
 
-Each column stays blank until its first valid message. Startup attempts a zero
-setpoint; connection or SDK faults can prevent publication. Once received, the
-logger retains pressure/resistance values without expiring them.
+Each pressure column stays blank until valid data arrives. The target also requires
+a ready `/pressure/status` received within 3 seconds; the measured value requires
+a successful reading within 2 seconds. Startup attempts a zero setpoint;
+connection or SDK faults can prevent publication. Resistance still does not expire.
 
 **Logging rate.** `log_interval_ms` defaults to **333 ms (approximately 3 Hz)** standalone and in the launch
 file, matching the converter's `--fps 3` and the policy's `CONTROL_HZ`. These
@@ -307,7 +312,7 @@ The pressure panel is one box plus a Send button:
 - **Send** — publishes the box's value on `/pressure/mbar`. Nothing reaches the device until you press it.
 - **Preset buttons** — `+50`, `+20`, `0`, `-10`, `-20`, `-30`, `-100`. These only **fill the box**; press Send to apply. Use the `0` preset plus Send to vent.
 
-Underneath, **Applied** shows `/pressure/target_mbar` (what the node actually wrote, so a clamped value is visible) and **Measured** shows `/pressure/measured_mbar` (the sensor), so you can confirm the controller reached the value you asked for.
+Underneath, **SDK target** shows `/pressure/target_mbar` and **Measured** shows `/pressure/measured_mbar`, with stale readings marked. Faults/offline status appear separately. The reconnect/reset button attempts recovery at zero; physical settling must be checked in the measured value.
 
 To change which presets appear, edit the `PRESSURE_PRESETS_MBAR` tuple near the top of [gui_node.py](ump_suite/gui_node.py) — the buttons and their layout are generated from it, so adding or removing entries is all that is needed.
 
@@ -420,7 +425,7 @@ This starts the dual UMP driver (`device_id=1` and `device_id=2` in one process)
 
 1. Launch the suite as above.
 2. Use the GUI (or publish on `/ump/target`, `/ump2/target`, `/motor/target_counts` and `/pressure/mbar` directly) to drive the rig. The CSV logger records UMP state/targets, HEKA resistance and the commanded pressure, but not the ODrive motor.
-   The pressure columns populate as soon as the pressure node is up, since it publishes its startup 0 mbar.
+   Pressure targets populate only while the driver reports ready, and measured pressure requires fresh successful readings; faults leave the relevant cells blank.
 3. Click **Start Data Acquisition** — this calls `/acq/start`, which opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and asks the camera to record `saved_videos/trial_N.mp4`.
 4. Perform the trial. The logger writes one row per `log_interval_ms` (default 333 ms = 3 Hz).
 5. Click **Stop Data Acquisition** — this calls `/acq/stop`, closes the CSV, and stops the mp4.
@@ -485,3 +490,35 @@ before issuing UMP or motor commands. Coordinate zeroing invalidates the cached
 UMP target until feedback from the new coordinate frame arrives. The camera's
 recording lock follows manual exposure precedence, recording writes are serialized,
 and shutdown joins the capture worker before releasing SDK buffers.
+
+
+## Session ownership and recording integrity (September 2026)
+
+Run one local rig session per user. `runtime_guard.py` holds process-lifetime
+filesystem locks for the suite and each hardware/logger/GUI entry point. A second
+launch fails before it starts hardware processes. Individual duplicate nodes are
+also rejected. Closing the control GUI shuts down the entire launch and waits for
+its children; it no longer leaves invisible loggers and hardware drivers behind.
+Locks release automatically when the owning process exits. Do not delete lock
+files while processes are running; file existence alone does not mean a lock is
+held.
+
+The logger reserves each trial with an atomic frame-directory creation and opens
+its CSV exclusively (`x` mode). Concurrent reservations cannot share a trial,
+and an existing CSV cannot be truncated. Every row has the same 29 named columns
+as the header, is flushed after writing, and a write failure stops acquisition.
+CSV cleanup still runs if ROS has already shut down.
+
+`target_pressure` is blank while pressure-driver status is faulted, absent, or
+older than 3 seconds. `measured_pressure` is blank once the last valid read is
+older than 2 seconds. Zero remains a real measurement/command, not a missing
+value. A target is the last SDK-acknowledged request, not proof of physical
+settling or of a front-panel command. Direct front-panel changes have no SDK
+setpoint acknowledgement and cannot be reconstructed as pressure action labels.
+
+On September 18, two old complete launches were found writing the same trial
+files concurrently. Existing `~/logs/trial_28.csv`, `trial_29.csv`, and
+`trial_30.csv` contain overwritten/merged rows; `trial_25.csv` also has structural
+corruption. Those originals were preserved, not repaired by guessing. Do not use
+corrupt trials for training. The fixes prevent future collisions and do not
+recover overwritten measurements or frames.

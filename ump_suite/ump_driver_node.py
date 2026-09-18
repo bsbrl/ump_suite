@@ -12,6 +12,7 @@ cell diameters. Do not read these as unspecified encoder counts.
 """
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Int32MultiArray
 from std_srvs.srv import Trigger
@@ -116,17 +117,26 @@ class UMPDriverNode(Node):
 
 
 def main():
+    from .runtime_guard import acquire_process_lock
+    acquire_process_lock("sensapex")
+
     rclpy.init()
     node = UMPDriverNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def main_dual():
     """Run two UMP driver nodes in a single process so they share one SDK instance."""
+    from .runtime_guard import acquire_process_lock
+    acquire_process_lock("sensapex")
+
     rclpy.init()
 
     from rclpy.executors import MultiThreadedExecutor
@@ -148,7 +158,11 @@ def main_dual():
     executor.add_node(node2)
     try:
         executor.spin()
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
+        executor.shutdown()
         node1.destroy_node()
         node2.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

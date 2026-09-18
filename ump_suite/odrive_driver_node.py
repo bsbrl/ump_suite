@@ -11,6 +11,7 @@ import time
 
 import odrive
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from odrive.enums import (
     AXIS_STATE_CLOSED_LOOP_CONTROL,
     AXIS_STATE_IDLE,
@@ -118,10 +119,16 @@ class ODriveDriverNode(Node):
 
 
 def main():
+    from .runtime_guard import acquire_process_lock
+    acquire_process_lock("odrive")
+
     rclpy.init()
     node = ODriveDriverNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

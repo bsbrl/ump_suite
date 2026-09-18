@@ -7,8 +7,12 @@ because PySpin needs the system Spinnaker libraries and a dedicated venv
 """
 
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess
+from launch.actions import EmitEvent, ExecuteProcess, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch_ros.actions import Node
+
+from ump_suite.runtime_guard import acquire_process_lock
 
 
 # PySpin requires the bundled Spinnaker .so files and is installed in a
@@ -51,7 +55,13 @@ CAMERA_BOOTSTRAP = (
 
 
 def generate_launch_description():
+    acquire_process_lock("suite")
+    gui = Node(package="ump_suite", executable="gui_node", output="screen")
     return LaunchDescription([
+        RegisterEventHandler(OnProcessExit(
+            target_action=gui,
+            on_exit=[EmitEvent(event=Shutdown(reason="Rig control window closed"))],
+        )),
         # Both UMP devices run in one process to share the Sensapex SDK
         # singleton (UDP socket). Separate processes cause port conflicts
         # and timeouts on the second device.
@@ -102,11 +112,7 @@ def generate_launch_description():
             parameters=[{"log_interval_ms": 333}],
         ),
 
-        Node(
-            package="ump_suite",
-            executable="gui_node",
-            output="screen",
-        ),
+        gui,
 
         Node(
             package="ump_suite",

@@ -6,6 +6,7 @@ from collections import deque
 
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Float32, Float32MultiArray
 
@@ -274,13 +275,19 @@ class HekaUdpReceiverNode(Node):
 
 
 def main():
+    from .runtime_guard import acquire_process_lock
+    acquire_process_lock("heka")
+
     rclpy.init()
     node = HekaUdpReceiverNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

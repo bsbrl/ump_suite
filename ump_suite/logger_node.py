@@ -17,6 +17,7 @@ video file is captured for the same trial.
 """
 
 import csv
+import json
 import math
 import os
 import time
@@ -24,6 +25,7 @@ import time
 import cv2
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float32, Int32MultiArray, String
@@ -36,6 +38,7 @@ from .ros_interfaces import (
     TOPIC_CAM_REC_CMD,
     TOPIC_HEKA_RESISTANCE,
     TOPIC_PRESSURE_MEASURED,
+    TOPIC_PRESSURE_STATUS,
     TOPIC_PRESSURE_TARGET,
     TOPIC_UMP_LIVE,
     TOPIC_UMP_TARGET,
@@ -94,6 +97,9 @@ class LoggerNode(Node):
         # is the value actually written to the device, not the raw request.
         self.latest_target_pressure = None
         self.latest_measured_pressure = None
+        self.latest_measured_pressure_stamp = 0.0
+        self.latest_pressure_ready = False
+        self.latest_pressure_status_stamp = 0.0
 
         # Latest commanded target. These are *not* cleared after each tick:
         # if the user stops issuing commands, the most recent target keeps
@@ -133,6 +139,9 @@ class LoggerNode(Node):
         )
         self.create_subscription(
             Float32, TOPIC_PRESSURE_MEASURED, self.on_measured_pressure, 10
+        )
+        self.create_subscription(
+            String, TOPIC_PRESSURE_STATUS, self.on_pressure_status, latched_qos()
         )
 
         self.pub_rec_cmd = self.create_publisher(String, TOPIC_CAM_REC_CMD, 10)
@@ -176,12 +185,23 @@ class LoggerNode(Node):
         value = float(msg.data)
         if math.isfinite(value):
             self.latest_measured_pressure = value
+            self.latest_measured_pressure_stamp = time.monotonic()
+
+    def on_pressure_status(self, msg: String):
+        try:
+            status = json.loads(msg.data)
+            if not isinstance(status, dict) or not isinstance(status.get('ready'), bool):
+                return
+        except (TypeError, ValueError):
+            return
+        self.latest_pressure_ready = status['ready']
+        self.latest_pressure_status_stamp = time.monotonic()
 
     # ── Trial setup ────────────────────────────────────────────────────────
     @staticmethod
     def _next_trial_id():
         """
-        Lowest unused trial number across every output directory.
+        Next unused trial number across every output directory.
 
         Scanning only `logs/` is not enough: deleting a CSV while its frame
         directory survives would hand the number back out, and the new run would
@@ -207,11 +227,20 @@ class LoggerNode(Node):
 
         next_trial = self._next_trial_id()
 
-        self.trial_name = f"trial_{next_trial}"
-        self.log_path = os.path.join("logs",         f"{self.trial_name}.csv")
-        self.frames_dir = os.path.join("saved_frames", self.trial_name)
-        self.video_path = os.path.join("saved_videos", f"{self.trial_name}.mp4")
-        os.makedirs(self.frames_dir, exist_ok=True)
+        # mkdir is an atomic reservation, unlike scanning followed by exist_ok.
+        while True:
+            trial_name = f"trial_{next_trial}"
+            frames_dir = os.path.join("saved_frames", trial_name)
+            try:
+                os.mkdir(frames_dir)
+            except FileExistsError:
+                next_trial += 1
+                continue
+            break
+        self.trial_name = trial_name
+        self.log_path = os.path.join("logs", f"{trial_name}.csv")
+        self.frames_dir = frames_dir
+        self.video_path = os.path.join("saved_videos", f"{trial_name}.mp4")
 
         self.frame_index = 0
         self.timestep = 0
@@ -220,9 +249,10 @@ class LoggerNode(Node):
         self._last_row_time = None
 
     def _open_csv(self):
-        self.log_file = open(self.log_path, "w", newline="")
+        self.log_file = open(self.log_path, "x", newline="", encoding="utf-8")
         self.writer = csv.writer(self.log_file)
         self.writer.writerow(CSV_HEADER)
+        self.log_file.flush()
 
     # ── Service handlers ───────────────────────────────────────────────────
     def on_start(self, _req, res):
@@ -231,9 +261,16 @@ class LoggerNode(Node):
             res.message = "Already acquiring."
             return res
 
-        self._setup_trial()
-        self._open_csv()
-        self.pub_rec_cmd.publish(String(data=self.video_path))
+        try:
+            self._setup_trial()
+            self._open_csv()
+            self.pub_rec_cmd.publish(String(data=self.video_path))
+        except Exception as exc:
+            self._close_csv()
+            res.success = False
+            res.message = f"Acquisition could not start: {exc}"
+            self.get_logger().error(res.message)
+            return res
 
         self.acquiring = True
         res.success = True
@@ -248,23 +285,33 @@ class LoggerNode(Node):
             return res
 
         self.acquiring = False
-        self.pub_rec_cmd.publish(String(data=""))
+        self._stop_recording()
         self._report_achieved_rate()
-
-        try:
-            if self.log_file:
-                self.log_file.flush()
-                self.log_file.close()
-        except Exception:
-            pass
-
-        self.log_file = None
-        self.writer = None
-
-        res.success = True
-        res.message = "Acquisition stopped."
+        error = self._close_csv()
+        res.success = not error
+        res.message = (f"Acquisition stopped; CSV close failed: {error}"
+                       if error else "Acquisition stopped.")
         self.get_logger().info(res.message)
         return res
+
+    def _stop_recording(self):
+        # ROS may already be shutting down; CSV cleanup must still run.
+        try:
+            self.pub_rec_cmd.publish(String(data=""))
+        except Exception as exc:
+            self.get_logger().warn(f"Could not send camera stop: {exc}")
+
+    def _close_csv(self):
+        error = ''
+        handle = self.log_file
+        self.log_file = self.writer = None
+        if handle is not None:
+            try:
+                handle.close()  # flushes, and closes even if the flush fails
+            except Exception as exc:
+                error = str(exc)
+                self.get_logger().error(f"CSV close failed: {exc}")
+        return error
 
     # ── Per-tick logging ───────────────────────────────────────────────────
     def _save_current_frame(self):
@@ -311,9 +358,8 @@ class LoggerNode(Node):
         if achieved < 0.9 * configured:
             self.get_logger().warn(
                 f"logging ran at {achieved:.2f} Hz, below 90% of the configured "
-                f"{configured:.2f} Hz. Convert this data with --fps "
-                f"{achieved:.0f} and match the policy control rate to it, or "
-                "reduce the load on this node."
+                f"{configured:.2f} Hz. Inspect timestamps and reduce acquisition load; "
+                "an average FPS alone cannot repair irregular timing."
             )
 
     def _image_stamp(self):
@@ -362,14 +408,18 @@ class LoggerNode(Node):
         # Pressure in mbar, negative = pull. The target is what the pressure
         # node actually wrote to the device (post-clamp), so it can never claim
         # a pressure the controller never received. Blank until first published.
+        now = time.monotonic()
+        pressure_ready = (self.latest_pressure_ready
+                          and now - self.latest_pressure_status_stamp <= 3.0)
         target_pressure = (
             float(self.latest_target_pressure)
-            if self.latest_target_pressure is not None
+            if pressure_ready and self.latest_target_pressure is not None
             else ""
         )
         measured_pressure = (
             float(self.latest_measured_pressure)
-            if self.latest_measured_pressure is not None
+            if (self.latest_measured_pressure is not None
+                and now - self.latest_measured_pressure_stamp <= 2.0)
             else ""
         )
 
@@ -380,7 +430,7 @@ class LoggerNode(Node):
         wall_time = time.time()
         image_age = "" if image_stamp == "" else round(wall_time - image_stamp, 6)
 
-        self.writer.writerow([
+        row = [
             self.timestep,
             cx, cy, cz, cd,
             tx, ty, tz, td,
@@ -398,27 +448,47 @@ class LoggerNode(Node):
             int(self.latest_target_ump2 is not None),
             int(self.latest_live_ump is not None and len(self.latest_live_ump) >= 4),
             int(self.latest_live_ump2 is not None and len(self.latest_live_ump2) >= 4),
-        ])
+        ]
+        try:
+            if len(row) != len(CSV_HEADER):
+                raise ValueError(f"CSV row width {len(row)} != {len(CSV_HEADER)}")
+            self.writer.writerow(row)
+            self.log_file.flush()
+        except Exception as exc:
+            self.acquiring = False
+            self._stop_recording()
+            self.get_logger().error(f"Acquisition stopped after CSV write failure: {exc}")
+            self._close_csv()
+            return
         if self._first_row_time is None:
             self._first_row_time = wall_time
         self._last_row_time = wall_time
         self.timestep += 1
         self._warn_if_stale(image_age)
 
-        try:
-            self.log_file.flush()
-        except Exception:
-            pass
+    def destroy_node(self):
+        """Finish an active trial and close the CSV before ROS teardown."""
+        if self.acquiring:
+            self.on_stop(None, Trigger.Response())
+        elif self.log_file is not None:
+            self._close_csv()
+        super().destroy_node()
 
 
 def main():
+    from .runtime_guard import acquire_process_lock
+    acquire_process_lock("logger")
+
     rclpy.init()
     node = LoggerNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
