@@ -66,6 +66,9 @@ driver also constructs service names from its configured prefix.
 | `/ump/stop`, `/ump2/stop` | `std_srvs/Trigger` | service | Request SDK stop; does not latch out future publishers |
 | `/ump/calibrate_zero`, `/ump2/calibrate_zero` | `std_srvs/Trigger` | service | Calibrate zero at the current pose |
 | `/acq/start`, `/acq/stop` | `std_srvs/Trigger` | service | Begin / end a logged trial |
+| `/inject/params` | `std_msgs/String` | subscribe (UMP 1 driver) | Latched JSON `{token, seq, speed_um_s, step_um, pressure_mbar, duration_ms}`, published by the GUI whenever its Injection boxes change |
+| `/inject/start` | `std_srvs/Trigger` | service (UMP 1 driver) | Run one injection with the current `/inject/params`; refused with a reason if it cannot start |
+| `/inject/status` | `std_msgs/String` | publish (UMP 1 driver) | Latched JSON `{count, active, stage, message, params, params_token, params_seq, stamp}`; `count` rises once per injection that starts |
 
 The UMP driver publishes and accepts raw absolute Sensapex device coordinates. There is no `10000` count centering offset in the ROS topics.
 
@@ -82,6 +85,27 @@ the affected stage and latch further targets off until the driver is restarted.
 Driver shutdown also attempts a stop. Updated MicroVLA live rollout requires
 these services before starting. Acknowledgment confirms the SDK call, not a
 measurement that physical motion has ceased.
+
+**Injection macro (UMP 1 only).** `/inject/start` runs the sequence in
+[injection.py](ump_suite/injection.py) in a worker thread, with the values last
+received on `/inject/params`:
+
+1. move X by `step_um` (positive = increasing X) at `speed_um_s`, and wait for the SDK to report arrival within 1 µm;
+2. request `pressure_mbar` on `/pressure/mbar` and wait up to 0.5 s for `/pressure/target_mbar` to acknowledge it;
+3. hold for `duration_ms`, counted from that acknowledgment;
+4. vent (`0` mbar);
+5. move X back to where it started, at the same speed.
+
+It is refused while another injection runs, while the stage is still moving,
+after a latched fault, when the X target would leave 0–20000 µm, or (for a
+nonzero pressure) unless `/pressure/status` reported ready in the last 3 s.
+While it runs, ordinary `/ump/target` commands are ignored. `/ump/stop` aborts
+it: the stage stops, the pressure vents if it was applied, and the needle stays
+where it stopped. A missing acknowledgment vents and moves back. A move that
+times out, is interrupted, or ends more than 1 µm from its target aborts too.
+Limits: speed 10–2000 µm/s, |step| 1–2000 µm, pressure ±1000 mbar, time
+1–10000 ms. Measured on the rig (7 Oct 2026): +10 mbar reached ~95 % about
+170 ms after acknowledgment, so much shorter pulses do not reach the set value.
 
 The `ump_dual_driver_node` entry point runs both devices in one process so they share the Sensapex SDK singleton / UDP socket. This is what [launch/app.launch.py](launch/app.launch.py) uses, because separate UMP processes can conflict on the SDK socket.
 
@@ -268,10 +292,20 @@ wall_time,
 image_stamp,
 state_stamp,
 image_age_s,
-target_valid, target_valid2, state_valid, state_valid2
+target_valid, target_valid2, state_valid, state_valid2,
+Injection
 ```
 
-The current CSV has **29 columns**.
+The current CSV has **30 columns**. `Injection` was added on 7 October 2026;
+older trials have 29 and simply lack it.
+
+**`Injection`** is `1` on the first row written after an injection starts and `0`
+on every other row. It records the command only, not its values. While the
+injection runs, the position, target, `target_pressure` and `state_stamp`
+columns keep the values they had just before it started, so the dataset shows
+one command rather than the moves and pressure pulse inside it. UMP 1 targets
+sent during an injection are not logged, because the driver ignores them.
+Images, resistance and `measured_pressure` stay live.
 
 The four timing columns exist so a late tick or a stalled camera is detectable
 after the fact. Without them a frozen camera silently writes the same frame into
@@ -315,6 +349,14 @@ The pressure panel is one box plus a Send button:
 Underneath, **SDK target** shows `/pressure/target_mbar` and **Measured** shows `/pressure/measured_mbar`, with stale readings marked. Faults/offline status appear separately. The reconnect/reset button attempts recovery at zero; physical settling must be checked in the measured value.
 
 To change which presets appear, edit the `PRESSURE_PRESETS_MBAR` tuple near the top of [gui_node.py](ump_suite/gui_node.py) — the buttons and their layout are generated from it, so adding or removing entries is all that is needed.
+
+The **Injection** panel, between UMP 2 and the ODrive, has an **Inject** button
+with four boxes beside it: **Speed** (µm/s), **Step X** (µm; `-` moves X down
+first), **Pressure** (mbar; `-` pulls) and **Time** (ms). The boxes publish
+`/inject/params` whenever they change, and Inject calls `/inject/start` once the
+driver has echoed those values back. **Stop** calls `/ump/stop`. The line
+underneath shows the driver's progress and timings. The boxes are saved in
+`~/.config/ump_suite/gui.ini` and restored on the next start.
 
 The panel is **mouse-only** — there are deliberately no keyboard shortcuts, so keystrokes always go to the widget you are editing.
 
@@ -505,8 +547,8 @@ held.
 
 The logger reserves each trial with an atomic frame-directory creation and opens
 its CSV exclusively (`x` mode). Concurrent reservations cannot share a trial,
-and an existing CSV cannot be truncated. Every row has the same 29 named columns
-as the header, is flushed after writing, and a write failure stops acquisition.
+and an existing CSV cannot be truncated. Every row has the same named columns
+as the header (30 since the `Injection` column), is flushed after writing, and a write failure stops acquisition.
 CSV cleanup still runs if ROS has already shut down.
 
 `target_pressure` is blank while pressure-driver status is faulted, absent, or

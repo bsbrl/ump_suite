@@ -11,6 +11,12 @@ When acquisition is running, this node periodically writes one CSV row per
   * wall-clock, camera and state timestamps, so a late tick or a stalled camera
     is detectable after the fact rather than silently producing a well-formed
     row whose image does not match its position
+  * an `Injection` flag: 1 on the first row after an injection starts, else 0
+
+While an injection runs (see injection.py), the position, target, pressure
+command and state-stamp columns keep the values they had just before it
+started. The injection is logged as one command, not as the moves and pressure
+pulse inside it. Images, resistance and measured pressure stay live.
 
 It also forwards a record path to the camera node so that the matching mp4
 video file is captured for the same trial.
@@ -37,6 +43,7 @@ from .ros_interfaces import (
     TOPIC_CAM_IMAGE_COMPRESSED,
     TOPIC_CAM_REC_CMD,
     TOPIC_HEKA_RESISTANCE,
+    TOPIC_INJECT_STATUS,
     TOPIC_PRESSURE_MEASURED,
     TOPIC_PRESSURE_STATUS,
     TOPIC_PRESSURE_TARGET,
@@ -70,6 +77,8 @@ CSV_HEADER = [
     "state_stamp",
     "image_age_s",
     "target_valid", "target_valid2", "state_valid", "state_valid2",
+    # 1 on the first row written after an injection started, else 0.
+    "Injection",
 ]
 
 
@@ -107,6 +116,12 @@ class LoggerNode(Node):
         self.latest_target_ump = None
         self.latest_target_ump2 = None
 
+        # Injection bookkeeping. The snapshot holds the logged values from just
+        # before the running injection; `pending` marks the next row with 1.
+        self._injection_count = None
+        self._injection_snapshot = None
+        self._injection_pending = False
+
         self.acquiring = False
         self.trial_name = None
         self.log_path = None
@@ -143,6 +158,10 @@ class LoggerNode(Node):
         self.create_subscription(
             String, TOPIC_PRESSURE_STATUS, self.on_pressure_status, latched_qos()
         )
+        # Depth 10, so a slow tick cannot drop the start of a short injection.
+        self.create_subscription(
+            String, TOPIC_INJECT_STATUS, self.on_inject_status, latched_qos(depth=10)
+        )
 
         self.pub_rec_cmd = self.create_publisher(String, TOPIC_CAM_REC_CMD, 10)
 
@@ -162,6 +181,10 @@ class LoggerNode(Node):
         self.latest_state_stamp = time.time()
 
     def on_ump_target(self, msg: Int32MultiArray):
+        # The UMP 1 driver ignores targets while an injection runs, so a target
+        # sent then was never executed and must not become the logged command.
+        if self._injection_snapshot is not None:
+            return
         # /ump/target carries [x,y,z,d,speed]; we only log [x,y,z,d].
         if len(msg.data) >= 5:
             self.latest_target_ump = list(msg.data)
@@ -196,6 +219,41 @@ class LoggerNode(Node):
             return
         self.latest_pressure_ready = status['ready']
         self.latest_pressure_status_stamp = time.monotonic()
+
+    def _logged_state(self):
+        """Values the position and command columns are built from."""
+        return {
+            "live_ump": self.latest_live_ump,
+            "live_ump2": self.latest_live_ump2,
+            "target_ump": self.latest_target_ump,
+            "target_ump2": self.latest_target_ump2,
+            "target_pressure": self.latest_target_pressure,
+            "state_stamp": self.latest_state_stamp,
+        }
+
+    def on_inject_status(self, msg: String):
+        """Freeze the logged state for an injection and flag its first row."""
+        try:
+            status = json.loads(msg.data)
+            count = int(status['count'])
+            active = status['active']
+        except (TypeError, ValueError, KeyError):
+            return
+        if not isinstance(active, bool):
+            return
+        if self._injection_count is None:
+            # First message seen: only a running injection is new to us.
+            started = active
+        else:
+            started = count > self._injection_count
+        self._injection_count = count if self._injection_count is None else max(
+            count, self._injection_count)
+        if started and self.acquiring:
+            self._injection_pending = True
+        if active and self._injection_snapshot is None:
+            self._injection_snapshot = self._logged_state()
+        elif not active:
+            self._injection_snapshot = None
 
     # ── Trial setup ────────────────────────────────────────────────────────
     @staticmethod
@@ -262,6 +320,7 @@ class LoggerNode(Node):
             return res
 
         try:
+            self._injection_pending = False
             self._setup_trial()
             self._open_csv()
             self.pub_rec_cmd.publish(String(data=self.video_path))
@@ -285,6 +344,7 @@ class LoggerNode(Node):
             return res
 
         self.acquiring = False
+        self._injection_pending = False
         self._stop_recording()
         self._report_achieved_rate()
         error = self._close_csv()
@@ -395,11 +455,18 @@ class LoggerNode(Node):
         if not self.acquiring or self.writer is None:
             return
 
-        cx,  cy,  cz,  cd = _xyzd(self.latest_live_ump)
-        cx2, cy2, cz2, cd2 = _xyzd(self.latest_live_ump2)
+        # During an injection these hold their pre-injection values.
+        state = self._injection_snapshot or self._logged_state()
+        live_ump, live_ump2 = state["live_ump"], state["live_ump2"]
+        target_ump, target_ump2 = state["target_ump"], state["target_ump2"]
+        state_stamp = state["state_stamp"]
+        injection = int(self._injection_pending)
 
-        tx,  ty,  tz,  td = _xyzd(self.latest_target_ump)
-        tx2, ty2, tz2, td2 = _xyzd(self.latest_target_ump2)
+        cx,  cy,  cz,  cd = _xyzd(live_ump)
+        cx2, cy2, cz2, cd2 = _xyzd(live_ump2)
+
+        tx,  ty,  tz,  td = _xyzd(target_ump)
+        tx2, ty2, tz2, td2 = _xyzd(target_ump2)
         resistance = (
             float(self.latest_resistance_mohm)
             if self.latest_resistance_mohm is not None
@@ -412,8 +479,8 @@ class LoggerNode(Node):
         pressure_ready = (self.latest_pressure_ready
                           and now - self.latest_pressure_status_stamp <= 3.0)
         target_pressure = (
-            float(self.latest_target_pressure)
-            if pressure_ready and self.latest_target_pressure is not None
+            float(state["target_pressure"])
+            if pressure_ready and state["target_pressure"] is not None
             else ""
         )
         measured_pressure = (
@@ -442,12 +509,13 @@ class LoggerNode(Node):
             measured_pressure,
             round(wall_time, 6),
             "" if image_stamp == "" else round(image_stamp, 6),
-            "" if self.latest_state_stamp is None else round(self.latest_state_stamp, 6),
+            "" if state_stamp is None else round(state_stamp, 6),
             image_age,
-            int(self.latest_target_ump is not None),
-            int(self.latest_target_ump2 is not None),
-            int(self.latest_live_ump is not None and len(self.latest_live_ump) >= 4),
-            int(self.latest_live_ump2 is not None and len(self.latest_live_ump2) >= 4),
+            int(target_ump is not None),
+            int(target_ump2 is not None),
+            int(live_ump is not None and len(live_ump) >= 4),
+            int(live_ump2 is not None and len(live_ump2) >= 4),
+            injection,
         ]
         try:
             if len(row) != len(CSV_HEADER):
@@ -460,6 +528,8 @@ class LoggerNode(Node):
             self.get_logger().error(f"Acquisition stopped after CSV write failure: {exc}")
             self._close_csv()
             return
+        if injection:
+            self._injection_pending = False
         if self._first_row_time is None:
             self._first_row_time = wall_time
         self._last_row_time = wall_time
@@ -485,6 +555,11 @@ def main():
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except RuntimeError:
+        # Ctrl+C shuts the context down while a message may still be taken,
+        # which rclpy reports as a RuntimeError. Anything else is a real error.
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         if rclpy.ok():

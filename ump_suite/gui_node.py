@@ -7,6 +7,10 @@ The ROS surface is:
   * publishes the exact commanded pressure in mbar
   * subscribes to live robot, pressure, camera, and HEKA voltage/current topics
   * calls acquisition and UMP zeroing services
+  * publishes the injection settings and calls the injection service
+
+The injection settings are saved in ~/.config/ump_suite/gui.ini, so they are
+still there after a restart.
 
 The panel is mouse-only; there are deliberately no keyboard shortcuts.
 
@@ -17,17 +21,20 @@ feel without requiring a separate web server.
 
 import json
 import math
+import os
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 
 import cv2
 import numpy as np
 import rclpy
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QSettings, Qt, QTimer
 from PyQt5.QtGui import QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QDoubleSpinBox,
     QFrame,
@@ -51,15 +58,33 @@ from std_msgs.msg import Float32, Float32MultiArray, Int32, Int32MultiArray
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
+from .injection import (
+    DEFAULT_DURATION_MS,
+    DEFAULT_PRESSURE_MBAR as DEFAULT_INJECT_PRESSURE_MBAR,
+    DEFAULT_SPEED_UM_S,
+    DEFAULT_STEP_UM,
+    DURATION_MAX_MS,
+    DURATION_MIN_MS,
+    PRESSURE_LIMIT_MBAR as INJECT_PRESSURE_LIMIT_MBAR,
+    SPEED_MAX_UM_S,
+    SPEED_MIN_UM_S,
+    STEP_LIMIT_UM,
+    encode_params_message,
+    validate_params,
+)
 from .ros_interfaces import (
     SRV_ACQ_START,
     SRV_ACQ_STOP,
+    SRV_INJECT_START,
+    SRV_UMP_STOP,
     SRV_ZERO,
     SRV_ZERO2,
     TOPIC_CAM_IMAGE_COMPRESSED,
     TOPIC_HEKA_CURRENT_PA,
     TOPIC_HEKA_RESISTANCE,
     TOPIC_HEKA_VOLTAGE_RAW,
+    TOPIC_INJECT_PARAMS,
+    TOPIC_INJECT_STATUS,
     TOPIC_MOTOR_LIVE,
     TOPIC_MOTOR_TGT,
     SRV_PRESSURE_RESET,
@@ -100,6 +125,11 @@ CAM_UPDATE_MS = 30
 HEKA_PLOT_UPDATE_MS = 100
 HEKA_PLOT_WINDOW_S = 0.25
 HEKA_MAX_DRAW_POINTS = 2200
+
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".config", "ump_suite", "gui.ini")
+# How long Inject waits for the driver to confirm it holds the values in the
+# boxes. Normally it already does: the boxes publish whenever they change.
+INJECT_PARAMS_ECHO_TIMEOUT_S = 1.0
 
 
 def clamp(v, vmin, vmax):
@@ -166,6 +196,18 @@ class GuiNode(Node):
         self.cli_zero = self.create_client(Trigger, SRV_ZERO)
         self.cli_zero2 = self.create_client(Trigger, SRV_ZERO2)
 
+        # Injection: latched settings for whoever triggers, the trigger itself,
+        # and UMP 1's stop service, which also aborts a running injection.
+        self.pub_inject_params = self.create_publisher(
+            String, TOPIC_INJECT_PARAMS, latched_qos()
+        )
+        self.create_subscription(
+            String, TOPIC_INJECT_STATUS, self._on_inject_status, latched_qos(depth=10)
+        )
+        self.cli_inject = self.create_client(Trigger, SRV_INJECT_START)
+        self.cli_ump_stop = self.create_client(Trigger, SRV_UMP_STOP)
+        self.latest_inject_status = None
+
         self.latest_live_ump = [0, 0, 0, 0]
         self.latest_live_ump2 = [0, 0, 0, 0]
         self.latest_live_motor = 0
@@ -202,6 +244,14 @@ class GuiNode(Node):
             return
         self.latest_pressure_status = status
         self.latest_pressure_status_stamp = time.monotonic()
+
+    def _on_inject_status(self, msg: String):
+        try:
+            status = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if isinstance(status, dict) and isinstance(status.get('active'), bool):
+            self.latest_inject_status = status
 
     def _on_pressure_measured(self, msg: Float32):
         value = float(msg.data)
@@ -647,12 +697,206 @@ class UmpPanel(QGroupBox):
         self.app.set_status(f"{self.label} zero: {ok} ({msg})")
 
 
+class InjectionPanel(QGroupBox):
+    """
+    Inject button and the values the injection macro uses (see injection.py).
+
+    The values are published on /inject/params whenever they change, so a
+    trigger from anywhere uses what these boxes show. The UMP 1 driver runs the
+    sequence; this panel only asks it to start, and shows its progress.
+    """
+
+    SETTINGS_KEYS = {
+        "speed": ("injection/speed_um_s", DEFAULT_SPEED_UM_S, int),
+        "step": ("injection/step_um", DEFAULT_STEP_UM, int),
+        "pressure": ("injection/pressure_mbar", DEFAULT_INJECT_PRESSURE_MBAR, float),
+        "duration": ("injection/duration_ms", DEFAULT_DURATION_MS, int),
+    }
+
+    def __init__(self, app, settings):
+        super().__init__("Injection")
+        self.app = app
+        self.settings = settings
+        self._token = uuid.uuid4().hex
+        self._seq = 0
+        self._published = None
+
+        self.speed = self._int_box(SPEED_MIN_UM_S, SPEED_MAX_UM_S, " \u00b5m/s")
+        self.step = self._int_box(-STEP_LIMIT_UM, STEP_LIMIT_UM, " \u00b5m")
+        self.pressure = QDoubleSpinBox()
+        self.pressure.setRange(-INJECT_PRESSURE_LIMIT_MBAR, INJECT_PRESSURE_LIMIT_MBAR)
+        self.pressure.setDecimals(1)
+        self.pressure.setSuffix(" mbar")
+        self._style_box(self.pressure)
+        self.duration = self._int_box(DURATION_MIN_MS, DURATION_MAX_MS, " ms")
+        self.boxes = {"speed": self.speed, "step": self.step,
+                      "pressure": self.pressure, "duration": self.duration}
+        self._load_settings()
+
+        self.inject_button = QPushButton("Inject")
+        self.inject_button.setProperty("kind", "danger")
+        self.inject_button.setToolTip(
+            "Move X in by Step at Speed, hold Pressure for Time, vent, move back")
+        self.inject_button.setFixedSize(84, 62)
+        self.inject_button.clicked.connect(self.inject)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setProperty("kind", "secondary")
+        self.stop_button.setToolTip("Stop UMP 1 now; a running injection vents and halts")
+        self.stop_button.clicked.connect(self.stop)
+        self.state_label = QLabel("Waiting for the UMP 1 driver")
+        self.state_label.setWordWrap(True)
+        self.state_label.setMinimumHeight(34)  # room for two wrapped lines
+        self.state_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        self._build()
+        for name, box in self.boxes.items():
+            box.valueChanged.connect(lambda _value, n=name: self._on_value_changed(n))
+        self.publish_params()
+
+    @staticmethod
+    def _style_box(box):
+        box.setKeyboardTracking(False)
+        box.setAlignment(Qt.AlignRight)
+        box.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        box.setFixedHeight(28)
+        box.setMinimumWidth(116)
+        box.setMaximumWidth(124)
+
+    @classmethod
+    def _int_box(cls, vmin, vmax, suffix):
+        box = QSpinBox()
+        box.setRange(vmin, vmax)
+        box.setSuffix(suffix)
+        cls._style_box(box)
+        return box
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(5)
+
+        # The button with its four values beside it, one per row.
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        grid.addWidget(self.inject_button, 0, 0, 4, 1, Qt.AlignVCenter)
+        rows = (("Speed", self.speed), ("Step X", self.step),
+                ("Pressure", self.pressure), ("Time", self.duration))
+        for row, (text, box) in enumerate(rows):
+            grid.addWidget(QLabel(text), row, 1)
+            grid.addWidget(box, row, 2)
+        grid.addWidget(self.stop_button, 0, 3, 4, 1, Qt.AlignVCenter)
+        grid.setColumnStretch(4, 1)
+        layout.addLayout(grid)
+
+        hint = QLabel("Step: + moves X up first, - moves it down. Pressure: '-' pulls. "
+                      "Time counts from the pressure driver's acknowledgment.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addWidget(self.state_label)
+
+    # ── Settings ───────────────────────────────────────────────────────────
+    def _load_settings(self):
+        for name, (key, default, kind) in self.SETTINGS_KEYS.items():
+            box = self.boxes[name]
+            try:
+                # INI files return text, and may hold "50.0" for an integer box.
+                value = float(self.settings.value(key, default))
+            except (TypeError, ValueError):
+                value = float(default)
+            if not math.isfinite(value) or not box.minimum() <= value <= box.maximum():
+                value = float(default)
+            box.setValue(kind(round(value)) if kind is int else value)
+
+    def _on_value_changed(self, name):
+        key, _default, kind = self.SETTINGS_KEYS[name]
+        self.settings.setValue(key, kind(self.boxes[name].value()))
+        self.settings.sync()
+        self.publish_params()
+
+    # ── ROS ────────────────────────────────────────────────────────────────
+    def current_params(self):
+        """Return the boxes as InjectionParams; raise ValueError if they are invalid."""
+        return validate_params({
+            "speed_um_s": self.speed.value(),
+            "step_um": self.step.value(),
+            "pressure_mbar": self.pressure.value(),
+            "duration_ms": self.duration.value(),
+        })
+
+    def publish_params(self, force=False):
+        """Publish the boxes if they changed; return the sequence number, or None."""
+        try:
+            params = self.current_params()
+        except ValueError as exc:
+            self.state_label.setText(f"Not published: {exc}")
+            return None
+        if force or self._published is None or self._published[0] != params:
+            self._seq += 1
+            self.app.node.pub_inject_params.publish(
+                String(data=encode_params_message(params, self._token, self._seq)))
+            self._published = (params, self._seq)
+        return self._published[1]
+
+    def _driver_has(self, seq):
+        status = self.app.node.latest_inject_status
+        return (status is not None and status.get("params_token") == self._token
+                and status.get("params_seq") == seq)
+
+    def inject(self):
+        for box in self.boxes.values():
+            box.interpretText()
+        seq = self.publish_params()
+        if seq is not None and not self._driver_has(seq):
+            # Someone else published values since; make these the current ones.
+            seq = self.publish_params(force=True)
+        if seq is None:
+            self.app.set_status("Injection not started: " + self.state_label.text())
+            return
+        # The trigger carries no values; make sure the driver holds these ones.
+        deadline = time.monotonic() + INJECT_PARAMS_ECHO_TIMEOUT_S
+        while not self._driver_has(seq):
+            if time.monotonic() > deadline:
+                self.app.set_status(
+                    "Injection not started: the UMP 1 driver has not confirmed the "
+                    "values (is it running?)")
+                return
+            time.sleep(0.01)
+        ok, message = self.app.node.call_trigger(self.app.node.cli_inject)
+        self.app.set_status(message if message else f"Inject: {ok}")
+
+    def stop(self):
+        ok, message = self.app.node.call_trigger(self.app.node.cli_ump_stop)
+        self.app.set_status(f"UMP 1 stop: {'OK' if ok else 'FAILED'} ({message})")
+
+    def update_status(self):
+        status = self.app.node.latest_inject_status
+        if status is None:
+            self.inject_button.setEnabled(True)
+            self.state_label.setText("Waiting for the UMP 1 driver")
+            return
+        active = bool(status.get("active"))
+        self.inject_button.setEnabled(not active)
+        stage = str(status.get("stage", ""))
+        message = str(status.get("message", ""))
+        count = status.get("count", 0)
+        if active:
+            text = f"#{count} running ({stage}): {message}"
+        elif stage in ("done", "aborted"):
+            text = f"#{count} {stage}: {message}"
+        else:
+            text = message or "ready"
+        self.state_label.setText(text)
+
+
 class UMPGuiApp(QMainWindow):
     """Main Qt application window."""
 
-    def __init__(self, node: GuiNode):
+    def __init__(self, node: GuiNode, settings=None):
         super().__init__()
         self.node = node
+        self.settings = settings or QSettings(SETTINGS_PATH, QSettings.IniFormat)
         self.setWindowTitle("Patch Clamping Robot")
         self.resize(1280, 900)
         self.setMinimumSize(900, 650)
@@ -719,6 +963,7 @@ class UMPGuiApp(QMainWindow):
             live_stamp_getter=lambda: node.live_ump2_stamp,
             subtitle=None,
         )
+        self.injection_panel = InjectionPanel(self, self.settings)
 
         self._build_ui()
 
@@ -785,6 +1030,7 @@ class UMPGuiApp(QMainWindow):
 
         left_layout.addWidget(self.panel1)
         left_layout.addWidget(self.panel2)
+        left_layout.addWidget(self.injection_panel)
         left_layout.addWidget(self._motor_group())
         left_layout.addWidget(self._pressure_group())
         left_layout.addWidget(self._acquisition_group())
@@ -1019,6 +1265,7 @@ class UMPGuiApp(QMainWindow):
     def _poll_live_to_gui(self):
         self.panel1.update_live_display()
         self.panel2.update_live_display()
+        self.injection_panel.update_status()
         self.live_motor.setText(f"{int(self.node.latest_live_motor):d}")
         if not self._motor_is_fresh():
             self._motor_adopted = False

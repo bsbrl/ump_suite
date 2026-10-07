@@ -46,6 +46,21 @@ SRV_ACQ_STOP = "/acq/stop"
 SRV_ZERO = "/ump/calibrate_zero"
 SRV_ZERO2 = "/ump2/calibrate_zero"
 
+SRV_UMP_STOP = "/ump/stop"
+SRV_UMP2_STOP = "/ump2/stop"
+
+# Injection macro, run by the UMP 1 driver (see injection.py):
+#   /inject/params  <- GUI: latched JSON {token, seq, speed_um_s, step_um,
+#                      pressure_mbar, duration_ms}; the values any trigger uses
+#   /inject/start   -> std_srvs/Trigger: start one injection with those values
+#   /inject/status  -> latched JSON {count, active, stage, message, params,
+#                      params_token, params_seq, stamp}; `count` increments
+#                      once per injection that actually starts
+# /ump/stop aborts a running injection (and vents if pressure was applied).
+TOPIC_INJECT_PARAMS = "/inject/params"
+TOPIC_INJECT_STATUS = "/inject/status"
+SRV_INJECT_START = "/inject/start"
+
 TOPIC_HEKA_RESISTANCE = "/heka/resistance_mohm"      # std_msgs/Float32 computed/live
 TOPIC_HEKA_MONITOR_V = "/heka/monitor_v"            # std_msgs/Float32
 TOPIC_HEKA_MONITOR_STEP_V = "/heka/monitor_step_v"  # std_msgs/Float32
