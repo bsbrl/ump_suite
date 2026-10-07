@@ -1,11 +1,13 @@
 """
-The injection macro: move in along X, apply pressure briefly, vent, move back.
+The injection macro: move in along one axis, apply pressure briefly, vent, move back.
 
-    1. move X by `step_um` at `speed_um_s` and wait for the SDK to report arrival
+    1. move `axis` (X, Y, Z or D) by `step_um` at `speed_um_s` and wait for the
+       SDK to report arrival
     2. request `pressure_mbar` and wait for the pressure driver to acknowledge it
     3. hold for `duration_ms`, measured from that acknowledgment
     4. vent (0 mbar)
-    5. move X back to where it started, at the same speed
+    5. move that axis back to where it started, at the same speed; the other
+       three axes are never commanded to change
 
 The UMP driver runs this in a worker thread when `/inject/start` is called. The
 parameters come from the GUI on `/inject/params`, so whoever triggers an
@@ -28,14 +30,17 @@ STEP_LIMIT_UM = 2000
 PRESSURE_LIMIT_MBAR = 1000.0
 DURATION_MIN_MS, DURATION_MAX_MS = 1, 10000
 AXIS_MIN_UM, AXIS_MAX_UM = 0, 20000
+# Sensapex axis order, as in [x, y, z, d] positions and targets.
+AXES = ("X", "Y", "Z", "D")
 
 DEFAULT_SPEED_UM_S = 1000
 DEFAULT_STEP_UM = 50
 DEFAULT_PRESSURE_MBAR = 50.0
 DEFAULT_DURATION_MS = 100
+DEFAULT_AXIS = "X"
 
 VENT_MBAR = 0.0
-# A move counts as arrived within this distance of its X target. The SDK itself
+# A move counts as arrived within this distance of its target. The SDK itself
 # retries until it is within 0.4 um, and the ROS readback is whole micrometres.
 ARRIVAL_TOLERANCE_UM = 1.0
 PRESSURE_ACK_TIMEOUT_S = 0.5
@@ -49,12 +54,17 @@ class InjectionParams:
     step_um: int
     pressure_mbar: float
     duration_ms: int
+    axis: str = DEFAULT_AXIS
+
+    @property
+    def axis_index(self):
+        return AXES.index(self.axis)
 
     def to_dict(self):
         return asdict(self)
 
     def describe(self):
-        return (f"X {self.step_um:+d} um at {self.speed_um_s} um/s, "
+        return (f"{self.axis} {self.step_um:+d} um at {self.speed_um_s} um/s, "
                 f"{self.pressure_mbar:+.1f} mbar for {self.duration_ms} ms")
 
 
@@ -66,8 +76,13 @@ def _integer(raw, name):
 
 
 def validate_params(raw):
-    """Return InjectionParams from a mapping, or raise ValueError saying why not."""
+    """
+    Return InjectionParams from a mapping, or raise ValueError saying why not.
+
+    A mapping without "axis" means X, the only axis before the selector existed.
+    """
     try:
+        axis = str(raw.get("axis", DEFAULT_AXIS)).strip().upper()
         speed = _integer(raw, "speed_um_s")
         step = _integer(raw, "step_um")
         duration = _integer(raw, "duration_ms")
@@ -76,6 +91,8 @@ def validate_params(raw):
         raise ValueError(f"missing injection parameter {exc.args[0]!r}") from None
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid injection parameter: {exc}") from None
+    if axis not in AXES:
+        raise ValueError(f"axis must be one of {', '.join(AXES)}, got {raw.get('axis')!r}")
     if not SPEED_MIN_UM_S <= speed <= SPEED_MAX_UM_S:
         raise ValueError(
             f"speed {speed} um/s is outside {SPEED_MIN_UM_S}..{SPEED_MAX_UM_S}")
@@ -87,7 +104,7 @@ def validate_params(raw):
     if not DURATION_MIN_MS <= duration <= DURATION_MAX_MS:
         raise ValueError(
             f"time must be {DURATION_MIN_MS}..{DURATION_MAX_MS} ms, got {duration}")
-    return InjectionParams(speed, step, pressure, duration)
+    return InjectionParams(speed, step, pressure, duration, axis)
 
 
 def encode_params_message(params, token, seq):
@@ -107,11 +124,11 @@ def decode_params_message(text):
 
 
 def forward_target(start, params):
-    """X target of the inward move, refusing one that leaves the stage range."""
-    target = float(start[0]) + params.step_um
+    """Target of the inward move on the chosen axis; refuse leaving the stage range."""
+    target = float(start[params.axis_index]) + params.step_um
     if not AXIS_MIN_UM <= target <= AXIS_MAX_UM:
         raise ValueError(
-            f"X target {target:.1f} um is outside the stage range "
+            f"{params.axis} target {target:.1f} um is outside the stage range "
             f"{AXIS_MIN_UM}..{AXIS_MAX_UM} um")
     return target
 
@@ -160,13 +177,14 @@ class InjectionSequence:
     def run(self, start=None):
         """Run to completion; return True if every step finished as planned."""
         params = self.params
+        axis, index = params.axis, params.axis_index
         pressure_on = vented = arrived = False
         start = list(self._read_position() if start is None else start)
         inward = list(start)
-        inward[0] = forward_target(start, params)
+        inward[index] = forward_target(start, params)
         t0 = self._clock()
         try:
-            self._report("forward", True, f"moving X to {inward[0]:.1f} um")
+            self._report("forward", True, f"moving {axis} to {inward[index]:.1f} um")
             self._move(inward, "inward")
             arrived = True
             self.timings["inward_s"] = self._clock() - t0
@@ -188,7 +206,7 @@ class InjectionSequence:
             vented = True
             self.timings["held_s"] = self._clock() - acknowledged
 
-            self._report("back", True, f"moving X back to {start[0]:.1f} um")
+            self._report("back", True, f"moving {axis} back to {start[index]:.1f} um")
             back_started = self._clock()
             self._move(start, "return")
             self.timings["return_s"] = self._clock() - back_started
@@ -235,10 +253,11 @@ class InjectionSequence:
         final = getattr(move, "last_pos", None)
         if final is None:
             final = self._read_position()
-        if abs(float(final[0]) - float(position[0])) > ARRIVAL_TOLERANCE_UM:
+        axis, index = self.params.axis, self.params.axis_index
+        if abs(float(final[index]) - float(position[index])) > ARRIVAL_TOLERANCE_UM:
             raise InjectionAborted(
-                f"the {label} move stopped at X {float(final[0]):.1f} um, "
-                f"not {float(position[0]):.1f} um")
+                f"the {label} move stopped at {axis} {float(final[index]):.1f} um, "
+                f"not {float(position[index]):.1f} um")
 
     def _summary(self):
         t = self.timings

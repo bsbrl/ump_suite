@@ -224,3 +224,25 @@ def test_an_injection_stopped_after_a_finished_one_leaves_the_driver_usable(rig)
         time.sleep(0.01)
     assert stage.moves[-1] == ([5000, 6000, 7000, 8000], 1000)
     assert [value for _, value in pressure.commands] == [30.0, 0.0, 30.0, 0.0]
+
+
+def test_injection_on_the_z_axis_moves_only_z_and_logs_it_frozen(rig):
+    client, pressure, _driver, stage = rig
+    client.set_params(2, axis="Z", step_um=-150)
+    client.wait_for(lambda s: s["params_seq"] == 2 and s["params"]["axis"] == "Z")
+    time.sleep(0.3)
+    assert client.call(SRV_ACQ_START).success
+    time.sleep(0.3)
+    response = client.call(SRV_INJECT_START)
+    assert response.success and "Z -150 um" in response.message
+    done = client.wait_for(lambda s: s["stage"] in ("done", "aborted"))
+    assert done["stage"] == "done", done["message"]
+    time.sleep(0.3)
+    assert client.call(SRV_ACQ_STOP).success
+    assert stage.moves == [([5000.0, 6000.0, 6850.0, 8000.0], 1000), (START, 1000)]
+    assert stage.pos == START
+    rows = read_trial()
+    assert [int(row["Injection"]) for row in rows].count(1) == 1
+    for column, value in (("current_x", "5000"), ("current_y", "6000"),
+                          ("current_z", "7000"), ("current_d", "8000")):
+        assert {row[column] for row in rows} == {value}, column

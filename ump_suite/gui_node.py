@@ -36,6 +36,7 @@ from PyQt5.QtGui import QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
+    QButtonGroup,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -59,6 +60,8 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from .injection import (
+    AXES as INJECT_AXES,
+    DEFAULT_AXIS as DEFAULT_INJECT_AXIS,
     DEFAULT_DURATION_MS,
     DEFAULT_PRESSURE_MBAR as DEFAULT_INJECT_PRESSURE_MBAR,
     DEFAULT_SPEED_UM_S,
@@ -712,6 +715,7 @@ class InjectionPanel(QGroupBox):
         "pressure": ("injection/pressure_mbar", DEFAULT_INJECT_PRESSURE_MBAR, float),
         "duration": ("injection/duration_ms", DEFAULT_DURATION_MS, int),
     }
+    AXIS_KEY = "injection/axis"
 
     def __init__(self, app, settings):
         super().__init__("Injection")
@@ -731,12 +735,26 @@ class InjectionPanel(QGroupBox):
         self.duration = self._int_box(DURATION_MIN_MS, DURATION_MAX_MS, " ms")
         self.boxes = {"speed": self.speed, "step": self.step,
                       "pressure": self.pressure, "duration": self.duration}
+
+        # One checkable button per axis; exactly one is selected (highlighted).
+        self.axis_group = QButtonGroup(self)
+        self.axis_group.setExclusive(True)
+        self.axis_buttons = {}
+        for axis in INJECT_AXES:
+            button = QPushButton(axis)
+            button.setCheckable(True)
+            button.setProperty("kind", "axis")
+            button.setFixedSize(38, 26)
+            button.setToolTip(f"Inject along the {axis} axis")
+            self.axis_group.addButton(button)
+            self.axis_buttons[axis] = button
         self._load_settings()
 
         self.inject_button = QPushButton("Inject")
         self.inject_button.setProperty("kind", "danger")
         self.inject_button.setToolTip(
-            "Move X in by Step at Speed, hold Pressure for Time, vent, move back")
+            "Move the selected axis in by Step at Speed, hold Pressure for Time, "
+            "vent, move back")
         self.inject_button.setFixedSize(84, 62)
         self.inject_button.clicked.connect(self.inject)
         self.stop_button = QPushButton("Stop")
@@ -745,12 +763,15 @@ class InjectionPanel(QGroupBox):
         self.stop_button.clicked.connect(self.stop)
         self.state_label = QLabel("Waiting for the UMP 1 driver")
         self.state_label.setWordWrap(True)
-        self.state_label.setMinimumHeight(34)  # room for two wrapped lines
+        self.state_label.setMinimumHeight(40)  # room for two wrapped lines
         self.state_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
 
         self._build()
         for name, box in self.boxes.items():
             box.valueChanged.connect(lambda _value, n=name: self._on_value_changed(n))
+        for axis, button in self.axis_buttons.items():
+            button.toggled.connect(
+                lambda checked, a=axis: checked and self._on_axis_selected(a))
         self.publish_params()
 
     @staticmethod
@@ -775,12 +796,20 @@ class InjectionPanel(QGroupBox):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(5)
 
+        axis_row = QHBoxLayout()
+        axis_row.setSpacing(4)
+        axis_row.addWidget(QLabel("Axis"))
+        for button in self.axis_buttons.values():
+            axis_row.addWidget(button)
+        axis_row.addStretch(1)
+        layout.addLayout(axis_row)
+
         # The button with its four values beside it, one per row.
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(4)
         grid.addWidget(self.inject_button, 0, 0, 4, 1, Qt.AlignVCenter)
-        rows = (("Speed", self.speed), ("Step X", self.step),
+        rows = (("Speed", self.speed), ("Step", self.step),
                 ("Pressure", self.pressure), ("Time", self.duration))
         for row, (text, box) in enumerate(rows):
             grid.addWidget(QLabel(text), row, 1)
@@ -789,8 +818,8 @@ class InjectionPanel(QGroupBox):
         grid.setColumnStretch(4, 1)
         layout.addLayout(grid)
 
-        hint = QLabel("Step: + moves X up first, - moves it down. Pressure: '-' pulls. "
-                      "Time counts from the pressure driver's acknowledgment.")
+        hint = QLabel("Step: + moves the axis up first, - down. Pressure: '-' pulls. "
+                      "Time starts when the pressure driver acknowledges.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -808,6 +837,19 @@ class InjectionPanel(QGroupBox):
             if not math.isfinite(value) or not box.minimum() <= value <= box.maximum():
                 value = float(default)
             box.setValue(kind(round(value)) if kind is int else value)
+        axis = str(self.settings.value(self.AXIS_KEY, DEFAULT_INJECT_AXIS)).strip().upper()
+        if axis not in self.axis_buttons:
+            axis = DEFAULT_INJECT_AXIS
+        self.axis_buttons[axis].setChecked(True)
+
+    def current_axis(self):
+        checked = self.axis_group.checkedButton()
+        return checked.text() if checked is not None else DEFAULT_INJECT_AXIS
+
+    def _on_axis_selected(self, axis):
+        self.settings.setValue(self.AXIS_KEY, axis)
+        self.settings.sync()
+        self.publish_params()
 
     def _on_value_changed(self, name):
         key, _default, kind = self.SETTINGS_KEYS[name]
@@ -819,6 +861,7 @@ class InjectionPanel(QGroupBox):
     def current_params(self):
         """Return the boxes as InjectionParams; raise ValueError if they are invalid."""
         return validate_params({
+            "axis": self.current_axis(),
             "speed_um_s": self.speed.value(),
             "step_um": self.step.value(),
             "pressure_mbar": self.pressure.value(),
@@ -1478,6 +1521,16 @@ class UMPGuiApp(QMainWindow):
             }
             QPushButton[kind="secondary"] {
                 background: #ffffff;
+            }
+            QPushButton[kind="axis"] {
+                background: #ffffff;
+                padding: 2px;
+            }
+            QPushButton[kind="axis"]:checked {
+                background: #2563eb;
+                border-color: #2563eb;
+                color: #ffffff;
+                font-weight: 700;
             }
             """
         )

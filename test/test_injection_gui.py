@@ -17,7 +17,7 @@ os.environ["ROS_LOCALHOST_ONLY"] = "1"
 
 import rclpy  # noqa: E402
 from PyQt5.QtCore import QSettings  # noqa: E402
-from PyQt5.QtWidgets import QApplication, QGroupBox  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel  # noqa: E402
 from rclpy.executors import MultiThreadedExecutor  # noqa: E402
 
 from ump_suite import ump_driver_node  # noqa: E402
@@ -85,6 +85,11 @@ def test_panel_sits_between_the_ump_panels_and_the_odrive(gui):
     assert order == sorted(order) and order[2] == order[1] + 1 and order[3] == order[2] + 1
     assert window.injection_panel.title() == "Injection"
     assert window.injection_panel.inject_button.text() == "Inject"
+    panel = window.injection_panel
+    assert list(panel.axis_buttons) == ["X", "Y", "Z", "D"]
+    assert [b.text() for b in panel.axis_buttons.values() if b.isChecked()] == ["X"]
+    labels = {label.text() for label in panel.findChildren(QLabel)}
+    assert {"Axis", "Speed", "Step", "Pressure", "Time"} <= labels
 
 
 def test_typed_values_drive_the_injection_and_survive_a_restart(gui, tmp_path):
@@ -154,3 +159,42 @@ def test_inject_uses_the_boxes_even_after_another_client_published_values(gui):
     wait_until(app, window, lambda: (node.latest_inject_status or {}).get("stage") == "done")
     assert [value for _, value in pressure.commands] == [50.0, 0.0]
     assert SimUMP.stage.moves[0] == ([START[0] + 50, *START[1:]], 1000)
+
+
+def background(button):
+    """Colour just inside the button's left edge, clear of its text."""
+    image = button.grab().toImage()
+    return image.pixelColor(4, image.height() // 2).name()
+
+
+def test_axis_buttons_select_one_axis_highlight_it_and_persist(gui):
+    app, node, pressure, path = gui
+    window = UMPGuiApp(node, settings=QSettings(path, QSettings.IniFormat))
+    window.resize(1500, 1000)
+    window.show()
+    wait_until(app, window, lambda: True, timeout=0.2)
+    panel = window.injection_panel
+    buttons = panel.axis_buttons
+    unselected = background(buttons["Y"])
+    assert background(buttons["X"]) != unselected  # X starts highlighted
+
+    buttons["Y"].click()
+    wait_until(app, window, lambda: True, timeout=0.1)
+    assert [a for a, b in buttons.items() if b.isChecked()] == ["Y"]
+    assert background(buttons["Y"]) == "#2563eb"
+    assert background(buttons["X"]) == unselected
+    buttons["Y"].click()  # clicking the selected axis keeps it selected
+    assert buttons["Y"].isChecked()
+    wait_until(app, window, lambda: node.latest_inject_status["params"]["axis"] == "Y")
+
+    panel.step.setValue(30)
+    panel.inject_button.click()
+    wait_until(app, window, lambda: (node.latest_inject_status or {}).get("stage") == "done")
+    assert SimUMP.stage.moves == [([START[0], START[1] + 30, *START[2:]], 1000), (START, 1000)]
+    assert "#1 done" in panel.state_label.text()
+
+    window.close()
+    reopened = UMPGuiApp(node, settings=QSettings(path, QSettings.IniFormat))
+    assert [a for a, b in reopened.injection_panel.axis_buttons.items()
+            if b.isChecked()] == ["Y"]
+    assert reopened.injection_panel.current_params().axis == "Y"

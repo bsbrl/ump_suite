@@ -7,6 +7,7 @@ import time
 import pytest
 
 from ump_suite.injection import (
+    AXES,
     DURATION_MAX_MS,
     InjectionParams,
     InjectionSequence,
@@ -28,7 +29,7 @@ class FakeMove:
         self.last_pos = None
         self.dest = list(dest)
         if finish:
-            stage.pos[0] = dest[0] if reach else dest[0] - 5.0
+            stage.pos[:] = [float(v) if reach else float(v) - 5.0 for v in dest]
             self.last_pos = list(stage.pos)
             self.finished_event.set()
 
@@ -92,8 +93,14 @@ def params(**changes):
 
 def test_validate_accepts_signed_values_and_returns_typed_params():
     p = params(step_um=-40)
-    assert p == InjectionParams(1000, -40, -25.5, 80)
+    assert p == InjectionParams(1000, -40, -25.5, 80, "X")
     assert isinstance(p.speed_um_s, int) and isinstance(p.pressure_mbar, float)
+
+
+def test_axis_defaults_to_x_and_accepts_any_case():
+    assert params().axis == "X"  # a message from before the axis selector
+    assert params(axis="z").axis == "Z" and params(axis=" d ").axis_index == 3
+    assert "Y +40 um" in params(axis="Y").describe()
 
 
 @pytest.mark.parametrize("changes", [
@@ -101,6 +108,7 @@ def test_validate_accepts_signed_values_and_returns_typed_params():
     {"step_um": STEP_LIMIT_UM + 1}, {"pressure_mbar": 1000.5},
     {"pressure_mbar": float("nan")}, {"duration_ms": 0},
     {"duration_ms": DURATION_MAX_MS + 1}, {"step_um": 2.5}, {"speed_um_s": "fast"},
+    {"axis": "W"}, {"axis": None}, {"axis": "XY"},
 ])
 def test_validate_rejects_out_of_range_or_malformed_values(changes):
     with pytest.raises(ValueError):
@@ -115,8 +123,9 @@ def test_validate_names_a_missing_key():
 
 
 def test_params_message_round_trip_keeps_token_and_sequence():
-    text = encode_params_message(params(), "abc", 7)
-    assert decode_params_message(text) == (params(), "abc", 7)
+    text = encode_params_message(params(axis="D"), "abc", 7)
+    assert json.loads(text)["axis"] == "D"
+    assert decode_params_message(text) == (params(axis="D"), "abc", 7)
     with pytest.raises(ValueError):
         decode_params_message("not json")
     with pytest.raises(ValueError):
@@ -129,6 +138,32 @@ def test_forward_target_refuses_leaving_the_stage_range():
         forward_target([50.0, 0, 0, 0], params(step_um=-100))
     with pytest.raises(ValueError):
         forward_target([19990.0, 0, 0, 0], params(step_um=20))
+
+
+def test_forward_target_uses_the_selected_axis():
+    start = [10000.0, 200.0, 19990.0, 50.0]
+    assert forward_target(start, params(axis="Y", step_um=-100)) == 100.0
+    with pytest.raises(ValueError, match="Z target"):
+        forward_target(start, params(axis="Z", step_um=20))
+    with pytest.raises(ValueError, match="D target"):
+        forward_target(start, params(axis="D", step_um=-100))
+
+
+@pytest.mark.parametrize("axis", AXES)
+def test_sequence_moves_only_the_selected_axis_and_back(axis):
+    rig = Rig()
+    assert rig.sequence(params(axis=axis)).run() is True
+    inward = [1000.0, 2000.0, 3000.0, 4000.0]
+    inward[AXES.index(axis)] += 40.0
+    assert [call for call in rig.calls if call[0] == "move"] == [
+        ("move", inward, 1000), ("move", [1000.0, 2000.0, 3000.0, 4000.0], 1000)]
+    assert rig.reports[0][2].startswith(f"moving {axis} to")
+
+
+def test_arrival_is_checked_on_the_selected_axis():
+    rig = Rig(reach=False)
+    assert rig.sequence(params(axis="Z")).run() is False
+    assert "stopped at Z 3035.0 um, not 3040.0 um" in rig.reports[-1][2]
 
 
 def test_full_sequence_order_values_and_hold_time():

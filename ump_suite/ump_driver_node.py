@@ -11,7 +11,7 @@ Units matter for safety: a step cap of 50 is 50 um per tick, which is several
 cell diameters. Do not read these as unspecified encoder counts.
 
 The UMP 1 node also runs the injection macro (`injection.py`): `/inject/start`
-moves X in, pulses pressure, vents and moves back, using the values the GUI last
+moves the selected axis in, pulses pressure, vents and moves back, using the values the GUI last
 published on `/inject/params`. While it runs, ordinary targets are ignored, and
 `/ump/stop` or a fault aborts it, venting if pressure was applied.
 """

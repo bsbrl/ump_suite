@@ -19,7 +19,7 @@ START = [5000.0, 6000.0, 7000.0, 8000.0]
 
 
 class SimMove:
-    """A move along X at the commanded speed, like the SDK's MoveRequest."""
+    """A straight move at the commanded speed, like the SDK's MoveRequest."""
 
     def __init__(self, stage, dest, speed):
         self.finished_event = threading.Event()
@@ -30,12 +30,14 @@ class SimMove:
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
-        start, target = self._stage.pos[0], float(self._dest[0])
-        duration = abs(target - start) / self._speed
+        start = list(self._stage.pos)
+        target = [float(v) for v in self._dest]
+        duration = max(abs(t - s) for s, t in zip(start, target)) / self._speed
         t0 = time.monotonic()
         while not self.interrupted:
             fraction = 1.0 if duration == 0 else min(1.0, (time.monotonic() - t0) / duration)
-            self._stage.pos[0] = start + fraction * (target - start)
+            for axis in range(4):
+                self._stage.pos[axis] = start[axis] + fraction * (target[axis] - start[axis])
             if fraction >= 1.0:
                 self.last_pos = list(self._stage.pos)
                 self.finished_event.set()

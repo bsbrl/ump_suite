@@ -66,7 +66,7 @@ driver also constructs service names from its configured prefix.
 | `/ump/stop`, `/ump2/stop` | `std_srvs/Trigger` | service | Request SDK stop; does not latch out future publishers |
 | `/ump/calibrate_zero`, `/ump2/calibrate_zero` | `std_srvs/Trigger` | service | Calibrate zero at the current pose |
 | `/acq/start`, `/acq/stop` | `std_srvs/Trigger` | service | Begin / end a logged trial |
-| `/inject/params` | `std_msgs/String` | subscribe (UMP 1 driver) | Latched JSON `{token, seq, speed_um_s, step_um, pressure_mbar, duration_ms}`, published by the GUI whenever its Injection boxes change |
+| `/inject/params` | `std_msgs/String` | subscribe (UMP 1 driver) | Latched JSON `{token, seq, axis, speed_um_s, step_um, pressure_mbar, duration_ms}`, published by the GUI whenever its Injection axis or boxes change; `axis` is `X`, `Y`, `Z` or `D`, and a message without it means `X` |
 | `/inject/start` | `std_srvs/Trigger` | service (UMP 1 driver) | Run one injection with the current `/inject/params`; refused with a reason if it cannot start |
 | `/inject/status` | `std_msgs/String` | publish (UMP 1 driver) | Latched JSON `{count, active, stage, message, params, params_token, params_seq, stamp}`; `count` rises once per injection that starts |
 
@@ -90,14 +90,14 @@ measurement that physical motion has ceased.
 [injection.py](ump_suite/injection.py) in a worker thread, with the values last
 received on `/inject/params`:
 
-1. move X by `step_um` (positive = increasing X) at `speed_um_s`, and wait for the SDK to report arrival within 1 µm;
+1. move the selected `axis` by `step_um` (positive = increasing that axis) at `speed_um_s`, and wait for the SDK to report arrival within 1 µm; the other three axes are not commanded to change;
 2. request `pressure_mbar` on `/pressure/mbar` and wait up to 0.5 s for `/pressure/target_mbar` to acknowledge it;
 3. hold for `duration_ms`, counted from that acknowledgment;
 4. vent (`0` mbar);
-5. move X back to where it started, at the same speed.
+5. move that axis back to where it started, at the same speed.
 
 It is refused while another injection runs, while the stage is still moving,
-after a latched fault, when the X target would leave 0–20000 µm, or (for a
+after a latched fault, when the axis target would leave 0–20000 µm, or (for a
 nonzero pressure) unless `/pressure/status` reported ready in the last 3 s.
 While it runs, ordinary `/ump/target` commands are ignored. `/ump/stop` aborts
 it: the stage stops, the pressure vents if it was applied, and the needle stays
@@ -350,13 +350,15 @@ Underneath, **SDK target** shows `/pressure/target_mbar` and **Measured** shows 
 
 To change which presets appear, edit the `PRESSURE_PRESETS_MBAR` tuple near the top of [gui_node.py](ump_suite/gui_node.py) — the buttons and their layout are generated from it, so adding or removing entries is all that is needed.
 
-The **Injection** panel, between UMP 2 and the ODrive, has an **Inject** button
-with four boxes beside it: **Speed** (µm/s), **Step X** (µm; `-` moves X down
-first), **Pressure** (mbar; `-` pulls) and **Time** (ms). The boxes publish
+The **Injection** panel, between UMP 2 and the ODrive, has a row of **X Y Z D**
+axis buttons (the selected one is highlighted blue; exactly one is always
+selected) and an **Inject** button with four boxes beside it: **Speed** (µm/s),
+**Step** (µm; `-` moves the axis down first), **Pressure** (mbar; `-` pulls) and
+**Time** (ms). The injection runs on the selected axis. The boxes publish
 `/inject/params` whenever they change, and Inject calls `/inject/start` once the
 driver has echoed those values back. **Stop** calls `/ump/stop`. The line
-underneath shows the driver's progress and timings. The boxes are saved in
-`~/.config/ump_suite/gui.ini` and restored on the next start.
+underneath shows the driver's progress and timings. The axis and boxes are saved
+in `~/.config/ump_suite/gui.ini` and restored on the next start.
 
 The panel is **mouse-only** — there are deliberately no keyboard shortcuts, so keystrokes always go to the widget you are editing.
 

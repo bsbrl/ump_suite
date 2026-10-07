@@ -50,8 +50,9 @@ SRV_UMP_STOP = "/ump/stop"
 SRV_UMP2_STOP = "/ump2/stop"
 
 # Injection macro, run by the UMP 1 driver (see injection.py):
-#   /inject/params  <- GUI: latched JSON {token, seq, speed_um_s, step_um,
-#                      pressure_mbar, duration_ms}; the values any trigger uses
+#   /inject/params  <- GUI: latched JSON {token, seq, axis, speed_um_s, step_um,
+#                      pressure_mbar, duration_ms}; the values any trigger uses.
+#                      axis is X, Y, Z or D; a message without it means X
 #   /inject/start   -> std_srvs/Trigger: start one injection with those values
 #   /inject/status  -> latched JSON {count, active, stage, message, params,
 #                      params_token, params_seq, stamp}; `count` increments
