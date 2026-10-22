@@ -153,11 +153,16 @@ def test_injection_runs_the_sequence_and_logs_one_frozen_command(rig):
     assert ("back", True) in stages and stages[-1] == ("done", False)
 
     rows = read_trial()
-    assert list(rows[0].keys()) == CSV_HEADER and CSV_HEADER[-1] == "Injection"
+    assert list(rows[0].keys()) == CSV_HEADER
+    assert CSV_HEADER[-3:] == ["Injection", "injection_axis", "injection_step_um"]
     flags = [int(row["Injection"]) for row in rows]
     assert flags.count(1) == 1, flags
     first = flags.index(1)
     assert first > 2 and len(rows) - first > 10
+    # The flagged row names the values the injection ran with; no other row does.
+    assert (rows[first]["injection_axis"], rows[first]["injection_step_um"]) == ("X", "200")
+    assert {(r["injection_axis"], r["injection_step_um"])
+            for i, r in enumerate(rows) if i != first} == {("", "")}
     # Positions and commands never show the injection moves or pulse.
     assert {row["current_x"] for row in rows} == {"5000"}
     assert {(row["target_x"], row["target_y"], row["target_z"], row["target_d"])
@@ -243,6 +248,26 @@ def test_injection_on_the_z_axis_moves_only_z_and_logs_it_frozen(rig):
     assert stage.pos == START
     rows = read_trial()
     assert [int(row["Injection"]) for row in rows].count(1) == 1
+    flagged = next(row for row in rows if row["Injection"] == "1")
+    assert (flagged["injection_axis"], flagged["injection_step_um"]) == ("Z", "-150")
     for column, value in (("current_x", "5000"), ("current_y", "6000"),
                           ("current_z", "7000"), ("current_d", "8000")):
         assert {row[column] for row in rows} == {value}, column
+
+
+def test_status_keeps_the_running_values_when_new_ones_arrive(rig):
+    client, _pressure, _driver, stage = rig
+    client.wait_for(lambda s: s["params_seq"] == 1)
+    assert client.statuses[-1]["injection_params"] is None  # nothing has run yet
+    client.set_params(2, step_um=120, duration_ms=1500)
+    client.wait_for(lambda s: s["params_seq"] == 2)
+    assert client.call(SRV_INJECT_START).success
+    client.wait_for(lambda s: s["stage"] == "pressure")
+    # Another client publishes different values mid-injection.
+    client.set_params(3, step_um=80, duration_ms=300)
+    mid = client.wait_for(lambda s: s["params_seq"] == 3)
+    assert mid["params"]["step_um"] == 80
+    assert mid["injection_params"]["step_um"] == 120 and mid["active"]
+    done = client.wait_for(lambda s: s["stage"] == "done")
+    assert done["injection_params"]["step_um"] == 120 and done["count"] == 1
+    assert stage.moves[0][0][0] == 5120.0

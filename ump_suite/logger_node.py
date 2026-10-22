@@ -11,7 +11,8 @@ When acquisition is running, this node periodically writes one CSV row per
   * wall-clock, camera and state timestamps, so a late tick or a stalled camera
     is detectable after the fact rather than silently producing a well-formed
     row whose image does not match its position
-  * an `Injection` flag: 1 on the first row after an injection starts, else 0
+  * an `Injection` flag: 1 on the first row after an injection starts, else 0,
+    and on that row the axis and step (um) the injection actually ran with
 
 While an injection runs (see injection.py), the position, target, pressure
 command and state-stamp columns keep the values they had just before it
@@ -79,6 +80,10 @@ CSV_HEADER = [
     "target_valid", "target_valid2", "state_valid", "state_valid2",
     # 1 on the first row written after an injection started, else 0.
     "Injection",
+    # On that row only: the axis (X, Y, Z or D) and signed step in um the
+    # injection ran with, as the driver reported them; blank on other rows.
+    "injection_axis",
+    "injection_step_um",
 ]
 
 
@@ -121,6 +126,7 @@ class LoggerNode(Node):
         self._injection_count = None
         self._injection_snapshot = None
         self._injection_pending = False
+        self._injection_pending_values = ("", "")
 
         self.acquiring = False
         self.trial_name = None
@@ -250,10 +256,26 @@ class LoggerNode(Node):
             count, self._injection_count)
         if started and self.acquiring:
             self._injection_pending = True
+            self._injection_pending_values = self._injection_values(status)
         if active and self._injection_snapshot is None:
             self._injection_snapshot = self._logged_state()
         elif not active:
             self._injection_snapshot = None
+
+    @staticmethod
+    def _injection_values(status):
+        """(axis, step_um) of the injection a status describes, blank if unknown."""
+        params = status.get("injection_params")
+        if not isinstance(params, dict):
+            return "", ""
+        axis = str(params.get("axis", "")).strip().upper()
+        try:
+            step = float(params.get("step_um"))
+        except (TypeError, ValueError):
+            return "", ""
+        if axis not in ("X", "Y", "Z", "D") or not math.isfinite(step) or step != int(step):
+            return "", ""
+        return axis, int(step)
 
     # ── Trial setup ────────────────────────────────────────────────────────
     @staticmethod
@@ -461,6 +483,8 @@ class LoggerNode(Node):
         target_ump, target_ump2 = state["target_ump"], state["target_ump2"]
         state_stamp = state["state_stamp"]
         injection = int(self._injection_pending)
+        injection_axis, injection_step = (
+            self._injection_pending_values if injection else ("", ""))
 
         cx,  cy,  cz,  cd = _xyzd(live_ump)
         cx2, cy2, cz2, cd2 = _xyzd(live_ump2)
@@ -516,6 +540,8 @@ class LoggerNode(Node):
             int(live_ump is not None and len(live_ump) >= 4),
             int(live_ump2 is not None and len(live_ump2) >= 4),
             injection,
+            injection_axis,
+            injection_step,
         ]
         try:
             if len(row) != len(CSV_HEADER):
@@ -530,6 +556,7 @@ class LoggerNode(Node):
             return
         if injection:
             self._injection_pending = False
+            self._injection_pending_values = ("", "")
         if self._first_row_time is None:
             self._first_row_time = wall_time
         self._last_row_time = wall_time

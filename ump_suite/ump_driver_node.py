@@ -87,6 +87,9 @@ class UMPDriverNode(Node):
         self._inject_params = None
         self._inject_params_error = "no parameters received on " + TOPIC_INJECT_PARAMS
         self._inject_token = self._inject_seq = None
+        # Values of the injection numbered `_inject_count` (the running or last
+        # one). The latched parameters can change while it runs; these cannot.
+        self._running_params = None
         self._pressure_ack = threading.Condition()
         self._pressure_ack_value = None
         self._pressure_ack_stamp = float("-inf")
@@ -123,14 +126,18 @@ class UMPDriverNode(Node):
             # sample taken while the stage was still moving.
             self.poll_live()
         params = self._inject_params
+        running = self._running_params
         self.pub_inject_status.publish(String(data=json.dumps({
             "count": self._inject_count,
             "active": bool(active),
             "stage": stage,
             "message": message,
+            # The values the next trigger will use.
             "params": None if params is None else params.to_dict(),
             "params_token": self._inject_token,
             "params_seq": self._inject_seq,
+            # The values injection number `count` actually ran with.
+            "injection_params": None if running is None else running.to_dict(),
             "stamp": time.time(),
         })))
 
@@ -214,6 +221,7 @@ class UMPDriverNode(Node):
                 return self._refuse_injection(res, f"could not read the stage: {exc}")
             self._inject_abort.clear()
             self._injecting = True
+            self._running_params = params
             self._inject_count += 1
             count = self._inject_count
             sequence = InjectionSequence(
