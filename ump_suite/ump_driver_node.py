@@ -14,6 +14,11 @@ The UMP 1 node also runs the injection macro (`injection.py`): `/inject/start`
 moves the selected axis in, pulses pressure, vents and moves back, using the values the GUI last
 published on `/inject/params`. While it runs, ordinary targets are ignored, and
 `/ump/stop` or a fault aborts it, venting if pressure was applied.
+
+It also runs the orient skill (`orient.py`): `/orient/start` turns the embryo the
+needle points at until its cell faces the needle, using the vision node's
+`/vision/scene` and the camera calibration. The two macros never run together;
+ordinary targets are ignored and `/ump/stop` aborts it, as for an injection.
 """
 
 import json
@@ -34,10 +39,16 @@ from .injection import (
     decode_params_message,
     forward_target,
 )
+from .orient import OrientParams, OrientSequence
+from .orient import decode_params_message as decode_orient_params
 from .ros_interfaces import (
     SRV_INJECT_START,
+    SRV_ORIENT_START,
     TOPIC_INJECT_PARAMS,
     TOPIC_INJECT_STATUS,
+    TOPIC_ORIENT_PARAMS,
+    TOPIC_ORIENT_STATUS,
+    TOPIC_VISION_SCENE,
     TOPIC_PRESSURE_MBAR,
     TOPIC_PRESSURE_STATUS,
     TOPIC_PRESSURE_TARGET,
@@ -95,8 +106,18 @@ class UMPDriverNode(Node):
         self._pressure_ack_stamp = float("-inf")
         self._pressure_ready = False
         self._pressure_status_stamp = float("-inf")
+        self._orienting = False
+        self._orient_abort = threading.Event()
+        self._orient_thread = None
+        self._orient_count = 0
+        self._orient_params = OrientParams()
+        self._orient_token = self._orient_seq = None
+        self._orient_last = {}
+        self._scene = None
+        self._scene_cond = threading.Condition()
         if bool(self.get_parameter("injection_enabled").value):
             self._setup_injection()
+            self._setup_orient()
 
         self.timer = self.create_timer(poll_ms / 1000.0, self.poll_live)
 
@@ -200,6 +221,8 @@ class UMPDriverNode(Node):
         with self._inject_lock:
             if self._injecting:
                 return self._refuse_injection(res, "an injection is already running")
+            if self._orienting:
+                return self._refuse_injection(res, "the orient skill is running")
             if self._faulted:
                 return self._refuse_injection(res, "UMP fault latched; restart the driver")
             params = self._inject_params
@@ -263,6 +286,136 @@ class UMPDriverNode(Node):
         else:
             self.get_logger().warn(f"Injection #{count} aborted")
 
+    # ── Orient skill ───────────────────────────────────────────────────────
+    def _setup_orient(self):
+        self.pub_orient_status = self.create_publisher(
+            String, TOPIC_ORIENT_STATUS, latched_qos(depth=10))
+        self.create_subscription(
+            String, TOPIC_ORIENT_PARAMS, self._on_orient_params, latched_qos())
+        self.create_subscription(String, TOPIC_VISION_SCENE, self._on_scene, 5)
+        self.srv_orient = self.create_service(Trigger, SRV_ORIENT_START, self._on_orient)
+        self._publish_orient_status("idle", False, "ready")
+
+    def _publish_orient_status(self, stage, active, message, info=None):
+        if stage in ("done", "aborted"):
+            self.poll_live()
+        if info:
+            self._orient_last = dict(info)
+        self.pub_orient_status.publish(String(data=json.dumps({
+            "count": self._orient_count,
+            "active": bool(active),
+            "stage": stage,
+            "message": message,
+            **{k: self._orient_last.get(k) for k in
+               ("result", "strokes", "angle_deg", "gain_deg_per_um", "history")},
+            "params": self._orient_params.to_dict(),
+            "params_token": self._orient_token,
+            "params_seq": self._orient_seq,
+            "stamp": time.time(),
+        })))
+
+    def _on_orient_params(self, msg: String):
+        try:
+            params, token, seq = decode_orient_params(msg.data)
+        except ValueError as exc:
+            self.get_logger().warn(f"Orient parameters rejected: {exc}")
+            self._publish_orient_status(
+                "running" if self._orienting else "idle", self._orienting,
+                f"parameters rejected: {exc}")
+            return
+        self._orient_params, self._orient_token, self._orient_seq = params, token, seq
+        self._publish_orient_status(
+            "running" if self._orienting else "idle", self._orienting, "parameters updated")
+
+    def _on_scene(self, msg: String):
+        try:
+            scene = json.loads(msg.data)
+        except ValueError:
+            return
+        with self._scene_cond:
+            self._scene = scene
+            self._scene_cond.notify_all()
+
+    def _get_scene(self, after, timeout):
+        """Return the first scene whose image was taken after wall time `after`, else None."""
+        deadline = time.monotonic() + timeout
+        with self._scene_cond:
+            while True:
+                scene = self._scene
+                if scene is not None and float(scene.get("stamp") or 0.0) > after:
+                    return scene
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._scene_cond.wait(remaining)
+
+    def _refuse_orient(self, res, reason):
+        res.success = False
+        res.message = f"Orient refused: {reason}"
+        self.get_logger().warn(res.message)
+        return res
+
+    def _on_orient(self, _req, res):
+        from .vision import calibration
+
+        with self._inject_lock:
+            if self._orienting:
+                return self._refuse_orient(res, "the orient skill is already running")
+            if self._injecting:
+                return self._refuse_orient(res, "an injection is running")
+            if self._faulted:
+                return self._refuse_orient(res, "UMP fault latched; restart the driver")
+            try:
+                cal = calibration.load()
+            except Exception as exc:
+                return self._refuse_orient(res, f"could not read the camera calibration: {exc}")
+            if cal is None:
+                return self._refuse_orient(
+                    res, f"no camera calibration at {calibration.DEFAULT_PATH}")
+            try:
+                if self.stage.is_busy():
+                    return self._refuse_orient(res, "the stage is still moving")
+            except Exception as exc:
+                return self._refuse_orient(res, f"could not read the stage: {exc}")
+            self._orient_abort.clear()
+            self._orienting = True
+            self._orient_count += 1
+            count = self._orient_count
+            self._orient_last = {}
+            sequence = OrientSequence(
+                self._orient_params, cal,
+                read_position=lambda: [float(v) for v in self.stage.get_pos()[:4]],
+                move_to=lambda pos, speed: self.stage.goto_pos(pos, speed=speed),
+                stop_stage=self.stage.stop,
+                get_scene=self._get_scene,
+                report=self._publish_orient_status,
+                abort_event=self._orient_abort,
+            )
+            self._publish_orient_status("starting", True, f"orient #{count} starting")
+            self._orient_thread = threading.Thread(
+                target=self._run_orient, args=(sequence, count), name=f"orient-{count}",
+                daemon=True)
+            self._orient_thread.start()
+        res.success = True
+        res.message = f"Orient #{count} started"
+        self.get_logger().info(res.message)
+        return res
+
+    def _run_orient(self, sequence, count):
+        try:
+            result = sequence.run()
+        except Exception as exc:
+            self._faulted = True
+            self.get_logger().error(f"Orient #{count} failed; stopping and latching fault: {exc}")
+            return
+        finally:
+            with self._inject_lock:
+                self._orienting = False
+        if result["result"] == "aborted":
+            self.get_logger().warn(f"Orient #{count} aborted: {result['message']}")
+        else:
+            self.get_logger().info(f"Orient #{count}: {result['message']}")
+
     def _abort_injection(self):
         """Ask a running injection to stop; it vents if pressure was applied."""
         self._inject_abort.set()
@@ -296,6 +449,9 @@ class UMPDriverNode(Node):
         if self._injecting:
             self.get_logger().warn("Target ignored: an injection is running")
             return
+        if self._orienting:
+            self.get_logger().warn("Target ignored: the orient skill is running")
+            return
         if len(msg.data) < 5:
             self.get_logger().warn("UMP target msg requires [x,y,z,d,speed]")
             return
@@ -311,6 +467,7 @@ class UMPDriverNode(Node):
 
     def _stop_stage(self):
         self._abort_injection()
+        self._orient_abort.set()
         try:
             self.stage.stop()
             return True, "SDK acknowledged stop"
@@ -324,9 +481,9 @@ class UMPDriverNode(Node):
 
     def destroy_node(self):
         self._stop_stage()
-        thread = self._inject_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+        for thread in (self._inject_thread, self._orient_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=2.0)
         super().destroy_node()
 
     def on_zero(self, _req, res):

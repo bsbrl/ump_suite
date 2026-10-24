@@ -61,6 +61,27 @@ SRV_UMP2_STOP = "/ump2/stop"
 TOPIC_INJECT_PARAMS = "/inject/params"
 TOPIC_INJECT_STATUS = "/inject/status"
 SRV_INJECT_START = "/inject/start"
+# The operator's verdict on the last injection, from the GUI:
+#   JSON {count, outcome} with outcome one of INJECTION_OUTCOMES
+TOPIC_INJECT_OUTCOME = "/inject/outcome"
+INJECTION_OUTCOMES = ("cell", "yolk", "chorion_space", "no_puncture")
+
+# Orient skill, run by the UMP 1 driver (see orient.py): turns the embryo the
+# needle points at until its cell faces the needle.
+#   /orient/params  <- GUI: latched JSON of OrientParams fields (+ token, seq)
+#   /orient/start   -> std_srvs/Trigger
+#   /orient/status  -> latched JSON {count, active, stage, message, result,
+#                      strokes, angle_deg, gain_deg_per_um, history, params, stamp}
+# /ump/stop aborts a running orient.
+TOPIC_ORIENT_PARAMS = "/orient/params"
+TOPIC_ORIENT_STATUS = "/orient/status"
+SRV_ORIENT_START = "/orient/start"
+
+# Vision node (vision_node.py): the scene from the segmentation model.
+#   /vision/scene   -> JSON scene (vision/geometry.py) for each processed frame
+#   /vision/status  -> latched JSON {ready, model, message, fps, inference_ms, stamp}
+TOPIC_VISION_SCENE = "/vision/scene"
+TOPIC_VISION_STATUS = "/vision/status"
 
 TOPIC_HEKA_RESISTANCE = "/heka/resistance_mohm"      # std_msgs/Float32 computed/live
 TOPIC_HEKA_MONITOR_V = "/heka/monitor_v"            # std_msgs/Float32

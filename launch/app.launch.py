@@ -114,6 +114,21 @@ def generate_launch_description():
 
         gui,
 
+        # Segmentation of the camera feed for the orient skill and MicroVLA's
+        # vision step. Without a model file it stays idle and says so on
+        # /vision/status; the rest of the rig is unaffected.
+        Node(
+            package="ump_suite",
+            executable="vision_node",
+            output="screen",
+            parameters=[{
+                "max_hz": 10.0,
+                "conf": 0.35,
+                "imgsz": 1024,
+                "device": "0",
+            }],
+        ),
+
         Node(
             package="ump_suite",
             executable="heka_udp_receiver_node",

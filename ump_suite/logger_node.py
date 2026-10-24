@@ -13,11 +13,18 @@ When acquisition is running, this node periodically writes one CSV row per
     row whose image does not match its position
   * an `Injection` flag: 1 on the first row after an injection starts, else 0,
     and on that row the axis and step (um) the injection actually ran with
+  * an `Orient` flag: 1 on the first row after the orient skill starts, and
+    `orient_result` (done / already_oriented / aborted) on the first row after
+    it ends
+  * `injection_outcome`: the operator's verdict on the last injection (cell,
+    yolk, chorion_space or no_puncture) on the row after it was recorded
 
-While an injection runs (see injection.py), the position, target, pressure
-command and state-stamp columns keep the values they had just before it
-started. The injection is logged as one command, not as the moves and pressure
-pulse inside it. Images, resistance and measured pressure stay live.
+While an injection or the orient skill runs (see injection.py, orient.py), the
+position, target, pressure command and state-stamp columns keep the values they
+had just before it started. Each is logged as one command, not as the moves
+inside it. Images, resistance and measured pressure stay live. The orient skill
+leaves the needle somewhere new, so the first row after it shows a jump in
+position; `orient_result` marks that row.
 
 It also forwards a record path to the camera node so that the matching mp4
 video file is captured for the same trial.
@@ -44,7 +51,10 @@ from .ros_interfaces import (
     TOPIC_CAM_IMAGE_COMPRESSED,
     TOPIC_CAM_REC_CMD,
     TOPIC_HEKA_RESISTANCE,
+    INJECTION_OUTCOMES,
+    TOPIC_INJECT_OUTCOME,
     TOPIC_INJECT_STATUS,
+    TOPIC_ORIENT_STATUS,
     TOPIC_PRESSURE_MEASURED,
     TOPIC_PRESSURE_STATUS,
     TOPIC_PRESSURE_TARGET,
@@ -84,6 +94,13 @@ CSV_HEADER = [
     # injection ran with, as the driver reported them; blank on other rows.
     "injection_axis",
     "injection_step_um",
+    # 1 on the first row written after the orient skill started, else 0.
+    "Orient",
+    # On the first row after it finished: done, already_oriented or aborted.
+    "orient_result",
+    # The operator's verdict on the last injection, on the row after it was
+    # recorded: cell, yolk, chorion_space or no_puncture.
+    "injection_outcome",
 ]
 
 
@@ -127,6 +144,13 @@ class LoggerNode(Node):
         self._injection_snapshot = None
         self._injection_pending = False
         self._injection_pending_values = ("", "")
+        # Orient bookkeeping, as for injections.
+        self._orient_count = None
+        self._orient_active = False
+        self._orient_snapshot = None
+        self._orient_pending = False
+        self._orient_result_pending = ""
+        self._outcome_pending = ""
 
         self.acquiring = False
         self.trial_name = None
@@ -168,6 +192,10 @@ class LoggerNode(Node):
         self.create_subscription(
             String, TOPIC_INJECT_STATUS, self.on_inject_status, latched_qos(depth=10)
         )
+        self.create_subscription(
+            String, TOPIC_ORIENT_STATUS, self.on_orient_status, latched_qos(depth=10)
+        )
+        self.create_subscription(String, TOPIC_INJECT_OUTCOME, self.on_inject_outcome, 10)
 
         self.pub_rec_cmd = self.create_publisher(String, TOPIC_CAM_REC_CMD, 10)
 
@@ -262,6 +290,42 @@ class LoggerNode(Node):
         elif not active:
             self._injection_snapshot = None
 
+    def on_orient_status(self, msg: String):
+        """Freeze the logged state while the orient skill runs; flag its start and result."""
+        try:
+            status = json.loads(msg.data)
+            count = int(status["count"])
+            active = status["active"]
+        except (TypeError, ValueError, KeyError):
+            return
+        if not isinstance(active, bool):
+            return
+        if self._orient_count is None:
+            started = active
+        else:
+            started = count > self._orient_count
+        self._orient_count = (
+            count if self._orient_count is None else max(count, self._orient_count))
+        if started and self.acquiring:
+            self._orient_pending = True
+        if active and self._orient_snapshot is None:
+            self._orient_snapshot = self._logged_state()
+            self._orient_active = True
+        elif not active and self._orient_active:
+            self._orient_snapshot = None
+            self._orient_active = False
+            result = str(status.get("result") or status.get("stage") or "")
+            if self.acquiring and result:
+                self._orient_result_pending = result
+
+    def on_inject_outcome(self, msg: String):
+        try:
+            outcome = str(json.loads(msg.data)["outcome"])
+        except (TypeError, ValueError, KeyError):
+            return
+        if outcome in INJECTION_OUTCOMES and self.acquiring:
+            self._outcome_pending = outcome
+
     @staticmethod
     def _injection_values(status):
         """(axis, step_um) of the injection a status describes, blank if unknown."""
@@ -343,6 +407,8 @@ class LoggerNode(Node):
 
         try:
             self._injection_pending = False
+            self._orient_pending = False
+            self._orient_result_pending = self._outcome_pending = ""
             self._setup_trial()
             self._open_csv()
             self.pub_rec_cmd.publish(String(data=self.video_path))
@@ -367,6 +433,8 @@ class LoggerNode(Node):
 
         self.acquiring = False
         self._injection_pending = False
+        self._orient_pending = False
+        self._orient_result_pending = self._outcome_pending = ""
         self._stop_recording()
         self._report_achieved_rate()
         error = self._close_csv()
@@ -478,7 +546,7 @@ class LoggerNode(Node):
             return
 
         # During an injection these hold their pre-injection values.
-        state = self._injection_snapshot or self._logged_state()
+        state = self._injection_snapshot or self._orient_snapshot or self._logged_state()
         live_ump, live_ump2 = state["live_ump"], state["live_ump2"]
         target_ump, target_ump2 = state["target_ump"], state["target_ump2"]
         state_stamp = state["state_stamp"]
@@ -542,6 +610,9 @@ class LoggerNode(Node):
             injection,
             injection_axis,
             injection_step,
+            int(self._orient_pending),
+            self._orient_result_pending,
+            self._outcome_pending,
         ]
         try:
             if len(row) != len(CSV_HEADER):
@@ -557,6 +628,8 @@ class LoggerNode(Node):
         if injection:
             self._injection_pending = False
             self._injection_pending_values = ("", "")
+        self._orient_pending = False
+        self._orient_result_pending = self._outcome_pending = ""
         if self._first_row_time is None:
             self._first_row_time = wall_time
         self._last_row_time = wall_time

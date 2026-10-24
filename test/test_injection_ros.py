@@ -154,7 +154,8 @@ def test_injection_runs_the_sequence_and_logs_one_frozen_command(rig):
 
     rows = read_trial()
     assert list(rows[0].keys()) == CSV_HEADER
-    assert CSV_HEADER[-3:] == ["Injection", "injection_axis", "injection_step_um"]
+    assert CSV_HEADER[-6:] == ["Injection", "injection_axis", "injection_step_um",
+                               "Orient", "orient_result", "injection_outcome"]
     flags = [int(row["Injection"]) for row in rows]
     assert flags.count(1) == 1, flags
     first = flags.index(1)

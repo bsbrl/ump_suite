@@ -35,6 +35,8 @@ setup(
             'pressure_node = ump_suite.pressure_node:main',
             'logger_node = ump_suite.logger_node:main',
             'heka_udp_receiver_node = ump_suite.heka_udp_receiver_node:main',
+            'vision_node = ump_suite.vision_node:main',
+            'calibrate_camera = ump_suite.calibrate_camera:main',
         ],
     },
 )

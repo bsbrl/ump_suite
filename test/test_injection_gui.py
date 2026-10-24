@@ -81,8 +81,9 @@ def test_panel_sits_between_the_ump_panels_and_the_odrive(gui):
     layout = window.injection_panel.parentWidget().layout()
     motor = next(g for g in window.findChildren(QGroupBox) if g.title() == "Motor (ODrive)")
     order = [layout.indexOf(w) for w in (window.panel1, window.panel2,
-                                         window.injection_panel, motor)]
-    assert order == sorted(order) and order[2] == order[1] + 1 and order[3] == order[2] + 1
+                                         window.injection_panel, window.orient_panel, motor)]
+    assert order == sorted(order) and order[2] == order[1] + 1 and order[4] == order[3] + 1
+    assert order[3] == order[2] + 1
     assert window.injection_panel.title() == "Injection"
     assert window.injection_panel.inject_button.text() == "Inject"
     panel = window.injection_panel

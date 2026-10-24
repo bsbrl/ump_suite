@@ -37,6 +37,8 @@ from PyQt5.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QButtonGroup,
+    QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -75,10 +77,22 @@ from .injection import (
     encode_params_message,
     validate_params,
 )
+from .orient import (
+    OrientParams,
+    encode_params_message as encode_orient_params,
+    validate_params as validate_orient_params,
+)
 from .ros_interfaces import (
+    INJECTION_OUTCOMES,
     SRV_ACQ_START,
     SRV_ACQ_STOP,
     SRV_INJECT_START,
+    SRV_ORIENT_START,
+    TOPIC_INJECT_OUTCOME,
+    TOPIC_ORIENT_PARAMS,
+    TOPIC_ORIENT_STATUS,
+    TOPIC_VISION_SCENE,
+    TOPIC_VISION_STATUS,
     SRV_UMP_STOP,
     SRV_ZERO,
     SRV_ZERO2,
@@ -210,6 +224,24 @@ class GuiNode(Node):
         self.cli_inject = self.create_client(Trigger, SRV_INJECT_START)
         self.cli_ump_stop = self.create_client(Trigger, SRV_UMP_STOP)
         self.latest_inject_status = None
+        self.pub_inject_outcome = self.create_publisher(String, TOPIC_INJECT_OUTCOME, 10)
+
+        # Orient skill (UMP 1 driver) and the vision node's scene.
+        self.pub_orient_params = self.create_publisher(
+            String, TOPIC_ORIENT_PARAMS, latched_qos()
+        )
+        self.create_subscription(
+            String, TOPIC_ORIENT_STATUS, self._on_orient_status, latched_qos(depth=10)
+        )
+        self.cli_orient = self.create_client(Trigger, SRV_ORIENT_START)
+        self.latest_orient_status = None
+        self.create_subscription(String, TOPIC_VISION_SCENE, self._on_vision_scene, 2)
+        self.create_subscription(
+            String, TOPIC_VISION_STATUS, self._on_vision_status, latched_qos()
+        )
+        self.latest_scene = None
+        self.latest_scene_stamp = 0.0
+        self.latest_vision_status = None
 
         self.latest_live_ump = [0, 0, 0, 0]
         self.latest_live_ump2 = [0, 0, 0, 0]
@@ -247,6 +279,31 @@ class GuiNode(Node):
             return
         self.latest_pressure_status = status
         self.latest_pressure_status_stamp = time.monotonic()
+
+    def _on_orient_status(self, msg: String):
+        try:
+            status = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if isinstance(status, dict) and isinstance(status.get('active'), bool):
+            self.latest_orient_status = status
+
+    def _on_vision_scene(self, msg: String):
+        try:
+            scene = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if isinstance(scene, dict):
+            self.latest_scene = scene
+            self.latest_scene_stamp = time.monotonic()
+
+    def _on_vision_status(self, msg: String):
+        try:
+            status = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if isinstance(status, dict):
+            self.latest_vision_status = status
 
     def _on_inject_status(self, msg: String):
         try:
@@ -765,6 +822,16 @@ class InjectionPanel(QGroupBox):
         self.state_label.setWordWrap(True)
         self.state_label.setMinimumHeight(40)  # room for two wrapped lines
         self.state_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        # The operator's verdict on the last injection, logged with the trial.
+        self.outcome = QComboBox()
+        for name in INJECTION_OUTCOMES:
+            self.outcome.addItem(name.replace("_", " "), name)
+        self.outcome.setFixedHeight(28)
+        self.outcome_button = QPushButton("Record outcome")
+        self.outcome_button.setProperty("kind", "secondary")
+        self.outcome_button.setToolTip(
+            "Log where the last injection went (written into the trial's CSV)")
+        self.outcome_button.clicked.connect(self.record_outcome)
 
         self._build()
         for name, box in self.boxes.items():
@@ -824,6 +891,23 @@ class InjectionPanel(QGroupBox):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         layout.addWidget(self.state_label)
+        outcome_row = QHBoxLayout()
+        outcome_row.setSpacing(6)
+        outcome_row.addWidget(QLabel("Went into"))
+        outcome_row.addWidget(self.outcome, 1)
+        outcome_row.addWidget(self.outcome_button)
+        layout.addLayout(outcome_row)
+
+    def record_outcome(self):
+        status = self.app.node.latest_inject_status or {}
+        count = int(status.get("count") or 0)
+        if count == 0:
+            self.app.set_status("No injection to record an outcome for yet")
+            return
+        outcome = self.outcome.currentData()
+        self.app.node.pub_inject_outcome.publish(
+            String(data=json.dumps({"count": count, "outcome": outcome})))
+        self.app.set_status(f"Injection #{count}: recorded '{outcome}'")
 
     # ── Settings ───────────────────────────────────────────────────────────
     def _load_settings(self):
@@ -933,6 +1017,223 @@ class InjectionPanel(QGroupBox):
         self.state_label.setText(text)
 
 
+def draw_scene(frame, scene):
+    """Draw a vision scene (vision/geometry.py) onto a BGR frame of the same size."""
+    target = scene.get("target")
+    for i, e in enumerate(scene.get("embryos", [])):
+        ch = e["chorion"]
+        thick = 4 if i == target else 2
+        cv2.circle(frame, (int(ch["cx"]), int(ch["cy"])), int(ch["r"]), (200, 120, 0), thick)
+        if e.get("yolk"):
+            y = e["yolk"]
+            cv2.circle(frame, (int(y["cx"]), int(y["cy"])), int(y["r"]), (0, 0, 220), 2)
+        if e.get("cell"):
+            c = e["cell"]
+            cv2.circle(frame, (int(c["cx"]), int(c["cy"])), 10, (0, 200, 0), -1)
+        label = f"#{i}"
+        if e.get("cell_angle_deg") is not None:
+            label += f"  cell {e['cell_angle_deg']:+.0f} deg"
+        if e.get("cell_on_face"):
+            label += " (on top/under)"
+        cv2.putText(frame, label, (int(ch["cx"] - ch["r"] * 0.6), int(ch["cy"] - ch["r"] - 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 120, 0), 2, cv2.LINE_AA)
+    needle = scene.get("needle")
+    if needle:
+        tip = (int(needle["tip"][0]), int(needle["tip"][1]))
+        base = (int(needle["base"][0]), int(needle["base"][1]))
+        cv2.line(frame, base, tip, (200, 0, 200), 2)
+        cv2.circle(frame, tip, 8, (200, 0, 200), 2)
+        ray = scene.get("ray")
+        if ray and ray.get("hits_cell") and ray.get("cell_near_px") is not None:
+            dx, dy = needle["direction"]
+            t = ray["cell_near_px"]
+            hit = (int(tip[0] + dx * t), int(tip[1] + dy * t))
+            cv2.line(frame, tip, hit, (0, 200, 255), 2)
+            cv2.circle(frame, hit, 7, (0, 200, 255), -1)
+            dist = ray.get("cell_near_um")
+            text = f"to cell {dist:.0f} um" if dist is not None else f"to cell {t:.0f} px"
+            cv2.putText(frame, text, (hit[0], hit[1] - 14), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (0, 160, 255), 2, cv2.LINE_AA)
+        elif ray:
+            cv2.putText(frame, "needle line misses the cell", (tip[0] - 380, tip[1] - 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 220), 2, cv2.LINE_AA)
+    if scene.get("test_only_model"):
+        cv2.putText(frame, "TEST-ONLY MODEL", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
+                    (0, 0, 255), 3, cv2.LINE_AA)
+    return frame
+
+
+class OrientPanel(QGroupBox):
+    """
+    Orient button and the orient skill's settings (see orient.py).
+
+    The settings are published on /orient/params whenever they change. The UMP 1
+    driver runs the skill using the vision node's scene; this panel asks it to
+    start and shows its progress. When a run ends, UMP 1's target boxes are
+    synced to where the skill left the needle and that position is sent, so the
+    next nudge starts from there and not from the old target.
+    """
+
+    FIELDS = (
+        # name, label, suffix, min, max, decimals
+        ("tolerance_deg", "Tolerance", " deg", 2, 90, 0),
+        ("max_strokes", "Max strokes", "", 1, 50, 0),
+        ("stroke_max_um", "Max stroke", " \u00b5m", 5, 400, 0),
+        ("dent_um", "Dent", " \u00b5m", 0, 300, 0),
+        ("backoff_um", "Standoff", " \u00b5m", 10, 500, 0),
+        ("speed_um_s", "Speed", " \u00b5m/s", 10, 2000, 0),
+    )
+
+    def __init__(self, app, settings):
+        super().__init__("Orient")
+        self.app = app
+        self.settings = settings
+        self._token = uuid.uuid4().hex
+        self._seq = 0
+        self._published = None
+        self._was_active = False
+        defaults = OrientParams()
+        self.boxes = {}
+        for name, _label, suffix, vmin, vmax, _dec in self.FIELDS:
+            box = QSpinBox()
+            box.setRange(vmin, vmax)
+            box.setSuffix(suffix)
+            InjectionPanel._style_box(box)
+            try:
+                value = float(self.settings.value(f"orient/{name}", getattr(defaults, name)))
+            except (TypeError, ValueError):
+                value = float(getattr(defaults, name))
+            if not math.isfinite(value) or not vmin <= value <= vmax:
+                value = float(getattr(defaults, name))
+            box.setValue(int(round(value)))
+            box.valueChanged.connect(lambda _v, n=name: self._on_value_changed(n))
+            self.boxes[name] = box
+        self.dry_run = QCheckBox("Dry run (plan only, no motion)")
+        self.dry_run.toggled.connect(lambda _c: self.publish_params())
+        self.orient_button = QPushButton("Orient")
+        self.orient_button.setProperty("kind", "danger")
+        self.orient_button.setToolTip(
+            "Turn the embryo the needle points at until its cell faces the needle")
+        self.orient_button.setFixedSize(84, 62)
+        self.orient_button.clicked.connect(self.orient)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setProperty("kind", "secondary")
+        self.stop_button.setToolTip("Stop UMP 1 now; a running orient halts")
+        self.stop_button.clicked.connect(self.stop)
+        self.state_label = QLabel("Waiting for the UMP 1 driver")
+        self.state_label.setWordWrap(True)
+        self.state_label.setMinimumHeight(40)
+        self.vision_label = QLabel("Vision: waiting for the vision node")
+        self.vision_label.setObjectName("hint")
+        self.vision_label.setWordWrap(True)
+        self._build()
+        self.publish_params()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(5)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        grid.addWidget(self.orient_button, 0, 0, 3, 1, Qt.AlignVCenter)
+        for i, (name, label, *_rest) in enumerate(self.FIELDS):
+            row, col = i % 3, 1 + 2 * (i // 3)
+            grid.addWidget(QLabel(label), row, col)
+            grid.addWidget(self.boxes[name], row, col + 1)
+        layout.addLayout(grid)
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.dry_run, 1)
+        bottom.addWidget(self.stop_button)
+        layout.addLayout(bottom)
+        layout.addWidget(self.vision_label)
+        layout.addWidget(self.state_label)
+
+    def _on_value_changed(self, name):
+        self.settings.setValue(f"orient/{name}", self.boxes[name].value())
+        self.settings.sync()
+        self.publish_params()
+
+    def current_params(self):
+        raw = {name: box.value() for name, box in self.boxes.items()}
+        raw["dry_run"] = self.dry_run.isChecked()
+        return validate_orient_params(raw)
+
+    def publish_params(self, force=False):
+        try:
+            params = self.current_params()
+        except ValueError as exc:
+            self.state_label.setText(f"Not published: {exc}")
+            return None
+        if force or self._published is None or self._published[0] != params:
+            self._seq += 1
+            self.app.node.pub_orient_params.publish(
+                String(data=encode_orient_params(params, self._token, self._seq)))
+            self._published = (params, self._seq)
+        return self._published[1]
+
+    def _driver_has(self, seq):
+        status = self.app.node.latest_orient_status
+        return (status is not None and status.get("params_token") == self._token
+                and status.get("params_seq") == seq)
+
+    def orient(self):
+        for box in self.boxes.values():
+            box.interpretText()
+        seq = self.publish_params()
+        if seq is not None and not self._driver_has(seq):
+            seq = self.publish_params(force=True)
+        if seq is None:
+            self.app.set_status("Orient not started: " + self.state_label.text())
+            return
+        deadline = time.monotonic() + INJECT_PARAMS_ECHO_TIMEOUT_S
+        while not self._driver_has(seq):
+            if time.monotonic() > deadline:
+                self.app.set_status("Orient not started: the UMP 1 driver has not confirmed "
+                                    "the settings (is it running?)")
+                return
+            time.sleep(0.01)
+        ok, message = self.app.node.call_trigger(self.app.node.cli_orient)
+        self.app.set_status(message if message else f"Orient: {ok}")
+
+    def stop(self):
+        ok, message = self.app.node.call_trigger(self.app.node.cli_ump_stop)
+        self.app.set_status(f"UMP 1 stop: {'OK' if ok else 'FAILED'} ({message})")
+
+    def update_status(self):
+        vision = self.app.node.latest_vision_status
+        if vision is None:
+            self.vision_label.setText("Vision: waiting for the vision node")
+        else:
+            parts = [str(vision.get("message", ""))]
+            if vision.get("ready"):
+                parts.append(f"{vision.get('fps', 0):.1f} fps")
+            parts.append("calibrated" if vision.get("calibrated") else "NOT calibrated")
+            self.vision_label.setText("Vision: " + ", ".join(p for p in parts if p))
+        status = self.app.node.latest_orient_status
+        if status is None:
+            self.orient_button.setEnabled(True)
+            self.state_label.setText("Waiting for the UMP 1 driver")
+            return
+        active = bool(status.get("active"))
+        self.orient_button.setEnabled(not active)
+        stage = str(status.get("stage", ""))
+        message = str(status.get("message", ""))
+        count = status.get("count", 0)
+        if active:
+            text = f"#{count} running ({stage}): {message}"
+        elif stage in ("done", "aborted"):
+            text = f"#{count} {stage}: {message}"
+        else:
+            text = message or "ready"
+        self.state_label.setText(text)
+        if self._was_active and not active:
+            # The skill moved the needle without /ump/target; hold it where it is.
+            self.app.panel1.sync_to_live()
+            self.app.panel1.send_now()
+        self._was_active = active
+
+
 class UMPGuiApp(QMainWindow):
     """Main Qt application window."""
 
@@ -1007,6 +1308,7 @@ class UMPGuiApp(QMainWindow):
             subtitle=None,
         )
         self.injection_panel = InjectionPanel(self, self.settings)
+        self.orient_panel = OrientPanel(self, self.settings)
 
         self._build_ui()
 
@@ -1074,6 +1376,7 @@ class UMPGuiApp(QMainWindow):
         left_layout.addWidget(self.panel1)
         left_layout.addWidget(self.panel2)
         left_layout.addWidget(self.injection_panel)
+        left_layout.addWidget(self.orient_panel)
         left_layout.addWidget(self._motor_group())
         left_layout.addWidget(self._pressure_group())
         left_layout.addWidget(self._acquisition_group())
@@ -1090,7 +1393,16 @@ class UMPGuiApp(QMainWindow):
 
         camera_title = QLabel("Blackfly S Live")
         camera_title.setObjectName("sectionTitle")
-        right_layout.addWidget(camera_title)
+        self.show_vision = QCheckBox("Show vision")
+        self.show_vision.setToolTip(
+            "Draw the segmentation scene: chorions, yolk, cell angle, needle tip, "
+            "the embryo the needle points at and the distance to its cell")
+        self.show_vision.setChecked(True)
+        camera_row = QHBoxLayout()
+        camera_row.addWidget(camera_title)
+        camera_row.addStretch(1)
+        camera_row.addWidget(self.show_vision)
+        right_layout.addLayout(camera_row)
         right_layout.addWidget(self.camera_label, 2)
         right_layout.addWidget(self.heka_voltage)
         right_layout.addWidget(self.heka_voltage_plot, 1)
@@ -1309,6 +1621,7 @@ class UMPGuiApp(QMainWindow):
         self.panel1.update_live_display()
         self.panel2.update_live_display()
         self.injection_panel.update_status()
+        self.orient_panel.update_status()
         self.live_motor.setText(f"{int(self.node.latest_live_motor):d}")
         if not self._motor_is_fresh():
             self._motor_adopted = False
@@ -1362,6 +1675,10 @@ class UMPGuiApp(QMainWindow):
         if frame is None:
             return
 
+        scene = self.node.latest_scene
+        if (self.show_vision.isChecked() and scene is not None
+                and time.monotonic() - self.node.latest_scene_stamp <= 1.0):
+            frame = draw_scene(frame.copy(), scene)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
