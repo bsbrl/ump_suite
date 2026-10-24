@@ -36,7 +36,8 @@ class SimEmbryo:
 
     While the tip is inside the chorion, a sideways move turns the embryo by
     `gain` degrees per um of movement along the rim (counterclockwise for a
-    stroke up the needle-side rim) and rolls it along by half the stroke.
+    stroke up the needle-side rim) and moves it along by `roll` of the stroke
+    (0 = turns in place; 0.5 = rolls along a trough wall).
     """
 
     def __init__(
@@ -48,6 +49,7 @@ class SimEmbryo:
         r=370.0,
         bend=False,
         cell_on_face=False,
+        roll=0.0,
     ):
         self.cal = calibration()
         self.pos = [10000.0, 10000.0, 8000.0, 12000.0]
@@ -59,6 +61,7 @@ class SimEmbryo:
         self.gain = math.degrees(1.0 / (2.0 * r_um)) if gain is None else gain
         self.bend = bend
         self.cell_on_face = cell_on_face
+        self.roll = roll  # fraction of each stroke the embryo moves along (0.5 = against a wall)
         self.moves = []
         self.clock = 1000.0
 
@@ -84,7 +87,7 @@ class SimEmbryo:
             tangential_px = -(after[1] - before[1])
             tangential_um = tangential_px * UM_PER_PX
             self.cell += self.gain * tangential_um
-            self.cy -= tangential_px / 2.0
+            self.cy -= tangential_px * self.roll
         return Move(self.pos)
 
     def stop_stage(self):

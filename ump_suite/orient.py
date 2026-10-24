@@ -142,6 +142,23 @@ def decode_params_message(text):
     return validate_params(raw), raw.get("token"), raw.get("seq")
 
 
+def _yolk_in_view(embryo, scene, margin=2.0):
+    """
+    Return True when the yolk is fully inside the frame (else the chorion centre).
+
+    The chorion's rim may be cut by the frame edge (it often is at this
+    magnification); the angle is measured around the yolk, so that is what
+    must stay in view.
+    """
+    w, h = scene.get("image_size") or (float("inf"), float("inf"))
+    yolk = embryo.get("yolk")
+    if yolk:
+        cx, cy, r = yolk["cx"], yolk["cy"], yolk["r"]
+    else:
+        cx, cy, r = embryo["chorion"]["cx"], embryo["chorion"]["cy"], 0.0
+    return margin <= cx - r and cx + r <= w - margin and margin <= cy - r and cy + r <= h - margin
+
+
 class OrientAborted(Exception):
     pass
 
@@ -468,8 +485,9 @@ class OrientSequence:
                 "the cell is on top of or under the yolk; it needs a press "
                 "from above, which this skill does not do"
             )
-        if not embryo.get("complete", True):
-            raise OrientAborted("the embryo is leaving the view")
+        if not _yolk_in_view(embryo, scene):
+            raise OrientAborted(
+                "the embryo is leaving the view (its yolk is cut by the frame edge)")
 
     def _check_tip(self, scene, expected):
         tip = scene["needle"]["tip"] if scene.get("needle") else None

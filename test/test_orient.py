@@ -149,3 +149,23 @@ def test_calibration_helper_moves_the_tip_up_with_positive_y():
     cal = calibration()
     ux, uy = cal.xy_move_for_pixels(0.0, -10.0)
     assert ux == pytest.approx(0.0) and uy == pytest.approx(18.0)
+
+
+def test_a_chorion_cut_by_the_frame_edge_is_fine_but_a_cut_yolk_is_not():
+    """Only the yolk has to stay in view; the chorion rim may be cut."""
+    from ump_suite.orient import _yolk_in_view
+
+    scene = {"image_size": [1440, 1080]}
+    edge = {"chorion": {"cx": 300, "cy": 540, "r": 400}, "yolk": {"cx": 320, "cy": 540, "r": 200}}
+    assert _yolk_in_view(edge, scene)
+    cut = {"chorion": {"cx": 100, "cy": 540, "r": 400}, "yolk": {"cx": 150, "cy": 540, "r": 200}}
+    assert not _yolk_in_view(cut, scene)
+
+
+def test_rolling_along_a_wall_until_the_yolk_leaves_view_aborts_and_backs_off():
+    """Rolling against a wall drifts the embryo; the skill stops before it is lost."""
+    sim = SimEmbryo(cell_deg=-150.0, roll=0.5)
+    result, _, _ = run(sim, OrientParams(settle_s=0.0, max_strokes=50))
+    assert result["result"] == "aborted" and "leaving the view" in result["message"]
+    tip = sim.tip()
+    assert math.hypot(tip[0] - sim.cx, tip[1] - sim.cy) > sim.r
