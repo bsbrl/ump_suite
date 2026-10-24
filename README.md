@@ -33,7 +33,13 @@ ump_suite/
 │   ├── pressure_node.py         # Fluigent push-pull pressure controller
 │   ├── logger_node.py           # CSV + frame + video dataset logger
 │   ├── gui_node.py              # PyQt control panel
-│   └── heka_udp_receiver_node.py # HEKA UDP bridge for voltage/current samples
+│   ├── heka_udp_receiver_node.py # HEKA UDP bridge for voltage/current samples
+│   ├── injection.py             # The injection macro (run by the UMP 1 driver)
+│   ├── orient.py                # The orient skill (run by the UMP 1 driver)
+│   ├── vision_node.py           # YOLO-seg segmentation of the camera -> /vision/scene
+│   ├── calibrate_camera.py      # um/px, image <-> stage axes and D tilt, by moving UMP 1
+│   └── vision/                  # Scene geometry, needle tip, calibration, segmenter (no ROS)
+│       └── tools/               # Frame export, label conversion, SAM 2 pre-labels, train, evaluate
 ├── WindowsCode/
 │   └── windows_send_heka_data.py # NI-DAQ sender that streams HEKA monitors over UDP
 └── InstallationFiles/libum.so   # Sensapex shared library
@@ -69,6 +75,12 @@ driver also constructs service names from its configured prefix.
 | `/inject/params` | `std_msgs/String` | subscribe (UMP 1 driver) | Latched JSON `{token, seq, axis, speed_um_s, step_um, pressure_mbar, duration_ms}`, published by the GUI whenever its Injection axis or boxes change; `axis` is `X`, `Y`, `Z` or `D`, and a message without it means `X` |
 | `/inject/start` | `std_srvs/Trigger` | service (UMP 1 driver) | Run one injection with the current `/inject/params`; refused with a reason if it cannot start |
 | `/inject/status` | `std_msgs/String` | publish (UMP 1 driver) | Latched JSON `{count, active, stage, message, params, params_token, params_seq, injection_params, stamp}`; `count` rises once per injection that starts; `params` are the values the next trigger will use, `injection_params` the values injection number `count` actually ran with (`null` before the first) |
+| `/inject/outcome` | `std_msgs/String` | subscribe (logger) | JSON `{count, outcome}` from the GUI's Record button; `outcome` is `cell`, `yolk`, `chorion_space` or `no_puncture` |
+| `/orient/params` | `std_msgs/String` | subscribe (UMP 1 driver) | Latched JSON of the orient skill's settings (`OrientParams` in [orient.py](ump_suite/orient.py)) plus `token`, `seq`; published by the GUI's Orient panel; missing keys take defaults |
+| `/orient/start` | `std_srvs/Trigger` | service (UMP 1 driver) | Run the orient skill once on the embryo the needle points at; refused with a reason (no calibration, injection running, stage moving, fault) |
+| `/orient/status` | `std_msgs/String` | publish (UMP 1 driver) | Latched JSON `{count, active, stage, message, result, strokes, angle_deg, gain_deg_per_um, history, params, params_token, params_seq, stamp}`; `result` is `done`, `already_oriented` or `aborted` |
+| `/vision/scene` | `std_msgs/String` | publish (vision node) | JSON scene per processed frame: embryos (chorion, yolk, cell, cell angle), needle tip/direction, the embryo the needle points at, distances along the needle line; `stamp` is the camera frame's own timestamp |
+| `/vision/status` | `std_msgs/String` | publish (vision node) | Latched JSON `{ready, message, model, test_only, fps, inference_ms, calibrated, stamp}`, once a second |
 
 The UMP driver publishes and accepts raw absolute Sensapex device coordinates. There is no `10000` count centering offset in the ROS topics.
 
@@ -301,12 +313,24 @@ image_stamp,
 state_stamp,
 image_age_s,
 target_valid, target_valid2, state_valid, state_valid2,
-Injection, injection_axis, injection_step_um
+Injection, injection_axis, injection_step_um,
+Orient, orient_result, injection_outcome
 ```
 
-The current CSV has **32 columns**. `Injection` was added on 7 October 2026 and
-`injection_axis` / `injection_step_um` on 22 October 2026; older trials have 29
-or 30 and simply lack them.
+The current CSV has **35 columns**. `Injection` was added on 7 October 2026,
+`injection_axis` / `injection_step_um` on 22 October 2026, and `Orient`,
+`orient_result` and `injection_outcome` on 24 October 2026 (branch
+`orientation-skill`); older trials have 29, 30 or 32 and simply lack them.
+
+**`Orient`** is `1` on the first row written after the orient skill starts.
+**`orient_result`** (`done`, `already_oriented` or `aborted`) is written on the
+first row after it ends. As for an injection, the position, target, pressure
+command and state-stamp columns hold their pre-orient values while it runs, but
+unlike an injection the skill leaves the needle somewhere new, so the result row
+shows a jump in position. The GUI then re-syncs UMP 1's targets to the live
+position (see `gui_node`), so the next logged target is the new position.
+**`injection_outcome`** is the operator's verdict on the last injection,
+written on the next row after it was recorded with the GUI's Record button.
 
 **`Injection`** is `1` on the first row written after an injection starts and `0`
 on every other row. On that row only, **`injection_axis`** (`X`, `Y`, `Z` or `D`)
@@ -373,11 +397,189 @@ driver has echoed those values back. **Stop** calls `/ump/stop`. The line
 underneath shows the driver's progress and timings. The axis and boxes are saved
 in `~/.config/ump_suite/gui.ini` and restored on the next start.
 
+Below the Injection boxes, **Went into** (cell / yolk / chorion space / no
+puncture) and **Record** publish `/inject/outcome` for the latest injection, so
+each trial records whether the injection reached the cell.
+
+The **Orient** panel, under Injection, has the orient skill's settings
+(Tolerance, Strokes, Stroke, Dent, Standoff, Speed; saved in `gui.ini` under
+`orient/`), a **Dry run** box (the skill plans and reports its moves but sends
+none), **Orient** and **Stop**. A line shows the vision node's state (model
+ready or not, test-only, fps, calibrated or not) and the skill's progress. When
+an orient run ends, the panel syncs UMP 1's target boxes to the live position and
+sends it: the skill moved the stage through the SDK, not `/ump/target`, so the
+boxes would otherwise still hold the old target and the next nudge would drive
+the needle back there.
+
+The camera view draws the vision scene when **Show vision** is ticked: chorion
+circles (the embryo the needle points at thicker), yolk circle, cell centroid
+and its angle relative to the needle, the needle line, the point where it meets
+the cell and the distance to it, and a `TEST-ONLY MODEL` banner for a model
+trained on unchecked labels.
+
 The panel is **mouse-only** — there are deliberately no keyboard shortcuts, so keystrokes always go to the widget you are editing.
 
 All UMP commands are absolute Sensapex targets. The bump buttons mutate the locally-held target and republish the full vector; the GUI spin boxes use the raw device range (`0` to `20000` micrometres); this UI range is not calibrated workspace protection.
 
 ---
+
+## Embryo vision and the orient skill (branch `orientation-skill`, 24 October 2026)
+
+### `vision_node`
+Runs a YOLO-seg model on the newest camera frame (frames that arrive while it
+runs are skipped; at most `max_hz`, default 10) and publishes a **scene** on
+`/vision/scene`. The model segments four classes, **chorion**, **yolk**,
+**cell** and **needle**; [vision/geometry.py](ump_suite/vision/geometry.py)
+turns the masks into:
+
+- every embryo (one per chorion, sorted top to bottom): the chorion circle,
+  the yolk circle, the cell's centroid, the cell's **screen angle** around the
+  yolk, whether the cell sits over the yolk's middle (on top or underneath) and
+  whether the chorion is fully in view;
+- the needle: a line fitted to its mask, with the tip extended along that line
+  while the image stays darker than its sides (the tip is a few micrometres
+  wide and the mask stops short of it);
+- `target`: the embryo whose chorion the needle line meets first;
+- `ray`: along the needle line from the tip, the distance to that chorion, to
+  the cell's near edge and to its far edge, and whether the line meets the cell
+  at all (micrometre copies when a camera calibration exists).
+
+`cell_angle_deg` is measured from the side the needle comes from: `0` means
+the cell faces the needle, positive means the embryo must turn clockwise on
+screen. Angles follow the screen: 0° is 3 o'clock, 90° is 12 o'clock.
+
+Parameters: `model_path` (default
+`~/.local/share/ump_suite/models/embryo_seg.pt`), `conf`, `imgsz`, `max_hz`,
+`device`, `calibration_path`. Without a model file the node stays up, publishes
+no scenes and says why on `/vision/status`. A JSON note beside the weights
+(`embryo_seg.json`, written by the trainer) says what the model was trained
+on; `test_only: true` marks one trained on unchecked labels, and the GUI and
+every scene say so.
+
+ultralytics is installed without its dependencies (`pip install --user
+--no-deps ultralytics==8.4.175` plus `ultralytics-thop`, `nvidia-ml-py`,
+`polars`), because it would otherwise pull a second OpenCV over the headless
+one. The package sets `YOLO_AUTOINSTALL=false` and `YOLO_OFFLINE=true` before
+importing it, so it never pip-installs at run time.
+
+### The orient skill (`orient.py`, run by the UMP 1 driver)
+`/orient/start` turns the embryo the needle points at until its cell faces the
+needle, with a step-and-look loop on the cell angle φ:
+
+1. if |φ| is within the tolerance on `confirm_frames` fresh scenes, stop
+   without moving (`already_oriented`);
+2. move sideways so the needle line passes through the chorion's centre;
+3. advance until the tip is `dent_um` inside the chorion's outline;
+4. stroke sideways along the rim by `u = clip(loop_gain · (−φ) / ĝ, ±stroke_max_um)`
+   (at least `stroke_min_um`); a stroke "up" on screen at the needle-side rim
+   turns the embryo counterclockwise;
+5. back off to `backoff_um` outside the chorion and look again;
+6. update this embryo's gain ĝ (degrees per µm of stroke) from what the
+   stroke did; if it did nothing, deepen the dent by `dent_step_um` up to
+   `dent_max_um`;
+7. when |φ| is within tolerance on `confirm_frames` scenes, re-centre
+   sideways and stop at the standard standoff.
+
+The starting gain is 1 / (2R) rad/µm (R the chorion radius), the value for a
+chorion rolling against a trough wall; the loop then learns the real one. Only
+X and Y move; Z and D never change. Pixel moves become X/Y moves through the
+camera calibration.
+
+It aborts (backing off first if the needle is in the chorion) when: there is no
+calibration, no fresh scene, no needle, the needle points at no embryo, the
+embryo has no cell, the cell is over the yolk's middle (it would need a press
+from above, which this skill does not do), the yolk is leaving the view, the
+needle is more than `approach_max_um` from the chorion or already inside it,
+the tip ends more than 30 px from where the moves should have put it (needle
+bent or slipped), two strokes in a row turn the embryo the wrong way (check the
+calibration's Y), two strokes do nothing at the deepest dent, `max_strokes` is
+reached, or `timeout_s` passes. `/ump/stop` aborts it at once, without backing
+off. While it runs the driver ignores `/ump/target` and refuses `/inject/start`;
+an injection running refuses `/orient/start`.
+
+Rolling the chorion against a wall moves the embryo along by about half of each
+stroke, so a long turn can carry the yolk out of view; the skill then stops.
+Whether rolling the chorion turns the embryo *inside* it, and which method
+(needle against the trough wall, a second tool on the far side, or a deeper
+dent onto the yolk) works best, has to be found by hand on the rig first. The
+skill implements the single-needle methods; a two-tool version is not written.
+
+Defaults (`OrientParams`): tolerance 15°, confirm 3 frames, 25 strokes, stroke
+15–250 µm, dent 40 µm (max 120, step 20), standoff 60 µm, approach at most
+800 µm, loop gain 0.6, gain blend 0.5, 200 µm/s, settle 0.4 s, timeout 300 s.
+
+### Camera calibration (`calibrate_camera`)
+The vision step and the orient skill need micrometres per pixel, which way each
+stage axis moves the tip on screen, and the D axis's tilt. With the needle tip
+in view, in clear liquid with nothing within a few hundred micrometres:
+
+```bash
+ros2 run ump_suite calibrate_camera --confirm --save-frames ~/calibration_frames
+```
+
+It pulls X back by `--background-um` (1500) so the needle leaves the view and
+takes a background frame, returns, then moves X and Y by ±`--step` (100 µm) and
+D back by `step` and `2·step` (D only ever retracts), returning to the start
+after each move. The tip is found by differencing each frame against the
+background (no model needed); `--tip-source vision` uses `/vision/scene`
+instead. It fits µm/px (X and Y must agree within 10%), the 2×2 image↔X/Y
+mapping and the D tilt θ (|vD|·µm/px = cos θ), prints the residuals and the
+return drift, and saves `~/.config/ump_suite/vision_calibration.json`
+(`--dry-run` only prints). The needle always ends where it started, also
+after an error or Ctrl-C. It refuses to move without `--confirm`.
+
+### Training the segmentation model
+Label by hand; that is what a model you trust is trained on.
+
+1. **Export frames**, grouped by trial so validation can hold whole trials
+   (embryos) out:
+   ```bash
+   python -m ump_suite.vision.tools.export_frames --trials ~/Backup/New\ 3 \
+       --trials ~ --every 4 --out ~/embryo_labels
+   ```
+   Every 4th frame plus every frame an injection or orient was decided on goes
+   to `images/`, listed with its trial in `manifest.csv`.
+2. **Label** in any polygon tool (CVAT, Label Studio, Roboflow, labelme, µSAM):
+   one polygon per object, classes `chorion`, `yolk`, `cell`, `needle`; one
+   chorion, yolk and cell per embryo, every embryo in the frame (an unlabelled
+   embryo teaches the model that embryos are background). Tools that export
+   YOLO segmentation write straight into `labels/`; for COCO or labelme:
+   ```bash
+   python -m ump_suite.vision.tools.labels_to_yolo --coco export.json \
+       --images ~/embryo_labels/images --out ~/embryo_labels/labels
+   ```
+   It reports objects per class and frames without labels.
+3. **Optional head start**: `bootstrap_labels.py --sam sam2.1_b.pt` writes
+   SAM 2 pre-annotations (seeded by the dark yolk) to a separate folder for
+   correcting in your tool. They are wrong often enough that a model trained
+   on them alone must be treated as test-only.
+4. **Train** (YOLO11-seg from pretrained weights, whole trials held out):
+   ```bash
+   python -m ump_suite.vision.tools.train_segmenter --data ~/embryo_labels \
+       --epochs 80 --install
+   ```
+   `--install` copies the best weights to the vision node's path with a note
+   beside them; add `--test-only` for unchecked labels.
+5. **Evaluate** on the held-out trials, in the units the skills use (IoU per
+   class, chorion centre, cell angle, tip and needle-to-cell distance errors):
+   ```bash
+   python -m ump_suite.vision.tools.eval_segmenter --data ~/embryo_labels \
+       --groups-from ~/embryo_seg_runs/<run>/model_note.json --um-per-px 1.8
+   ```
+
+**State on 24 October 2026.** The installed model is a **test-only** YOLO11s-seg
+trained on SAM 2 pre-annotations of 654 frames from 22 trials (40 epochs).
+Against those same unchecked labels on 4 held-out trials: IoU chorion 0.92,
+yolk 0.90, cell 0.49, needle 0.46; cell angle error median 6°, mean 21°; tip
+error median 7 px but 90th percentile 387 px. It runs at about 18 ms per frame
+on the RTX 3080 Ti. Good enough to exercise the pipeline, not to orient or
+inject. No camera calibration exists yet, and the orient skill, the
+calibration and the measured step have not yet been run on a needle in view on
+the rig; on 24 October the needle was out of the field (UMP 1 at Z 200) and was
+not moved blind. Checked live that day without moving the needle: the vision
+node at 10 fps on real frames, `/orient/start` refused without a calibration,
+a dry-run orient through the real driver aborting on "no needle in view", the
+35-column log with an outcome, the GUI panels, and a MicroVLA dry run.
 
 ## Closed-loop VLA rollouts
 
@@ -526,6 +728,8 @@ Defined in [setup.py](setup.py):
 | `pressure_node` | `ump_suite.pressure_node:main` |
 | `logger_node` | `ump_suite.logger_node:main` |
 | `heka_udp_receiver_node` | `ump_suite.heka_udp_receiver_node:main` |
+| `vision_node` | `ump_suite.vision_node:main` |
+| `calibrate_camera` | `ump_suite.calibrate_camera:main` |
 
 ---
 
