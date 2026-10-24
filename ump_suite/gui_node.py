@@ -827,7 +827,7 @@ class InjectionPanel(QGroupBox):
         for name in INJECTION_OUTCOMES:
             self.outcome.addItem(name.replace("_", " "), name)
         self.outcome.setFixedHeight(28)
-        self.outcome_button = QPushButton("Record outcome")
+        self.outcome_button = QPushButton("Record")
         self.outcome_button.setProperty("kind", "secondary")
         self.outcome_button.setToolTip(
             "Log where the last injection went (written into the trial's CSV)")
@@ -1077,8 +1077,8 @@ class OrientPanel(QGroupBox):
     FIELDS = (
         # name, label, suffix, min, max, decimals
         ("tolerance_deg", "Tolerance", " deg", 2, 90, 0),
-        ("max_strokes", "Max strokes", "", 1, 50, 0),
-        ("stroke_max_um", "Max stroke", " \u00b5m", 5, 400, 0),
+        ("max_strokes", "Strokes", "", 1, 50, 0),
+        ("stroke_max_um", "Stroke", " \u00b5m", 5, 400, 0),
         ("dent_um", "Dent", " \u00b5m", 0, 300, 0),
         ("backoff_um", "Standoff", " \u00b5m", 10, 500, 0),
         ("speed_um_s", "Speed", " \u00b5m/s", 10, 2000, 0),
@@ -1106,6 +1106,8 @@ class OrientPanel(QGroupBox):
             if not math.isfinite(value) or not vmin <= value <= vmax:
                 value = float(getattr(defaults, name))
             box.setValue(int(round(value)))
+            box.setMinimumWidth(104 if name == "speed_um_s" else 88)
+            box.setMaximumWidth(104 if name == "speed_um_s" else 88)
             box.valueChanged.connect(lambda _v, n=name: self._on_value_changed(n))
             self.boxes[name] = box
         self.dry_run = QCheckBox("Dry run (plan only, no motion)")
@@ -1114,7 +1116,7 @@ class OrientPanel(QGroupBox):
         self.orient_button.setProperty("kind", "danger")
         self.orient_button.setToolTip(
             "Turn the embryo the needle points at until its cell faces the needle")
-        self.orient_button.setFixedSize(84, 62)
+        self.orient_button.setFixedSize(84, 30)
         self.orient_button.clicked.connect(self.orient)
         self.stop_button = QPushButton("Stop")
         self.stop_button.setProperty("kind", "secondary")
@@ -1133,19 +1135,23 @@ class OrientPanel(QGroupBox):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(5)
+        # Six settings in two columns of label + box; the buttons get their own row
+        # so the panel fits the control column.
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(4)
-        grid.addWidget(self.orient_button, 0, 0, 3, 1, Qt.AlignVCenter)
         for i, (name, label, *_rest) in enumerate(self.FIELDS):
-            row, col = i % 3, 1 + 2 * (i // 3)
+            row, col = i % 3, 2 * (i // 3)
             grid.addWidget(QLabel(label), row, col)
             grid.addWidget(self.boxes[name], row, col + 1)
+        grid.setColumnStretch(4, 1)
         layout.addLayout(grid)
-        bottom = QHBoxLayout()
-        bottom.addWidget(self.dry_run, 1)
-        bottom.addWidget(self.stop_button)
-        layout.addLayout(bottom)
+        layout.addWidget(self.dry_run)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.orient_button)
+        buttons.addWidget(self.stop_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
         layout.addWidget(self.vision_label)
         layout.addWidget(self.state_label)
 
