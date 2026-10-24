@@ -219,3 +219,19 @@ def test_calibration_rejects_mismatched_axes():
         cal.fit(samples, (1440, 1080))
     with pytest.raises(ValueError, match="no usable D"):
         cal.fit(samples[:2], (1440, 1080))
+
+
+def test_eval_compare_scores_identical_and_shifted_frames():
+    """A perfect prediction scores IoU 1 and zero errors; a shifted cell costs angle."""
+    from ump_suite.vision.tools.eval_segmenter import compare, summarise
+
+    truth = embryo(500, 540, 0) + [Instance("needle", needle_mask((1000, 540)))]
+    same = compare(truth, truth, (H, W))
+    assert same["iou_chorion"] == 1.0 and same["iou_cell"] == 1.0
+    assert same["cell_angle_deg"] == 0.0 and same["tip_px"] == 0.0
+    turned = embryo(500, 540, 30) + [Instance("needle", needle_mask((1000, 540)))]
+    row = compare(truth, turned, (H, W))
+    assert row["cell_angle_deg"] == pytest.approx(30, abs=3)
+    assert row["iou_cell"] < 1.0
+    stats = summarise([same, row])
+    assert stats["cell_angle_deg"]["n"] == 2
