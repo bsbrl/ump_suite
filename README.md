@@ -1,8 +1,8 @@
 # ump_suite
 
-A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **two Sensapex UMP micromanipulators**, an **ODrive**-driven focusing knob and a **FLIR Blackfly S** camera.
+A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **two Sensapex UMP micromanipulators**, an **ODrive**-driven focusing knob and a **FLIR Blackfly S** camera (a camera with a larger sensor is to replace it; see [For the new camera](#training-the-segmentation-model)).
 
-The package wraps every device behind a small ROS2 node, ships a Qt GUI for manual teleop, and a logger that writes synchronized image / video / CSV trials. It is the **robot side** only: closed-loop VLA policy clients live in separate repos and drive this rig over the ROS topics below.
+The package wraps every device behind a small ROS2 node, ships a Qt GUI for manual teleop, and a logger that writes synchronized image / video / CSV trials. It also runs the rig's fixed skills: the **injection macro**, the **embryo vision** (segmentation of chorion, yolk, cell and needle) and the **orient skill** that turns an embryo until its cell faces the needle. It is the **robot side** only: the policy client (MicroVLA, in `~/MicroVLA2`) drives this rig over the ROS topics below.
 
 ---
 
@@ -286,7 +286,7 @@ For now, the GUI plots voltage and current and shows the live resistance estimat
 Records the latest received observations and targets with timing diagnostics:
 1. Subscribes to **live** topics (UMP1, UMP2) and to **target** topics published by the GUI / policy.
 2. Subscribes to `/heka/resistance_mohm` so each row can include the latest finite HEKA resistance value when available, and to `/pressure/target_mbar` and `/pressure/measured_mbar` for applied setpoints and sensor values.
-3. On `/acq/start`, picks the next free `trial_N` ID by inspecting **`logs/`, `saved_frames/` and `saved_videos/` together**, atomically reserves `saved_frames/trial_N/`, exclusively creates `logs/trial_N.csv`, and tells the camera to record `saved_videos/trial_N.mp4`. Scanning all three matters: deleting a CSV while its frame directory survives would otherwise hand the number back out and the new run would overwrite the old frames.
+3. On `/acq/start`, picks the next free `trial_N` ID (all paths are relative to the folder the rig was launched from) by inspecting **`logs/`, `saved_frames/` and `saved_videos/` together**, atomically reserves `saved_frames/trial_N/`, exclusively creates `logs/trial_N.csv`, and tells the camera to record `saved_videos/trial_N.mp4`. Scanning all three matters: deleting a CSV while its frame directory survives would otherwise hand the number back out and the new run would overwrite the old frames.
 4. Every `log_interval_ms` it saves the latest JPEG to `saved_frames/trial_N/frame_NNNNNN.png` and appends one CSV row with the live pose, the most-recent commanded target, the saved image's path, the latest resistance when available, and the timing columns below.
 5. On `/acq/stop` it closes the file, sends an empty record command to the camera, and reports the logging rate it actually achieved.
 
@@ -411,11 +411,15 @@ sends it: the skill moved the stage through the SDK, not `/ump/target`, so the
 boxes would otherwise still hold the old target and the next nudge would drive
 the needle back there.
 
-The camera view draws the vision scene when **Show vision** is ticked: chorion
-circles (the embryo the needle points at thicker), yolk circle, cell centroid
-and its angle relative to the needle, the needle line, the point where it meets
-the cell and the distance to it, and a `TEST-ONLY MODEL` banner for a model
-trained on unchecked labels.
+The camera view draws the vision scene when **Show vision** is ticked (the
+default): chorion circles (the embryo the needle points at thicker), yolk
+circle, cell centroid and its angle relative to the needle (`(on top/under)`
+when the cell sits over the yolk's middle), the needle line, the point where it
+meets the cell and the distance to it (µm with a calibration, px without), and a
+`TEST-ONLY MODEL` banner for a model trained on unchecked labels. It draws on a
+copy of the displayed frame only: recordings, the skills and MicroVLA are
+unaffected, and it shows nothing while no model is installed or the newest scene
+is more than 1 s old.
 
 The panel is **mouse-only** — there are deliberately no keyboard shortcuts, so keystrokes always go to the widget you are editing.
 
@@ -476,9 +480,12 @@ needle, with a step-and-look loop on the cell angle φ:
    (at least `stroke_min_um`); a stroke "up" on screen at the needle-side rim
    turns the embryo counterclockwise;
 5. back off to `backoff_um` outside the chorion and look again;
-6. update this embryo's gain ĝ (degrees per µm of stroke) from what the
-   stroke did; if it did nothing, deepen the dent by `dent_step_um` up to
-   `dent_max_um`;
+6. if the stroke turned the embryo at least 2° the way it was sent, update
+   this embryo's gain ĝ (degrees per µm of stroke):
+   ĝ ← (1 − `gain_blend`)·ĝ + `gain_blend`·(turned / stroke), the measured
+   value clamped to ĝ/10…10ĝ; if it turned less than 2°, deepen the dent by
+   `dent_step_um` up to `dent_max_um` instead; a turn the wrong way is counted
+   but not learned from;
 7. when |φ| is within tolerance on `confirm_frames` scenes, re-centre
    sideways and stop at the standard standoff.
 
@@ -494,8 +501,8 @@ from above, which this skill does not do), the yolk is leaving the view, the
 needle is more than `approach_max_um` from the chorion or already inside it,
 the tip ends more than 55 µm from where the moves should have put it (needle
 bent or slipped), two strokes in a row turn the embryo the wrong way (check the
-calibration's Y), two strokes do nothing at the deepest dent, `max_strokes` is
-reached, or `timeout_s` passes. `/ump/stop` aborts it at once, without backing
+calibration's Y), two strokes in a row do nothing and the dent cannot go
+deeper, `max_strokes` is reached, or `timeout_s` passes. `/ump/stop` aborts it at once, without backing
 off. While it runs the driver ignores `/ump/target` and refuses `/inject/start`;
 an injection running refuses `/orient/start`.
 
@@ -543,31 +550,53 @@ Label by hand; that is what a model you trust is trained on.
    be repeated:
    ```bash
    python3 -m ump_suite.vision.tools.export_frames --trials ~/newcam \
-       --every 4 --out ~/embryo_labels
+       --every 30 --out ~/embryo_labels
    ```
-   Every 4th frame plus every frame an injection or orient was decided on goes
-   to `images/`, listed with its trial in `manifest.csv`.
+   Every Nth frame (`--every`, default 4) plus every frame an injection or
+   orient was decided on goes to `images/`, listed with its trial in
+   `manifest.csv`. Frames of one trial at 3 Hz barely differ, so for labelling
+   a large N (30 = one frame per 10 s) gives more variety for the effort.
 2. **Label** in any polygon tool (CVAT, Label Studio, Roboflow, labelme, µSAM):
    one polygon per object, classes `chorion`, `yolk`, `cell`, `needle`; one
-   chorion, yolk and cell per embryo, every embryo in the frame (an unlabelled
-   embryo teaches the model that embryos are background). Tools that export
-   YOLO segmentation write straight into `labels/`; for COCO or labelme:
+   chorion, yolk and cell per embryo, every embryo in the frame, including
+   ones cut by the frame edge (an unlabelled embryo teaches the model that
+   embryos are background). All embryos get the same class names; which one
+   is "topmost" is worked out later from the positions. Outlines overlap: the
+   chorion is the whole circle, with the yolk, cell and any needle crossing it
+   drawn on top. Draw polygons, not brush masks. Export **COCO 1.0** (CVAT) and
+   convert, which numbers the classes by name:
    ```bash
    python3 -m ump_suite.vision.tools.labels_to_yolo --coco export.json \
        --images ~/embryo_labels/images --out ~/embryo_labels/labels
    ```
-   It reports objects per class and frames without labels.
-3. **Optional head start**: `bootstrap_labels.py --sam sam2.1_b.pt` writes
-   SAM 2 pre-annotations (seeded by the dark yolk) to a separate folder for
-   correcting in your tool. They are wrong often enough that a model trained
-   on them alone must be treated as test-only.
+   It reports objects per class; frames you have not labelled yet get no
+   label file, so the trainer leaves them out.
+
+   What to label: start with about 150–200 frames from 20 or more trials
+   (different embryos), then train, evaluate and label more of what the model
+   gets wrong. Have the needle in about three quarters of the frames, in every
+   state (far, approaching, touching or denting the chorion, inside the embryo,
+   slightly out of focus), and vary the number of embryos (1–4), their layout,
+   the cells' clock positions, focus, bubbles and debris. Keep the camera
+   settings the ones used for real.
+3. **Optional head start**: `python3 -m ump_suite.vision.tools.bootstrap_labels
+   --frames-dir ~/embryo_labels/images --out-dir ~/embryo_labels/labels_bootstrap
+   --sam ~/.local/share/ump_suite/models/sam2.1_b.pt` writes SAM 2
+   pre-annotations (seeded by the dark yolk) as YOLO labels in a separate
+   folder, for correcting in your tool. They are wrong often enough that a
+   model trained on them alone must be treated as test-only, and its
+   thresholds were tuned to the old camera.
 4. **Train** (YOLO11-seg from pretrained weights, whole trials held out):
    ```bash
    python3 -m ump_suite.vision.tools.train_segmenter --data ~/embryo_labels \
        --epochs 80 --install
    ```
-   `--install` copies the best weights to the vision node's path with a note
-   beside them; add `--test-only` for unchecked labels.
+   Runs go to `~/embryo_seg_runs/`. `--install` copies the best weights to the
+   vision node's path with a note beside them (the vision node loads it on its
+   next start); add `--test-only` for unchecked labels. Training mirrors frames
+   top to bottom and tilts them up to 10° on the fly, labels included, so the
+   needle still enters from the right and cells appear at the mirrored clock
+   positions; there is no need to rotate or relabel frames by hand.
 5. **Evaluate** on the held-out trials, in the units the skills use (IoU per
    class, chorion centre, cell angle, tip and needle-to-cell distance errors):
    ```bash
@@ -595,10 +624,11 @@ outcome, the GUI panels, and a MicroVLA dry run. The orient skill on an
 embryo, the calibration and the measured step have not been run on the rig.
 
 **For the new camera:**
-- Launch the rig from a new folder (for example `mkdir -p ~/newcam && cd ~/newcam`)
-  so the new trials do not mix with the obsolete ones in `~/logs`; the logger
-  numbers trials per folder. Use that folder for `export_frames --trials` and
-  MicroVLA's `--data-root`.
+- Launch the rig from a new folder so the new trials do not mix with the
+  obsolete ones in `~/logs`; the logger numbers trials per folder. The desktop
+  **My Robot** icon starts the rig in the home folder, so start it from a
+  terminal instead: `mkdir -p ~/newcam && cd ~/newcam && ~/start_robot.sh`. Use
+  that folder for `export_frames --trials` and MicroVLA's `--data-root`.
 - `camera_node` works with any FLIR camera through Spinnaker (PySpin) at its
   native resolution; another make needs a new driver node.
 - The logger writes a full-resolution PNG every tick; at a higher resolution it
@@ -614,7 +644,7 @@ embryo, the calibration and the measured step have not been run on the rig.
 
 ## Closed-loop VLA rollouts
 
-> ⓘ **The rollout client no longer lives in this package.** `main.py` and `sensapex_env.py` were deleted in commit `699bd1f`, along with the `sensapex_rollout` console script. The policy code now sits in the separate training / inference repo (`~/MicroVLA2/rollout`; `~/SmolVLA` for the older SmolVLA experiments).
+> ⓘ **The rollout client no longer lives in this package.** `main.py` and `sensapex_env.py` were deleted in commit `699bd1f`, along with the `sensapex_rollout` console script. The policy code now sits in the separate training / inference repo (`~/MicroVLA2/rollout`; `~/SmolVLA` holds the older SmolVLA experiments).
 >
 > This package is now purely the **robot side**. What follows is the interface a policy client has to speak — not documentation of code in this repo.
 
@@ -623,7 +653,10 @@ embryo, the calibration and the measured step have not been run on the rig.
 | Topic | Use |
 |---|---|
 | `/camera/image/compressed` | JPEG frame, resize as the policy requires |
-| `/ump/live`, `/ump2/live` | `[x, y, z, d]` absolute counts per manipulator → the 8-value state |
+| `/ump/live`, `/ump2/live` | `[x, y, z, d]` absolute micrometres per manipulator → the 4- or 8-value state |
+| `/heka/resistance_mohm`, `/pressure/measured_mbar` | optional sensor inputs |
+| `/vision/scene` | embryos, needle and distances (embryo tokens, the measured step, the prompt check) |
+| `/inject/status`, `/orient/status` | progress and counts of the injection macro and the orient skill |
 
 ### What the rig accepts (action)
 
@@ -631,6 +664,9 @@ embryo, the calibration and the measured step have not been run on the rig.
 |---|---|
 | `/ump/target`, `/ump2/target` | `[x, y, z, d, speed]` absolute micrometres plus speed |
 | `/pressure/mbar` | `Float32` exact pressure in mbar |
+| `/inject/params`, `/inject/start` | run the injection macro (optionally with the client's own step) |
+| `/orient/start` | run the orient skill |
+| `/ump/stop`, `/ump2/stop` | SDK stop |
 
 A dual-arm client controls **8 motion coordinates and a separate pressure channel**:
 
@@ -642,7 +678,7 @@ This matches the dataset columns the logger writes, so state/action shapes line 
 
 ### Client-side responsibilities
 
-These lived in the deleted `main.py` and are now the client's job — worth re-checking whichever repo you roll out from:
+These lived in the deleted `main.py` and are now the client's job (MicroVLA's rollout does all of them) — worth re-checking whichever client you roll out from:
 
 - **Workspace clamping** — per-stage min/max boxes on each of the 8 axes. ⚠️ These are tied to one physical setup; they must be set for *your* stage before any rollout.
 - **Pressure clamping** — keep the predicted mbar inside what the pipette tolerates. The node reads device limits and intersects them with its configured envelope.
@@ -686,6 +722,8 @@ The driver nodes import several non-`rosdep` packages:
   The wheel ships its own `libfgt_SDK.so`, so unlike PySpin it needs no system libraries and no separate virtualenv.
 - `PyQt5` — modern desktop GUI (`apt install python3-pyqt5`)
 - `opencv-python`, `numpy`
+- `ultralytics` and `torch` — the vision node and the segmentation tools (see
+  [`vision_node`](#vision_node) for why ultralytics is installed `--no-deps`)
 
 (`tyro` / `openpi-client` are no longer needed — they were only used by the rollout client that has since moved out of this package.)
 
@@ -713,14 +751,19 @@ This starts the dual UMP driver (`device_id=1` and `device_id=2` in one process)
 
 ### Collect a dataset trial
 
-1. Launch the suite as above.
+1. Launch the suite as above, from the folder the trials should go into (the
+   desktop **My Robot** icon uses the home folder).
 2. Use the GUI (or publish on `/ump/target`, `/ump2/target`, `/motor/target_counts` and `/pressure/mbar` directly) to drive the rig. The CSV logger records UMP state/targets, HEKA resistance and the commanded pressure, but not the ODrive motor.
    Pressure targets populate only while the driver reports ready, and measured pressure requires fresh successful readings; faults leave the relevant cells blank.
 3. Click **Start Data Acquisition** — this calls `/acq/start`, which opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and asks the camera to record `saved_videos/trial_N.mp4`.
 4. Perform the trial. The logger writes one row per `log_interval_ms` (default 333 ms = 3 Hz).
 5. Click **Stop Data Acquisition** — this calls `/acq/stop`, closes the CSV, and stops the mp4.
 
-Output layout:
+For microinjection: press **Orient** when the cell does not face the needle,
+**Inject** when the needle is in place, and after each injection choose **Went
+into** and press **Record**. The logger records all three.
+
+Output layout (inside the launch folder):
 
 ```
 logs/trial_1.csv
@@ -764,11 +807,7 @@ Defined in [setup.py](setup.py):
 
 ---
 
-## Maintainer
-
-Raian Haider Chowdhury — `chowd207@umn.edu`
-
-### Log validity and manual feedback
+## Log validity and manual feedback
 
 New CSVs append `target_valid`, `target_valid2`, `state_valid`, and `state_valid2`.
 A valid zero target means Home; an absent target is recorded as invalid. Each arm
@@ -798,7 +837,8 @@ held.
 The logger reserves each trial with an atomic frame-directory creation and opens
 its CSV exclusively (`x` mode). Concurrent reservations cannot share a trial,
 and an existing CSV cannot be truncated. Every row has the same named columns
-as the header (32 since the injection columns), is flushed after writing, and a write failure stops acquisition.
+as the header (35 since 24 October 2026), is flushed after writing, and a
+write failure stops acquisition.
 CSV cleanup still runs if ROS has already shut down.
 
 `target_pressure` is blank while pressure-driver status is faulted, absent, or
@@ -809,8 +849,14 @@ settling or of a front-panel command. Direct front-panel changes have no SDK
 setpoint acknowledgement and cannot be reconstructed as pressure action labels.
 
 On September 18, two old complete launches were found writing the same trial
-files concurrently. Existing `~/logs/trial_28.csv`, `trial_29.csv`, and
-`trial_30.csv` contain overwritten/merged rows; `trial_25.csv` also has structural
-corruption. Those originals were preserved, not repaired by guessing. Do not use
+files concurrently. That day's `~/logs/trial_28.csv`, `trial_29.csv`, and
+`trial_30.csv` contained overwritten/merged rows and `trial_25.csv` had
+structural corruption (those files are no longer in `~/logs`). Those originals were preserved, not repaired by guessing. Do not use
 corrupt trials for training. The fixes prevent future collisions and do not
 recover overwritten measurements or frames.
+
+---
+
+## Maintainer
+
+Raian Haider Chowdhury — `chowd207@umn.edu`
