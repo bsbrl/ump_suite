@@ -538,10 +538,12 @@ after an error or Ctrl-C. It refuses to move without `--confirm`.
 Label by hand; that is what a model you trust is trained on.
 
 1. **Export frames**, grouped by trial so validation can hold whole trials
-   (embryos) out:
+   (embryos) out. `--trials` is a folder holding `logs/` and `saved_frames/`
+   (the logger writes both into the folder the rig was launched from) and can
+   be repeated:
    ```bash
-   python -m ump_suite.vision.tools.export_frames --trials ~/Backup/New\ 3 \
-       --trials ~ --every 4 --out ~/embryo_labels
+   python3 -m ump_suite.vision.tools.export_frames --trials ~/newcam \
+       --every 4 --out ~/embryo_labels
    ```
    Every 4th frame plus every frame an injection or orient was decided on goes
    to `images/`, listed with its trial in `manifest.csv`.
@@ -551,7 +553,7 @@ Label by hand; that is what a model you trust is trained on.
    embryo teaches the model that embryos are background). Tools that export
    YOLO segmentation write straight into `labels/`; for COCO or labelme:
    ```bash
-   python -m ump_suite.vision.tools.labels_to_yolo --coco export.json \
+   python3 -m ump_suite.vision.tools.labels_to_yolo --coco export.json \
        --images ~/embryo_labels/images --out ~/embryo_labels/labels
    ```
    It reports objects per class and frames without labels.
@@ -561,7 +563,7 @@ Label by hand; that is what a model you trust is trained on.
    on them alone must be treated as test-only.
 4. **Train** (YOLO11-seg from pretrained weights, whole trials held out):
    ```bash
-   python -m ump_suite.vision.tools.train_segmenter --data ~/embryo_labels \
+   python3 -m ump_suite.vision.tools.train_segmenter --data ~/embryo_labels \
        --epochs 80 --install
    ```
    `--install` copies the best weights to the vision node's path with a note
@@ -569,8 +571,8 @@ Label by hand; that is what a model you trust is trained on.
 5. **Evaluate** on the held-out trials, in the units the skills use (IoU per
    class, chorion centre, cell angle, tip and needle-to-cell distance errors):
    ```bash
-   python -m ump_suite.vision.tools.eval_segmenter --data ~/embryo_labels \
-       --groups-from ~/embryo_seg_runs/<run>/model_note.json --um-per-px 1.8
+   python3 -m ump_suite.vision.tools.eval_segmenter --data ~/embryo_labels \
+       --groups-from ~/embryo_seg_runs/<run>/model_note.json --um-per-px <from calibration>
    ```
 
 **State on 25 October 2026: no model is installed.** The frames recorded so far
@@ -593,6 +595,10 @@ outcome, the GUI panels, and a MicroVLA dry run. The orient skill on an
 embryo, the calibration and the measured step have not been run on the rig.
 
 **For the new camera:**
+- Launch the rig from a new folder (for example `mkdir -p ~/newcam && cd ~/newcam`)
+  so the new trials do not mix with the obsolete ones in `~/logs`; the logger
+  numbers trials per folder. Use that folder for `export_frames --trials` and
+  MicroVLA's `--data-root`.
 - `camera_node` works with any FLIR camera through Spinnaker (PySpin) at its
   native resolution; another make needs a new driver node.
 - The logger writes a full-resolution PNG every tick; at a higher resolution it
