@@ -286,3 +286,31 @@ def test_a_needle_sliding_along_its_own_axis_still_counts_as_change():
     before = grab()
     goto([10000.0 - 200, 0, 0, 0])
     assert changed_area(grab(), before) > 150
+
+
+def test_coco_conversion_skips_unlabelled_frames_and_brush_masks(tmp_path):
+    import json
+
+    from ump_suite.vision.tools.labels_to_yolo import from_coco
+
+    coco = {
+        "images": [
+            {"id": 1, "file_name": "a__t1__f0.png", "width": 100, "height": 50},
+            {"id": 2, "file_name": "a__t1__f4.png", "width": 100, "height": 50},
+        ],
+        # CVAT's order, not ours: the written class numbers must follow the names.
+        "categories": [{"id": 7, "name": "Needle"}, {"id": 8, "name": "chorion"},
+                       {"id": 9, "name": "bubble"}],
+        "annotations": [
+            {"image_id": 1, "category_id": 7, "segmentation": [[90, 20, 99, 20, 99, 30]]},
+            {"image_id": 1, "category_id": 8, "segmentation": {"counts": "x", "size": [50, 100]}},
+            {"image_id": 1, "category_id": 9, "segmentation": [[0, 0, 5, 0, 5, 5]]},
+        ],
+    }
+    (tmp_path / "export.json").write_text(json.dumps(coco))
+    written, unlabelled, skipped = from_coco(tmp_path / "export.json", tmp_path / "labels")
+    assert (written, unlabelled) == (1, 1)
+    assert skipped["<brush mask, not a polygon>"] == 1 and skipped["bubble"] == 1
+    assert not (tmp_path / "labels" / "a__t1__f4.txt").exists()
+    line = (tmp_path / "labels" / "a__t1__f0.txt").read_text().split()
+    assert line[0] == "3" and line[1:3] == ["0.90000", "0.40000"]

@@ -3,19 +3,24 @@ Convert polygons from an annotation tool into YOLO segmentation labels.
 
 Draw one polygon per object with the class names chorion, yolk, cell and needle
 (one chorion, one yolk and one cell polygon per embryo; the cell mass may be
-several polygons). Most tools export YOLO segmentation directly (CVAT
-"Ultralytics YOLO Segmentation", Label Studio "YOLO", Roboflow "YOLOv8/11
-segmentation"); copy those .txt files into the labels folder and only run
-`--check`. For other tools this converts
+several polygons). This converts
 
     --coco FILE      a COCO instances JSON (CVAT, Label Studio, Roboflow, µSAM)
     --labelme DIR    a folder of labelme JSON files, one per image
 
 Class names are matched case-insensitively; anything else is skipped and
 reported. The class order in the written files is chorion=0, yolk=1, cell=2,
-needle=3 whatever order the tool used.
+needle=3 whatever order the tool used, which is why a COCO export is safer than
+a tool's own YOLO export (that one numbers the classes in the tool's order; if
+you use it, copy the .txt files into the labels folder and run this with
+neither option to check them).
 
-    python -m ump_suite.vision.tools.labels_to_yolo --coco export.json \
+An image with no polygons gets no label file: an export lists every image of
+the task, labelled or not, and an empty file would teach the model that the
+embryos in that frame are background. Brush masks (COCO RLE) are skipped and
+counted; draw polygons, or convert masks to polygons before exporting.
+
+    python3 -m ump_suite.vision.tools.labels_to_yolo --coco export.json \
         --images ~/embryo_labels/images --out ~/embryo_labels/labels
 """
 
@@ -52,25 +57,30 @@ def from_coco(coco_path: Path, out_dir: Path):
     for ann in data.get("annotations", []):
         cls = cats.get(ann["category_id"])
         seg = ann.get("segmentation")
-        if cls is None or not isinstance(seg, list):
-            continue  # RLE masks need pycocotools; export polygons instead
+        if cls is None:
+            continue
+        if not isinstance(seg, list):
+            skipped["<brush mask, not a polygon>"] += 1  # RLE needs pycocotools
+            continue
         im = images[ann["image_id"]]
         for poly in seg:
             pts = list(zip(poly[0::2], poly[1::2]))
             if len(pts) >= 3:
                 lines[ann["image_id"]].append(_line(cls, pts, im["width"], im["height"]))
     out_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
     for im_id, im in images.items():
+        if not lines[im_id]:
+            continue  # not labelled (yet)
         stem = Path(im["file_name"]).stem
-        (out_dir / f"{stem}.txt").write_text(
-            "\n".join(lines[im_id]) + ("\n" if lines[im_id] else "")
-        )
-    return len(images), skipped
+        (out_dir / f"{stem}.txt").write_text("\n".join(lines[im_id]) + "\n")
+        written += 1
+    return written, len(images) - written, skipped
 
 
 def from_labelme(folder: Path, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
-    skipped, n = Counter(), 0
+    skipped, n, unlabelled = Counter(), 0, 0
     for js in sorted(Path(folder).glob("*.json")):
         data = json.loads(js.read_text())
         w, h = data["imageWidth"], data["imageHeight"]
@@ -83,10 +93,13 @@ def from_labelme(folder: Path, out_dir: Path):
             if shape.get("shape_type", "polygon") != "polygon" or len(shape["points"]) < 3:
                 continue
             lines.append(_line(cls, shape["points"], w, h))
+        if not lines:
+            unlabelled += 1
+            continue
         stem = Path(data.get("imagePath", js.name)).stem
-        (out_dir / f"{stem}.txt").write_text("\n".join(lines) + ("\n" if lines else ""))
+        (out_dir / f"{stem}.txt").write_text("\n".join(lines) + "\n")
         n += 1
-    return n, skipped
+    return n, unlabelled, skipped
 
 
 def check(images_dir: Path, labels_dir: Path):
@@ -119,16 +132,14 @@ def main(argv=None):
     p.add_argument("--images", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True, help="labels folder (YOLO .txt per image)")
     args = p.parse_args(argv)
-    if args.coco:
-        n, skipped = from_coco(args.coco, args.out)
-        print(f"[labels] {n} image(s) converted from COCO")
-    elif args.labelme:
-        n, skipped = from_labelme(args.labelme, args.out)
-        print(f"[labels] {n} image(s) converted from labelme")
+    if args.coco or args.labelme:
+        convert, source = (from_coco, args.coco) if args.coco else (from_labelme, args.labelme)
+        n, unlabelled, skipped = convert(source, args.out)
+        print(f"[labels] {n} image(s) converted; {unlabelled} without polygons got no label file")
     else:
         skipped = Counter()
     if skipped:
-        print(f"[labels] skipped classes (not one of {', '.join(CLASS_NAMES)}): {dict(skipped)}")
+        print(f"[labels] skipped (not a polygon of {', '.join(CLASS_NAMES)}): {dict(skipped)}")
     counts, missing, empty = check(args.images, args.out)
     print(f"[labels] objects per class: {dict(counts)}")
     print(f"[labels] {len(missing)} image(s) without a label file, {len(empty)} with an empty one")

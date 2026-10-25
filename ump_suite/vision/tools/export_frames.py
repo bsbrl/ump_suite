@@ -4,12 +4,12 @@ Copy frames from logged trials into one folder for labelling.
 Every Nth frame of each trial is copied (plus every frame flagged as an
 injection or an orient start, which are the moments that matter most), named
 `<session>__t<trial>__f<frame>.png`, and listed in `manifest.csv` with its
-source and its group. The group is the trial: frames of one trial show one
-embryo, so the training split keeps whole trials together and the model is
-always tested on embryos it never saw.
+source and its group. The group is the trial: frames of one trial show the
+same embryos, so the training split keeps whole trials together and the model
+is always tested on embryos it never saw.
 
-    python -m ump_suite.vision.tools.export_frames \
-        --trials "~/Backup/New 3" --trials ~ --every 4 --out ~/embryo_labels
+    python3 -m ump_suite.vision.tools.export_frames \
+        --trials ~/newcam --every 4 --out ~/embryo_labels
 """
 
 from __future__ import annotations

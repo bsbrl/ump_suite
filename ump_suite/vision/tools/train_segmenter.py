@@ -133,11 +133,14 @@ def main(argv=None):
         verbose=False,
         exist_ok=True,
         workers=4,
+        # The needle always enters from the right: a top-bottom mirror and a
+        # small tilt keep it there (and show cells at the mirrored clock
+        # positions); a left-right flip or a large rotation would not.
         fliplr=0.0,
-        flipud=0.0,
-        degrees=0.0,
+        flipud=0.5,
+        degrees=10.0,
         mosaic=0.5,
-    )  # the needle always enters from one side
+    )
     best = project / name / "weights" / "best.pt"
     print(f"[train] best weights: {best}")
     note = {
