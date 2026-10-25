@@ -43,7 +43,9 @@ AXIS_MIN_UM, AXIS_MAX_UM = 0, 20000
 ARRIVAL_TOLERANCE_UM = 1.5
 # How far the tip may end up from where the moves should have put it (pixels)
 # before the skill assumes the needle bent or slipped.
-TIP_LAG_LIMIT_PX = 30.0
+# Micrometres, so the check means the same at any camera scale (it was 30 px at
+# 1.8 um/px on the first camera).
+TIP_LAG_LIMIT_UM = 55.0
 # Strokes that turn the embryo by less than this count as "did nothing".
 NO_TURN_DEG = 2.0
 
@@ -493,10 +495,10 @@ class OrientSequence:
         tip = scene["needle"]["tip"] if scene.get("needle") else None
         if tip is None:
             raise OrientAborted("lost the needle")
-        lag = math.hypot(tip[0] - expected[0], tip[1] - expected[1])
-        if lag > TIP_LAG_LIMIT_PX:
+        lag_um = math.hypot(tip[0] - expected[0], tip[1] - expected[1]) * self.cal.um_per_px
+        if lag_um > TIP_LAG_LIMIT_UM:
             raise OrientAborted(
-                f"the tip is {lag:.0f} px from where it was sent " "(needle bent or slipped?)"
+                f"the tip is {lag_um:.0f} um from where it was sent (needle bent or slipped?)"
             )
 
     def _confirm(self, tol, first):

@@ -6,10 +6,11 @@ few hundred micrometres, then run (with the rig launched):
 
     ros2 run ump_suite calibrate_camera --confirm
 
-1. X is pulled back by --background-um so the needle leaves the view, and a
-   background frame is taken (the tip is then found by differencing; no model
-   is needed). Use --tip-source vision to take the tip from /vision/scene
-   instead.
+1. X is pulled back in --background-step-um steps (500) until a step changes
+   nothing on screen: the needle has left the view, whatever the camera's field
+   (at most --max-background-um, 6000). That frame is the background; the tip
+   is then found by differencing, with no model. Use --tip-source vision to
+   take the tip from /vision/scene instead.
 2. The needle returns to where it started.
 3. X and Y move +/-step and D moves back by step and 2 x step (D only ever
    retracts), each time returning to the start; the tip is found in each frame.
@@ -41,7 +42,7 @@ from .ros_interfaces import (
     TOPIC_VISION_SCENE,
 )
 from .vision import calibration
-from .vision.needle import tip_from_difference
+from .vision.needle import changed_area, needle_mask_from_difference, tip_from_difference
 
 AXIS = {"X": 0, "Y": 1, "Z": 2, "D": 3}
 STEP_LIMIT_UM = 300
@@ -134,6 +135,36 @@ class CalibrationNode(Node):
                 self._cond.wait(0.2)
 
 
+def find_background(goto, grab, start, *, step_um=500.0, max_um=6000.0, min_change_px=150):
+    """
+    Pull X back step by step until the needle has left the view.
+
+    `goto(position)` moves and waits; `grab()` returns a settled grey frame. A
+    frame is accepted as the background when the step to it changed fewer than
+    `min_change_px` pixels and, compared with the starting frame, the whole
+    needle (a changed region reaching the frame edge, where the needle enters)
+    has gone. The second test stops a needle that only crept a few pixels from
+    passing for an empty view. Returns (background, distance pulled back);
+    raises RuntimeError if the needle is still in view after `max_um`, or X
+    would leave the stage range.
+    """
+    first = previous = grab()
+    pulled = 0.0
+    while pulled < max_um:
+        pulled = min(pulled + step_um, max_um)
+        position = list(start)
+        position[0] -= pulled
+        if position[0] < 0:
+            raise RuntimeError("pulling X back would leave the stage range; start further in")
+        goto(position)
+        frame = grab()
+        if (changed_area(frame, previous) < min_change_px
+                and needle_mask_from_difference(first, frame) is not None):
+            return frame, pulled
+        previous = frame
+    raise RuntimeError(f"the needle was still in view after pulling X back {max_um:.0f} um")
+
+
 def run(node, args):
     import cv2
 
@@ -147,11 +178,11 @@ def run(node, args):
         save_dir.mkdir(parents=True, exist_ok=True)
     background = None
     if args.tip_source == "difference":
-        back = list(start)
-        back[0] -= args.background_um
-        node.goto(back, args.speed)
-        time.sleep(args.settle)
-        background = node.gray_after(time.time(), frames=5)
+        background, pulled = find_background(
+            lambda pos: node.goto(pos, args.speed),
+            lambda: (time.sleep(args.settle), node.gray_after(time.time(), frames=3))[1],
+            start, step_um=args.background_step_um, max_um=args.max_background_um)
+        print(f"[calibrate] background taken {pulled:.0f} um back along X")
         if save_dir:
             cv2.imwrite(str(save_dir / "background.png"), background)
         node.goto(start, args.speed)
@@ -170,8 +201,7 @@ def run(node, args):
             found = tip_from_difference(gray, background)
             if found is None:
                 raise RuntimeError(
-                    f"{label}: no needle found against the background; is the tip in view, "
-                    "and did --background-um take it out of view?"
+                    f"{label}: no needle found against the background; is the tip in view?"
                 )
             tip = found[0]
         if save_dir:
@@ -232,12 +262,10 @@ def main(argv=None):
         help="required: the needle is in clear liquid with nothing within reach",
     )
     p.add_argument("--step", type=float, default=100.0, help="move size per axis (um)")
-    p.add_argument(
-        "--background-um",
-        type=float,
-        default=1500.0,
-        help="how far X is pulled back for the background frame (um)",
-    )
+    p.add_argument("--background-step-um", type=float, default=500.0,
+                   help="X pull-back per step while looking for a needle-free frame (um)")
+    p.add_argument("--max-background-um", type=float, default=6000.0,
+                   help="give up if the needle is still in view after pulling X back this far")
     p.add_argument("--tip-source", choices=("difference", "vision"), default="difference")
     p.add_argument("--speed", type=int, default=500)
     p.add_argument("--settle", type=float, default=0.6, help="seconds to wait after each move")
@@ -249,8 +277,10 @@ def main(argv=None):
         p.error("refusing to move without --confirm (read the description first)")
     if not 10 <= args.step <= STEP_LIMIT_UM:
         p.error(f"--step must be within 10..{STEP_LIMIT_UM} um")
-    if not 200 <= args.background_um <= 4000:
-        p.error("--background-um must be within 200..4000 um")
+    if not 100 <= args.background_step_um <= 1000:
+        p.error("--background-step-um must be within 100..1000 um")
+    if not args.background_step_um <= args.max_background_um <= 10000:
+        p.error("--max-background-um must be within --background-step-um..10000 um")
 
     rclpy.init()
     node = CalibrationNode()

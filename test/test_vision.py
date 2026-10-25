@@ -235,3 +235,54 @@ def test_eval_compare_scores_identical_and_shifted_frames():
     assert row["iou_cell"] < 1.0
     stats = summarise([same, row])
     assert stats["cell_angle_deg"]["n"] == 2
+
+
+def _needle_frames(px_per_um=0.5, tip0=200.0, width=500, start_x=10000.0):
+    """Grey frames of a needle from the right edge whose tip moves right as X is pulled back."""
+    state = {"x": start_x}
+
+    def goto(pos):
+        state["x"] = pos[0]
+
+    def grab():
+        img = np.full((120, width), 220, np.uint8)
+        tip = tip0 + (start_x - state["x"]) * px_per_um
+        if tip < width:
+            img[58:63, int(tip):] = 120
+        return img
+
+    return goto, grab, state
+
+
+def test_find_background_pulls_back_until_the_needle_is_gone():
+    """The first step that changes nothing gives a needle-free background."""
+    from ump_suite.calibrate_camera import find_background
+
+    goto, grab, state = _needle_frames()
+    background, pulled = find_background(goto, grab, [10000.0, 0, 0, 0], step_um=200, max_um=6000)
+    assert (background == 220).all()
+    # the tip leaves the 500 px view after 600 um (300 px / 0.5 px per um); one more step confirms
+    assert pulled == 800
+    assert state["x"] == 10000.0 - 800
+
+
+def test_find_background_gives_up_and_respects_the_stage_range():
+    """A needle that never leaves, or a pull-back past X = 0, raises instead of guessing."""
+    from ump_suite.calibrate_camera import find_background
+
+    goto, grab, _ = _needle_frames(px_per_um=0.01)
+    with pytest.raises(RuntimeError, match="still in view"):
+        find_background(goto, grab, [10000.0, 0, 0, 0], step_um=500, max_um=1500)
+    goto, grab, _ = _needle_frames()
+    with pytest.raises(RuntimeError, match="stage range"):
+        find_background(goto, grab, [300.0, 0, 0, 0], step_um=500, max_um=6000)
+
+
+def test_a_needle_sliding_along_its_own_axis_still_counts_as_change():
+    """Only the tip region changes when the needle slides; that is still change."""
+    from ump_suite.vision.needle import changed_area
+
+    goto, grab, _ = _needle_frames()
+    before = grab()
+    goto([10000.0 - 200, 0, 0, 0])
+    assert changed_area(grab(), before) > 150

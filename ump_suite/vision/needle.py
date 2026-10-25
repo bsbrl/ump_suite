@@ -85,6 +85,17 @@ def needle_mask_from_difference(frame_gray, background_gray, *, threshold=14, mi
     return labels == best
 
 
+def changed_area(a_gray, b_gray, *, threshold=14):
+    """Pixels that differ clearly between two grey frames (after a light blur)."""
+    import cv2
+
+    diff = cv2.absdiff(np.asarray(a_gray, np.uint8), np.asarray(b_gray, np.uint8))
+    diff = cv2.GaussianBlur(diff, (5, 5), 0)
+    mask = cv2.morphologyEx((diff >= threshold).astype(np.uint8), cv2.MORPH_OPEN,
+                            np.ones((3, 3), np.uint8))
+    return int(mask.sum())
+
+
 def tip_from_difference(frame_gray, background_gray, **kwargs):
     """
     (tip_xy, direction) of the needle found by differencing against a background.
@@ -123,7 +134,11 @@ def extend_needle(instances, gray, **kwargs):
     line = needle_line(mask)
     if line is None:
         return instances
-    opts = {"max_extend_px": 400, "contrast": 5.0, "gap_px": 8, **kwargs}
+    # Compare the line with pixels just beyond the needle's own width, whatever the
+    # camera scale: the width is the mask's area over its length.
+    width = mask.sum() / max(line["length_px"], 1.0)
+    side = int(min(max(round(width), 3), 15))
+    opts = {"max_extend_px": 400, "contrast": 5.0, "gap_px": 8, "side_px": side, **kwargs}
     tip = refine_tip(gray, line["tip"], line["direction"], **opts)
     m = mask.astype(np.uint8)
     cv2.line(m, tuple(int(round(v)) for v in line["tip"]), tuple(int(round(v)) for v in tip), 1, 3)
