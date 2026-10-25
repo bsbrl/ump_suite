@@ -319,8 +319,8 @@ Orient, orient_result, injection_outcome
 
 The current CSV has **35 columns**. `Injection` was added on 7 October 2026,
 `injection_axis` / `injection_step_um` on 22 October 2026, and `Orient`,
-`orient_result` and `injection_outcome` on 24 October 2026 (branch
-`orientation-skill`); older trials have 29, 30 or 32 and simply lack them.
+`orient_result` and `injection_outcome` on 24 October 2026; older trials have
+29, 30 or 32 and simply lack them.
 
 **`Orient`** is `1` on the first row written after the orient skill starts.
 **`orient_result`** (`done`, `already_oriented` or `aborted`) is written on the
@@ -423,7 +423,7 @@ All UMP commands are absolute Sensapex targets. The bump buttons mutate the loca
 
 ---
 
-## Embryo vision and the orient skill (branch `orientation-skill`, 24 October 2026)
+## Embryo vision and the orient skill (added 24–25 October 2026)
 
 ### `vision_node`
 Runs a YOLO-seg model on the newest camera frame (frames that arrive while it
@@ -437,8 +437,10 @@ turns the masks into:
   yolk, whether the cell sits over the yolk's middle (on top or underneath) and
   whether the chorion is fully in view;
 - the needle: a line fitted to its mask, with the tip extended along that line
-  while the image stays darker than its sides (the tip is a few micrometres
-  wide and the mask stops short of it);
+  while the image stays darker than the pixels just beyond the needle's own
+  width on either side (the tip is a few micrometres wide and the mask stops
+  short of it; the width is measured from the mask, so this adapts to the
+  camera's scale);
 - `target`: the embryo whose chorion the needle line meets first;
 - `ray`: along the needle line from the tip, the distance to that chorion, to
   the cell's near edge and to its far edge, and whether the line meets the cell
@@ -490,7 +492,7 @@ calibration, no fresh scene, no needle, the needle points at no embryo, the
 embryo has no cell, the cell is over the yolk's middle (it would need a press
 from above, which this skill does not do), the yolk is leaving the view, the
 needle is more than `approach_max_um` from the chorion or already inside it,
-the tip ends more than 30 px from where the moves should have put it (needle
+the tip ends more than 55 µm from where the moves should have put it (needle
 bent or slipped), two strokes in a row turn the embryo the wrong way (check the
 calibration's Y), two strokes do nothing at the deepest dent, `max_strokes` is
 reached, or `timeout_s` passes. `/ump/stop` aborts it at once, without backing
@@ -517,8 +519,12 @@ in view, in clear liquid with nothing within a few hundred micrometres:
 ros2 run ump_suite calibrate_camera --confirm --save-frames ~/calibration_frames
 ```
 
-It pulls X back by `--background-um` (1500) so the needle leaves the view and
-takes a background frame, returns, then moves X and Y by ±`--step` (100 µm) and
+It pulls X back in `--background-step-um` steps (500 µm) until the whole needle
+has left the view: a step that changes almost nothing on screen, and a frame
+that differs from the starting one by a needle-shaped region reaching the frame
+edge. That frame is the background, so it works for any field of view; it gives
+up after `--max-background-um` (6000) or if X would leave the stage range. It
+then returns, moves X and Y by ±`--step` (100 µm) and
 D back by `step` and `2·step` (D only ever retracts), returning to the start
 after each move. The tip is found by differencing each frame against the
 background (no model needed); `--tip-source vision` uses `/vision/scene`
@@ -567,19 +573,38 @@ Label by hand; that is what a model you trust is trained on.
        --groups-from ~/embryo_seg_runs/<run>/model_note.json --um-per-px 1.8
    ```
 
-**State on 24 October 2026.** The installed model is a **test-only** YOLO11s-seg
-trained on SAM 2 pre-annotations of 654 frames from 22 trials (40 epochs).
-Against those same unchecked labels on 4 held-out trials: IoU chorion 0.92,
-yolk 0.90, cell 0.49, needle 0.46; cell angle error median 6°, mean 21°; tip
-error median 7 px but 90th percentile 387 px. It runs at about 18 ms per frame
-on the RTX 3080 Ti. Good enough to exercise the pipeline, not to orient or
-inject. No camera calibration exists yet, and the orient skill, the
-calibration and the measured step have not yet been run on a needle in view on
-the rig; on 24 October the needle was out of the field (UMP 1 at Z 200) and was
-not moved blind. Checked live that day without moving the needle: the vision
-node at 10 fps on real frames, `/orient/start` refused without a calibration,
-a dry-run orient through the real driver aborting on "no needle in view", the
-35-column log with an outcome, the GUI panels, and a MicroVLA dry run.
+**State on 25 October 2026: no model is installed.** The frames recorded so far
+are obsolete: a camera with a larger sensor is coming, which shows more embryos
+per view and makes each embryo and the needle smaller on screen. The test-only
+model trained on the old frames, the exported frames and its training runs
+were deleted on 25 October; the vision node reports "no model" until a model is
+trained on the new camera's frames. No camera calibration exists yet either.
+The generic starting weights (`yolo11s-seg.pt`, `yolo11n-seg.pt`, `sam2.1_b.pt`)
+are kept in `~/.local/share/ump_suite/models/`.
+
+For the record, on the old camera (24 October): a test-only YOLO11s-seg trained on
+SAM 2 pre-annotations of 654 frames reached, against those same unchecked labels
+on 4 held-out trials, IoU chorion 0.92, yolk 0.90, cell 0.49, needle 0.46, and
+ran at about 18 ms per frame on the RTX 3080 Ti. Checked live that day without
+moving the needle (it was out of the field, UMP 1 at Z 200): the vision node at
+10 fps, `/orient/start` refused without a calibration, a dry-run orient through
+the real driver aborting on "no needle in view", the 35-column log with an
+outcome, the GUI panels, and a MicroVLA dry run. The orient skill on an
+embryo, the calibration and the measured step have not been run on the rig.
+
+**For the new camera:**
+- `camera_node` works with any FLIR camera through Spinnaker (PySpin) at its
+  native resolution; another make needs a new driver node.
+- The logger writes a full-resolution PNG every tick; at a higher resolution it
+  may not keep 3 Hz. It reports the rate it achieved when a trial stops.
+- The segmentation input size (`imgsz`, 1024 in the launch file and the trainer)
+  may need raising, or tiling, for smaller embryos and a thinner needle; decide
+  from the first frames.
+- The skills' limits are in micrometres through the calibration, and the tip
+  finder adapts to the needle's width, so they carry over; recalibrate whenever
+  the camera, objective or adapter changes.
+- `bootstrap_labels.py`'s thresholds were tuned to the old frames; expect to
+  retune it, or label entirely by hand.
 
 ## Closed-loop VLA rollouts
 
