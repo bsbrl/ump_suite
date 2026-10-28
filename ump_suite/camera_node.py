@@ -9,6 +9,32 @@ Each frame is grabbed in a worker thread, then:
 Recording is controlled by a String message on /camera/record_cmd: a non-empty
 path starts recording to that file, an empty string stops it.
 
+=== Resolution and frame rate ===
+``binning`` combines b x b pixels in the camera, so the image keeps the whole
+field of view at 1/b the width and height. The 20 MP BFS-U3-200S6C (5472 x 3648)
+runs with 2: full-resolution frames are 60 MB in BGR8, and every consumer (JPEG
+encode, the GUI, a 3 Hz PNG logger) falls behind on them.
+``roi_width``/``roi_height``/``roi_offset_*`` then crop the binned image in the
+camera. The 20 MP sensor sees out to the edge of the microscope's light circle,
+which sits left of the sensor's centre, so the launch file crops to the lit 4:3
+part.
+
+While the camera's image processor (ISP) is on, which every colour format
+needs, this model runs at 6 fps whatever the binning or crop. ``raw_bayer``
+turns the ISP off and takes the 8-bit Bayer mosaic instead (FLIR's table: 16 fps
+at full resolution, 32 fps binned 2x2); this node then demosaics it and applies
+the colour matrix the ISP would have, read from the camera at startup (measured
+against the ISP's own output: within 4 grey levels). White balance and exposure
+stay in the camera. With the ISP off the camera averages binned pixels instead
+of summing them, so ``gain_db`` (12 dB = x4) restores the brightness the ISP's
+"Sum" gave at the same exposure. ``link_limit_mb_s`` raises the USB bandwidth
+the camera may use (it powers up at 60 MB/s) and ``frame_rate`` caps the rate;
+keep it below ``publish_hz`` or the preview throttle skips every other frame.
+
+USB3 cameras this size also need more USB buffer memory than Linux's 16 MB
+default (``/sys/module/usbcore/parameters/usbfs_memory_mb``; FLIR recommends
+1000). With the default, ``Init()`` fails with Spinnaker error -1016.
+
 === Image brightness ===
 The camera powers up with ``ExposureAuto = Continuous`` and an automatically
 chosen target grey level, which renders a bright brightfield background at
@@ -28,6 +54,7 @@ import threading
 import time
 
 import cv2
+import numpy as np
 import PySpin
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -45,6 +72,17 @@ from .ros_interfaces import (
 CAM_GET_TIMEOUT_MS = 1000
 
 
+# The camera's 8-bit Bayer layouts and OpenCV's demosaic codes. OpenCV names a
+# layout by the second row's second and third pixels, so RGGB is its "BG"
+# (checked on the BFS-U3-200S6C: the (0, 0) phase follows the red balance ratio).
+_BAYER_TO_BGR = {
+    "BayerRG8": cv2.COLOR_BayerBG2BGR,
+    "BayerGB8": cv2.COLOR_BayerGR2BGR,
+    "BayerGR8": cv2.COLOR_BayerGB2BGR,
+    "BayerBG8": cv2.COLOR_BayerRG2BGR,
+}
+
+
 def _ensure_bgr(frame):
     """Convert a PySpin frame to a 3-channel BGR image (no-op if already BGR)."""
     if frame.ndim == 2:
@@ -52,13 +90,38 @@ def _ensure_bgr(frame):
     return frame
 
 
+def bayer_to_bgr(raw, code, ccm=None):
+    """Demosaic an 8-bit Bayer frame, then apply a 3x3 colour matrix (BGR order)."""
+    bgr = cv2.cvtColor(raw, code)
+    if ccm is not None:
+        bgr = cv2.transform(bgr, ccm)
+    return bgr
+
+
 class CameraNode(Node):
     def __init__(self):
         super().__init__("camera_node")
 
         self.declare_parameter("publish_hz", 30.0)
-        self.declare_parameter("record_fps", 20.0)
+        # Frame rate written into the mp4; 0 = the camera's own frame rate, so
+        # the video plays at real speed.
+        self.declare_parameter("record_fps", 0.0)
         self.declare_parameter("jpeg_quality", 80)
+        # Combine binning x binning pixels in the camera (see the module docstring).
+        self.declare_parameter("binning", 1)
+        self.declare_parameter("binning_mode", "Sum")  # Sum | Average
+        # Crop in the camera, in binned pixels (see the module docstring).
+        # 0 keeps the whole width/height; a negative offset centres the crop.
+        self.declare_parameter("roi_width", 0)
+        self.declare_parameter("roi_height", 0)
+        self.declare_parameter("roi_offset_x", -1)
+        self.declare_parameter("roi_offset_y", -1)
+        # Take the raw Bayer mosaic with the camera's ISP off and convert it
+        # here; USB bandwidth in MB/s (0 = leave the camera's value); frame-rate
+        # cap (0 = as fast as the camera goes). See the module docstring.
+        self.declare_parameter("raw_bayer", False)
+        self.declare_parameter("link_limit_mb_s", 0.0)
+        self.declare_parameter("frame_rate", 0.0)
 
         # --- Image quality ------------------------------------------------
         # Target for the auto-exposure loop, in percent of full scale. The
@@ -95,6 +158,9 @@ class CameraNode(Node):
 
         self._exposure_locked = False
         self._held_exposure_us = 0.0
+        # Set by _configure_pixel_format when frames arrive as a Bayer mosaic.
+        self._bayer_code = None
+        self._ccm = None
         # PySpin image acquisition and node-map access are not thread safe, and
         # two threads reach the camera: the grab loop below, and the ROS
         # executor thread whenever a record command triggers a recalibration.
@@ -131,17 +197,34 @@ class CameraNode(Node):
             raise RuntimeError("No PySpin cameras detected.")
 
         self.cam = self.cams[0]
-        self.cam.Init()
+        try:
+            self.cam.Init()
+        except PySpin.SpinnakerException as exc:
+            # Drop every SDK reference before raising: a System released while a
+            # camera still holds its interface aborts the whole process.
+            self.cam = None
+            self.cams.Clear()
+            self.cams = None
+            self.system.ReleaseInstance()
+            self.system = None
+            hint = ""
+            if "-1016" in str(exc):
+                hint = (
+                    " The USB buffer memory is too small for this camera: run "
+                    "sudo sh -c 'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb' "
+                    "(and make it permanent, see the ump_suite README)."
+                )
+            raise RuntimeError(f"camera initialisation failed: {exc}.{hint}") from exc
 
         self._set_stream_newest_only(self.cam)
         self.cam.AcquisitionMode.SetValue(PySpin.AcquisitionMode_Continuous)
-
-        # Prefer BGR8 so we don't have to debayer manually. Cameras that
-        # don't support it stay on whatever default they advertise.
-        try:
-            self.cam.PixelFormat.SetValue(PySpin.PixelFormat_BGR8)
-        except PySpin.SpinnakerException:
-            pass
+        limit = float(self.get_parameter("link_limit_mb_s").value)
+        if limit > 0:
+            self._set_int("DeviceLinkThroughputLimit", int(limit * 1e6))
+        # Pixel format first: binning and the frame-rate limits depend on it.
+        self._configure_pixel_format()
+        self._configure_binning()
+        self._configure_frame_rate()
 
         self._configure_image_quality()
 
@@ -154,6 +237,198 @@ class CameraNode(Node):
         self._calibrate_white_balance()
         self._calibrate_exposure()
         self._log_exposure("after startup")
+
+    def _configure_pixel_format(self):
+        """
+        Choose BGR8 from the camera's ISP, or with `raw_bayer` the Bayer mosaic.
+
+        The ISP state is set either way, so a raw session does not leave it off.
+        """
+        self._set_bool("IspEnable", True)
+        # Prefer BGR8 so we don't have to debayer manually. Cameras that
+        # don't support it stay on whatever default they advertise.
+        self._set_enum("PixelFormat", "BGR8")
+        if not bool(self.get_parameter("raw_bayer").value):
+            return
+        formats = self._enum_entries("PixelFormat")
+        fmt = next((f for f in _BAYER_TO_BGR if f in formats), None)
+        if fmt is None:
+            self.get_logger().warn("raw_bayer: this camera offers no 8-bit Bayer format")
+            return
+        # Read the colour matrix while the ISP that owns it is still on.
+        ccm = self._read_color_matrix()
+        if not (self._set_enum("PixelFormat", fmt) and self._set_bool("IspEnable", False)):
+            self.get_logger().warn("raw_bayer: could not switch the ISP off; staying on BGR8")
+            self._set_bool("IspEnable", True)
+            self._set_enum("PixelFormat", "BGR8")
+            return
+        self._bayer_code = _BAYER_TO_BGR[fmt]
+        self._ccm = ccm
+        self.get_logger().info(
+            f"Raw {fmt} with the camera's ISP off; demosaic"
+            f"{' and colour matrix' if ccm is not None else ''} on this PC"
+        )
+
+    def _read_color_matrix(self):
+        """Return the ISP's RGB-to-RGB colour matrix in BGR order, or None if it is off."""
+        if not self._get_bool("ColorTransformationEnable"):
+            return None
+        self._set_enum("ColorTransformationSelector", "RGBtoRGB")
+        matrix = np.zeros((3, 3), np.float32)
+        for i in range(3):
+            for j in range(3):
+                if not self._set_enum("ColorTransformationValueSelector", f"Gain{i}{j}"):
+                    return None
+                matrix[i, j] = self._get_float("ColorTransformationValue")
+        if not np.isfinite(matrix).all():
+            return None
+        return matrix[::-1, ::-1].copy()  # RGB to BGR on both sides
+
+    def _configure_frame_rate(self):
+        """Cap the frame rate at `frame_rate`, or let the camera run free (0)."""
+        fps = float(self.get_parameter("frame_rate").value)
+        self._set_bool("AcquisitionFrameRateEnable", fps > 0)
+        if fps > 0:
+            self._set_float("AcquisitionFrameRate", fps)
+        self.get_logger().info(
+            f"Frame rate {self._get_float('AcquisitionResultingFrameRate'):.1f} fps"
+            f"{f' (capped at {fps:g})' if fps > 0 else ''}"
+        )
+
+    def _to_bgr(self, frame):
+        if self._bayer_code is not None:
+            return bayer_to_bgr(frame, self._bayer_code, self._ccm)
+        return _ensure_bgr(frame)
+
+    def _configure_binning(self):
+        """
+        Apply `binning` and the `roi_*` crop.
+
+        Both are applied every start, so values left in the camera by an earlier
+        session are undone.
+        """
+        b = max(1, int(self.get_parameter("binning").value))
+        mode = str(self.get_parameter("binning_mode").value)
+        if self._bayer_code is not None:
+            mode = "Average"  # what the camera does with the ISP off, whatever is asked
+        self._set_enum("BinningSelector", "All")
+        if b > 1:
+            self._set_enum("BinningHorizontalMode", mode)
+            self._set_enum("BinningVerticalMode", mode)
+        applied = [self._set_int(name, b) for name in ("BinningHorizontal", "BinningVertical")]
+        # The image area shrinks with binning; grow it back to the whole sensor.
+        for name in ("OffsetX", "OffsetY"):
+            self._set_int(name, 0)
+        full_w = self._set_int_to_max("Width")
+        full_h = self._set_int_to_max("Height")
+        if b > 1 and not all(applied):
+            self.get_logger().warn(f"this camera did not accept {b}x{b} binning")
+        area = ""
+        if full_w and full_h:
+            area = self._configure_roi(full_w, full_h)
+        self.get_logger().info(
+            f"Image {self._get_int('Width')}x{self._get_int('Height')}{area} "
+            f"(binning {b}x{b}{', ' + mode if b > 1 else ''})"
+        )
+
+    def _configure_roi(self, full_w, full_h):
+        """Crop to the `roi_*` parameters; return a note for the log ('' when uncropped)."""
+        want_w = int(self.get_parameter("roi_width").value) or full_w
+        want_h = int(self.get_parameter("roi_height").value) or full_h
+        if want_w >= full_w and want_h >= full_h:
+            return ""
+        fits = [self._set_int("Width", want_w), self._set_int("Height", want_h)]
+        w, h = self._get_int("Width"), self._get_int("Height")
+        offsets = []
+        for name, size, full in (("roi_offset_x", w, full_w), ("roi_offset_y", h, full_h)):
+            offset = int(self.get_parameter(name).value)
+            offsets.append((full - size) // 2 if offset < 0 else offset)
+        fits += [self._set_int("OffsetX", offsets[0]), self._set_int("OffsetY", offsets[1])]
+        x, y = self._get_int("OffsetX"), self._get_int("OffsetY")
+        if not all(fits) or (w, h, x, y) != (want_w, want_h, *offsets):
+            self.get_logger().warn(
+                f"crop {want_w}x{want_h} at ({offsets[0]}, {offsets[1]}) adjusted by the "
+                f"camera to {w}x{h} at ({x}, {y})"
+            )
+        return f" at ({x}, {y}) of {full_w}x{full_h}"
+
+    def _set_int(self, name, value) -> bool:
+        """
+        Set one integer node, returning False instead of raising.
+
+        The value is clamped to the node's range and rounded down to its step
+        (crop sizes and offsets come in steps of a few pixels).
+        """
+        try:
+            with self._cam_lock:
+                node = PySpin.CIntegerPtr(self._node_map().GetNode(name))
+                if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
+                    return False
+                lo, hi, inc = node.GetMin(), node.GetMax(), max(1, node.GetInc())
+                fits = lo <= int(value) <= hi
+                value = min(max(int(value), lo), hi)
+                node.SetValue(lo + (value - lo) // inc * inc)
+            return fits
+        except PySpin.SpinnakerException as exc:
+            self.get_logger().warn(f"could not set {name}={value}: {exc}")
+            return False
+
+    def _enum_entries(self, name):
+        """Names of the entries an enumeration node currently offers."""
+        try:
+            with self._cam_lock:
+                node = PySpin.CEnumerationPtr(self._node_map().GetNode(name))
+                if not PySpin.IsAvailable(node) or not PySpin.IsReadable(node):
+                    return []
+                return [PySpin.CEnumEntryPtr(e).GetSymbolic()
+                        for e in node.GetEntries() if PySpin.IsAvailable(e)]
+        except PySpin.SpinnakerException:
+            return []
+
+    def _set_bool(self, name, value) -> bool:
+        """Set one boolean node, returning False instead of raising."""
+        try:
+            with self._cam_lock:
+                node = PySpin.CBooleanPtr(self._node_map().GetNode(name))
+                if not PySpin.IsAvailable(node) or not PySpin.IsWritable(node):
+                    return False
+                node.SetValue(bool(value))
+            return True
+        except PySpin.SpinnakerException as exc:
+            self.get_logger().warn(f"could not set {name}={value}: {exc}")
+            return False
+
+    def _get_bool(self, name):
+        try:
+            with self._cam_lock:
+                node = PySpin.CBooleanPtr(self._node_map().GetNode(name))
+                if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+                    return bool(node.GetValue())
+        except PySpin.SpinnakerException:
+            pass
+        return None
+
+    def _get_int(self, name):
+        try:
+            with self._cam_lock:
+                node = PySpin.CIntegerPtr(self._node_map().GetNode(name))
+                if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+                    return node.GetValue()
+        except PySpin.SpinnakerException:
+            pass
+        return None
+
+    def _set_int_to_max(self, name):
+        """Set an integer node to its maximum and return the value, or None."""
+        try:
+            with self._cam_lock:
+                node = PySpin.CIntegerPtr(self._node_map().GetNode(name))
+                if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
+                    node.SetValue(node.GetMax())
+                return node.GetValue() if PySpin.IsReadable(node) else None
+        except PySpin.SpinnakerException as exc:
+            self.get_logger().warn(f"could not set {name} to its maximum: {exc}")
+            return None
 
     # ── Exposure / brightness ──────────────────────────────────────────────
     def _node_map(self):
@@ -267,7 +542,8 @@ class CameraNode(Node):
                 except PySpin.SpinnakerException:
                     return value
                 if not image.IsIncomplete():
-                    value = float(image.GetNDArray().mean())
+                    # Measure what is delivered, after any conversion on this PC.
+                    value = float(self._to_bgr(image.GetNDArray()).mean())
                 image.Release()
         return value
 
@@ -512,6 +788,10 @@ class CameraNode(Node):
             h, w = frame_bgr.shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             rec_fps = float(self.get_parameter("record_fps").value)
+            if rec_fps <= 0:
+                rec_fps = self._get_float("AcquisitionResultingFrameRate")
+                if not rec_fps > 0:  # NaN when the camera does not report it
+                    rec_fps = 10.0
             self.video_writer = cv2.VideoWriter(self.record_path, fourcc, rec_fps, (w, h))
 
         if self.video_writer.isOpened():
@@ -542,7 +822,7 @@ class CameraNode(Node):
                 # always sees every captured frame so the video stays smooth.
                 publish_due = (now - last_pub) >= publish_period
                 if publish_due or (self.recording and self.record_path):
-                    frame_bgr = _ensure_bgr(frame)
+                    frame_bgr = self._to_bgr(frame)
 
                     if publish_due:
                         last_pub = now
@@ -606,6 +886,9 @@ class CameraNode(Node):
 def main():
     from .runtime_guard import acquire_process_lock
     acquire_process_lock("camera")
+    # OpenCV starts one worker per core (32 here) for every small call and they
+    # spin: about a core per process at 25 fps. Two do the same work.
+    cv2.setNumThreads(2)
 
     rclpy.init()
     node = CameraNode()

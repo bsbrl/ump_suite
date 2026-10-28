@@ -155,3 +155,31 @@ def test_draw_scene_marks_the_target_and_the_distance():
     out = draw_scene(frame.copy(), scene)
     assert (out != frame).any()
     assert tuple(out[540, 710 - 0]) != (230, 230, 230)  # the line to the cell's edge
+
+
+def test_large_frames_are_decoded_smaller_and_the_overlay_follows():
+    from types import SimpleNamespace
+
+    import cv2
+    from sensor_msgs.msg import CompressedImage
+
+    from ump_suite.gui_node import display_scale
+
+    assert [display_scale(w) for w in (640, 1440, 2304, 2736, 5472)] == [1, 1, 2, 2, 4]
+
+    node = SimpleNamespace(latest_frame=None, _decode_scale=1)
+    msg = CompressedImage()
+    msg.data = cv2.imencode(".jpg", np.full((1824, 2736, 3), 200, np.uint8))[1].tobytes()
+    GuiNode._on_cam_image(node, msg)          # first frame: decoded in full
+    GuiNode._on_cam_image(node, msg)          # then at half size
+    frame, scale, count = node.latest_frame
+    assert (frame.shape[1], scale, count) == (1368, 2, 2)
+
+    # A scene in full-resolution pixels lands at half the coordinates.
+    scene = {"embryos": [], "target": None,
+             "needle": {"tip": [2000, 900], "base": [2735, 900], "direction": [-1, 0]},
+             "ray": {"hits_cell": True, "cell_near_px": 580, "cell_near_um": None}}
+    out = draw_scene(frame.copy(), scene, scale)
+    # At full-scale coordinates both would fall outside this 1368-px frame.
+    assert tuple(out[450, 710]) == (0, 200, 255)     # the cell edge: (2000 - 580) / 2
+    assert tuple(out[450, 1200]) == (200, 0, 200)    # the needle, tip 1000 to base 1367

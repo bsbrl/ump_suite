@@ -36,12 +36,49 @@ from ump_suite.runtime_guard import acquire_process_lock
 #   lock_exposure_while_recording
 #                        only meaningful with use_auto_exposure; freezes
 #                        exposure for each logged trial.
+#   binning              combine b x b pixels in the camera, keeping the whole
+#                        field of view. 2 for the 20 MP BFS-U3-200S6C (2736 x
+#                        1824); 1 for a small sensor such as the old 1.6 MP one.
+#                        Changing it changes um/px: recalibrate the camera.
+#   roi_width, roi_height, roi_offset_x, roi_offset_y
+#                        crop in the camera, in binned pixels (0 = whole width
+#                        or height, offset -1 = centred). The microscope's light
+#                        circle sits left of the BFS-U3-200S6C's centre, leaving
+#                        its right edge dark; 2304 x 1728 at (0, 0) is the 4:3
+#                        part that stays lit with the 4x objective. 4:3 also
+#                        matches the policy's 320 x 240 input, so frames are
+#                        neither padded in training nor stretched in rollout.
+#                        Once the camera is centred, 2432 x 1824 centred is the
+#                        full-height 4:3 crop.
+#   raw_bayer            take the raw Bayer mosaic with the camera's image
+#                        processor off and convert colours on this PC. With the
+#                        processor on, the BFS-U3-200S6C runs at 6 fps in every
+#                        mode; off, it reaches 32 fps binned. false for the old
+#                        camera (its processor never limited it).
+#   link_limit_mb_s      USB bandwidth the camera may use. It powers up at 60
+#                        MB/s; 380 is what FLIR rates it at.
+#   frame_rate           cap on the camera's frame rate. 25 rather than its 32:
+#                        it must stay below publish_hz or the preview throttle
+#                        skips every other frame, and 25 fps is plenty for a
+#                        3 Hz policy at a third less CPU.
+#   gain_db              with the processor off the camera averages binned
+#                        pixels instead of summing them; 12 dB (x4) gives back
+#                        the brightness at the same exposure (measured: within
+#                        3% of the processor's Sum, and no noisier).
 CAMERA_PARAMS = (
     "--ros-args"
     " -p publish_hz:=30.0"
+    " -p binning:=2"
+    " -p roi_width:=2304"
+    " -p roi_height:=1728"
+    " -p roi_offset_x:=0"
+    " -p roi_offset_y:=0"
+    " -p raw_bayer:=true"
+    " -p link_limit_mb_s:=380.0"
+    " -p frame_rate:=25.0"
     " -p target_mean_grey:=200.0"
     " -p exposure_time_us:=0.0"
-    " -p gain_db:=0.0"
+    " -p gain_db:=12.0"
     " -p use_auto_exposure:=false"
     " -p lock_exposure_while_recording:=true"
 )

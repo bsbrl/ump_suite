@@ -1,6 +1,6 @@
 # ump_suite
 
-A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **two Sensapex UMP micromanipulators**, an **ODrive**-driven focusing knob and a **FLIR Blackfly S** camera (a camera with a larger sensor is to replace it; see [For the new camera](#training-the-segmentation-model)).
+A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **two Sensapex UMP micromanipulators**, an **ODrive**-driven focusing knob and a **FLIR Blackfly S BFS-U3-200S6C** camera (20 MP colour, USB3, installed 27 October 2026 in place of the 1.6 MP BFS-U3-16S2C; see [`camera_node`](#camera_node)).
 
 The package wraps every device behind a small ROS2 node, ships a Qt GUI for manual teleop, and a logger that writes synchronized image / video / CSV trials. It also runs the rig's fixed skills: the **injection macro**, the **embryo vision** (segmentation of chorion, yolk, cell and needle) and the **orient skill** that turns an embryo until its cell faces the needle. It is the **robot side** only: the policy client (MicroVLA, in `~/MicroVLA2`) drives this rig over the ROS topics below.
 
@@ -12,7 +12,7 @@ The package wraps every device behind a small ROS2 node, ships a Qt GUI for manu
 |---|---|---|
 | Sensapex UMP (×2) | `sensapex` Python SDK + `libum.so` | [ump_driver_node.py](ump_suite/ump_driver_node.py) |
 | ODrive single-axis motor (focusing knob) | `odrive` Python SDK | [odrive_driver_node.py](ump_suite/odrive_driver_node.py) |
-| FLIR Blackfly S camera | PySpin (Spinnaker) | [camera_node.py](ump_suite/camera_node.py) |
+| FLIR Blackfly S BFS-U3-200S6C camera (20 MP colour, USB3) | PySpin (Spinnaker 4.2) | [camera_node.py](ump_suite/camera_node.py) |
 | Fluigent LineUP push-pull pressure controller | Fluigent Python SDK (`fluigent_sdk`) | [pressure_node.py](ump_suite/pressure_node.py) |
 | HEKA / patch-clamp monitor stream | UDP packets | [heka_udp_receiver_node.py](ump_suite/heka_udp_receiver_node.py) |
 
@@ -135,12 +135,141 @@ Connects via `odrive.find_any()`, puts axis 0 into closed-loop velocity control,
 The ODrive remains available for manual focusing-knob control from the GUI, but it is not included in the policy rollout action vector and is not written into the CSV logger.
 
 ### `camera_node`
-Initializes the first PySpin camera, prefers `BGR8` and `NewestOnly` stream buffering so the policy / GUI always see the freshest frame. A worker thread:
+Initializes the first PySpin camera with `NewestOnly` stream buffering so the policy / GUI always see the freshest frame. It takes either `BGR8` from the camera's image processor or, with `raw_bayer` (the launch setting for the 20 MP camera), the raw Bayer mosaic, which it converts to colour itself (see [Frame rate: raw Bayer mode](#frame-rate-raw-bayer-mode)). A worker thread:
 - publishes a JPEG preview (`jpeg_quality`) at `publish_hz` on `/camera/image/compressed`
 - publishes the actual grab rate on `/camera/fps`
-- writes every captured frame to an mp4 (`record_fps`) when recording is active
+- writes every captured frame to an mp4 when recording is active, declared at the
+  camera's own frame rate (`record_fps` 0) so it plays at real speed
 
 Recording is toggled by sending a path on `/camera/record_cmd` (empty string to stop).
+
+#### Resolution and USB memory (20 MP camera)
+
+The BFS-U3-200S6C's full frame is 5472 × 3648. At that size every consumer falls
+behind (measured 27 October 2026: the logger reached 1.6 Hz instead of 3 Hz with
+15 MB PNGs, saved frames went 3 s stale while recording, and the GUI used five
+CPU cores). The launch file therefore sets **`binning:=2`**: the camera combines
+2 × 2 pixels, keeping the whole field of view at **2736 × 1824** (cropped further
+below). Measured on 27 October with the camera's image processor doing the
+binning (`binning_mode` `Sum`, so each pixel gets 4× the light and the exposure
+dropped from about 13.6 ms to 3.8 ms): 6.1 fps, JPEG 0.3 MB, the logger at 3.00
+Hz with 3.9 MB PNGs and frames at most 0.33 s old, the video at real speed, the
+GUI at about 28% CPU. The camera now runs with that processor off and does the
+same binning on the raw data, at 25 fps (see
+[Frame rate: raw Bayer mode](#frame-rate-raw-bayer-mode)). `binning` is applied
+on every start; changing it changes µm per pixel, so recalibrate the camera
+(`calibrate_camera`) afterwards. Use `binning:=1` for a small sensor.
+
+USB3 cameras this size also need more USB buffer memory than Linux's default
+16 MB. With the default, Spinnaker fails at `Init()` with **-1016 "Not enough
+available memory to allocate buffers for streaming"**, the camera node exits and
+the GUI's camera view stays empty. FLIR recommends 1000 MB:
+
+```bash
+sudo sh -c 'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb'   # until the next reboot
+```
+
+To make it permanent, add a udev rule that sets it whenever a FLIR camera
+appears (including at boot):
+
+```bash
+echo 'ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1e10", RUN+="/bin/sh -c '"'"'echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb'"'"'"' \
+  | sudo tee /etc/udev/rules.d/41-flir-usbfs-memory.rules
+sudo udevadm control --reload-rules
+```
+
+(or add `usbcore.usbfs_memory_mb=1000` to `GRUB_CMDLINE_LINUX_DEFAULT` in
+`/etc/default/grub` and run `sudo update-grub`, FLIR's documented way). Check with
+`cat /sys/module/usbcore/parameters/usbfs_memory_mb`.
+
+**The crop.** The new sensor is about 2.6 times as wide as the old one and sees
+out to the edge of the microscope's circular field. On 27 October that circle sat
+off centre, about 12% of the frame width to the left and 6% up (radius about 1616
+binned pixels with the 4× objective), so the right of the frame went dark: from
+about 85% of the width in the corners, black at the edge. The 2× objective
+showed less of it. The launch file therefore crops in the camera, in binned
+pixels, to the part that stays lit:
+
+```
+roi_width:=2304  roi_height:=1728  roi_offset_x:=0  roi_offset_y:=0
+```
+
+Its darkest corner is about 70% of the centre's brightness with the 4× objective
+(1% without the crop). The crop is 4:3 on purpose: MicroVLA's image input is
+320 × 240, the dataset converter letterboxes frames into it and the rollout
+stretches them, and the two only agree for 4:3 frames. It also keeps the exposure
+calibration, which measures the whole delivered frame, off the dark area. It does
+not change the frame rate (with the image processor on, 6.1 fps at every crop
+measured from 1368 to 2736 px wide; with it off, 32.2 fps binned with or without
+the crop), but every frame is 20% smaller: PNGs 3.1 MB instead of 3.9 MB. The
+camera calibration is unaffected
+(it uses how far the tip moves in pixels, not where the frame starts); changing
+the crop's size or position does not need a recalibration, changing `binning`
+does. The node logs the result at startup, e.g. `Image 2304x1728 at (0, 0) of
+2736x1824 (binning 2x2, Average)`, and warns if the camera had to adjust it
+(sizes come in steps of 4 px across and 2 px down).
+
+To use more of the sensor, centre the light circle on it. Close the field
+diaphragm: if its edge appears off centre, centre it with the condenser's
+centring screws and open it until it just clears the frame. If the circle does
+not respond to the diaphragm, the camera adapter is off centre. Once centred,
+the full-height 4:3 crop (`roi_width:=2432 roi_height:=1824`, offsets `-1` for
+centred) fits inside the circle; the whole 3:2 frame would still have dim
+corners, as the circle only just reaches them.
+
+#### Frame rate: raw Bayer mode
+
+With its image processor (ISP) on, which every colour pixel format needs, the
+BFS-U3-200S6C runs at **6 fps in every mode**. FLIR's frame-rate table lists 6
+fps for every ISP-on row, and here binning, cropping, the ADC bit depth and the
+USB limit made no difference (measured 28 October). At 6 fps a frame can already
+be 165 ms old, and MicroVLA's rollout, which refuses an observation whose frame
+and positions arrived more than 0.25 s apart, failed that check about once a
+minute.
+
+The launch file therefore sets **`raw_bayer:=true`**. The camera sends its 8-bit
+Bayer mosaic (`BayerRG8`) with the ISP off, still binned 2 × 2 and cropped in the
+camera, and the node converts each frame:
+
+1. demosaic with OpenCV (`COLOR_BayerBG2BGR`, which is OpenCV's name for the
+   camera's RGGB layout);
+2. the ISP's own colour matrix, read from the camera at startup.
+
+White balance and exposure stay in the camera; both work with the ISP off.
+Against the ISP's output of the same view at the same exposure, the result is
+within 3% in brightness and within 4 grey levels per pixel on average, and it is
+no noisier (frame-to-frame noise 3.4 / 2.5 / 2.2 grey levels in B / G / R
+against 4.8 / 2.5 / 3.2). The ISP applied no gamma on top of the matrix, so the
+node does not either. The two steps take about 3 ms per frame.
+
+| Parameter | Launch value | Why |
+|---|---|---|
+| `raw_bayer` | `true` | ISP off; the camera then reaches 32 fps binned. `false` for the old camera, whose ISP never limited it. |
+| `link_limit_mb_s` | `380` | USB bandwidth the camera may use. It powers up at 60 MB/s, which caps raw frames at 3–4 fps; 380 is FLIR's reference value. |
+| `frame_rate` | `25` | Cap. It must stay below `publish_hz` (30): the preview throttle skips a frame that comes sooner than 1/`publish_hz` after the last one, so at 32 fps every other frame would go. 25 fps also costs a quarter less CPU. |
+| `gain_db` | `12` | With the ISP off the camera averages binned pixels instead of summing them; 12 dB (× 4) restores the brightness at the same exposure. |
+
+Measured on 28 October with the whole rig running:
+
+- 25.0 fps steady (frame gaps 36–43 ms), including while recording;
+- MicroVLA's own observation code, polled at 3 Hz for a minute, passed 180 of
+  180 checks: frame and positions at most 51 ms apart, frames at most 52 ms old;
+- the logger at 3.01 Hz with saved frames at most 0.19 s old, videos at 25 fps
+  and real speed;
+- mean grey 200.2, a neutral white field, no clipped pixels;
+- CPU: the camera node about 70% of one core (about 105% while recording video),
+  the GUI about 40%.
+
+OpenCV is limited to two threads in the camera and GUI nodes. By default it
+starts a worker per core (32 on this PC) for every small call and they spin,
+which cost about a core per process at 25 fps.
+
+On 28 October the field needed 10.6 ms of exposure for mean grey 200, against
+4.9 ms the day before; the ISP mode needed the same 10.3 ms that day, so the light
+was dimmer, not the mode. Raise the illumination if the moving needle blurs.
+
+Unbinned raw frames would run at 16.6 fps (23.4 fps cropped to 4608 × 3456) but
+send 16–20 MB per frame over USB and leave the binning to the PC.
 
 #### Brightness and exposure
 
@@ -164,7 +293,7 @@ The node therefore calibrates once at startup and then holds both fixed:
 |---|---|---|
 | `target_mean_grey` | `200.0` | Measures the delivered image and bisects exposure until its mean grey matches, then holds it. `0` disables. |
 | `exposure_time_us` | `0.0` | `> 0` states the exposure outright and skips calibration. |
-| `gain_db` | `0.0` | Prefer exposure over gain; gain amplifies noise. |
+| `gain_db` | `0.0` | Prefer exposure over gain; gain amplifies noise. The launch file sets `12` with `raw_bayer` (see [Frame rate](#frame-rate-raw-bayer-mode)). |
 | `exposure_search_max_us` | `15000.0` | Upper bound for the search. |
 | `use_auto_exposure` | `false` | Hand brightness back to the camera's own loop. |
 | `target_grey_percent` | `80.0` | Target for that loop. Only used when `use_auto_exposure` is true. |
@@ -211,8 +340,10 @@ and names the likely causes rather than quietly under-exposing:
 ```
 
 That message is the dividing line between a settings problem and a real optical
-one. Note also that full-resolution BGR8 is capped near **12.9 fps** by
-`DeviceLinkThroughputLimit` (60 MB/s), regardless of `publish_hz`.
+one. The frame rate is a property of the camera, not `publish_hz`: the old 1.6 MP
+camera's full-resolution BGR8 was capped near 12.9 fps by
+`DeviceLinkThroughputLimit` (60 MB/s); the 20 MP camera runs at 25 fps in raw
+mode (see [Frame rate](#frame-rate-raw-bayer-mode)).
 
 PySpin needs the system Spinnaker `.so` libraries plus a dedicated virtualenv, so the launch file starts the camera node via `ExecuteProcess` with the venv activated rather than as a normal `ament_python` executable. Edit the `CAMERA_BOOTSTRAP` string in [launch/app.launch.py](launch/app.launch.py) to match your setup.
 
@@ -604,9 +735,10 @@ Label by hand; that is what a model you trust is trained on.
        --groups-from ~/embryo_seg_runs/<run>/model_note.json --um-per-px <from calibration>
    ```
 
-**State on 25 October 2026: no model is installed.** The frames recorded so far
-are obsolete: a camera with a larger sensor is coming, which shows more embryos
-per view and makes each embryo and the needle smaller on screen. The test-only
+**State on 27 October 2026: no model is installed.** The frames recorded before
+25 October are obsolete: the camera has a larger sensor now (installed 27
+October), which shows more embryos per view and makes each embryo and the
+needle smaller on screen. The test-only
 model trained on the old frames, the exported frames and its training runs
 were deleted on 25 October; the vision node reports "no model" until a model is
 trained on the new camera's frames. No camera calibration exists yet either.
@@ -629,10 +761,13 @@ embryo, the calibration and the measured step have not been run on the rig.
   **My Robot** icon starts the rig in the home folder, so start it from a
   terminal instead: `mkdir -p ~/newcam && cd ~/newcam && ~/start_robot.sh`. Use
   that folder for `export_frames --trials` and MicroVLA's `--data-root`.
-- `camera_node` works with any FLIR camera through Spinnaker (PySpin) at its
-  native resolution; another make needs a new driver node.
-- The logger writes a full-resolution PNG every tick; at a higher resolution it
-  may not keep 3 Hz. It reports the rate it achieved when a trial stops.
+- The BFS-U3-200S6C runs through `camera_node` as raw Bayer data, binned 2 × 2
+  and cropped to the lit 2304 × 1728, at 25 fps (see
+  [Frame rate: raw Bayer mode](#frame-rate-raw-bayer-mode)), and the logger
+  keeps 3 Hz with it. The machine needs the larger USB buffer memory described in
+  [Resolution and USB memory](#resolution-and-usb-memory-20-mp-camera); until
+  the udev rule there is installed, it falls back to 16 MB at every reboot and
+  the camera view stays empty.
 - The segmentation input size (`imgsz`, 1024 in the launch file and the trainer)
   may need raising, or tiling, for smaller embryos and a thinner needle; decide
   from the first frames.

@@ -139,6 +139,17 @@ DEFAULT_PRESSURE_MBAR = 0.0
 LIVE_POLL_MS = 50
 SEND_THROTTLE_MS = 60
 CAM_UPDATE_MS = 30
+# Camera frames are decoded at 1/2, 1/4 or 1/8 size (JPEG DCT scaling, much
+# cheaper than a full decode) while that stays at least this wide. On a 1080p
+# screen the view is about 700 px wide (height-limited), so a 2304 px wide crop
+# still decodes at 1/2.
+CAM_DISPLAY_MIN_WIDTH = 1024
+_CAM_DECODE_FLAGS = {
+    1: cv2.IMREAD_COLOR,
+    2: cv2.IMREAD_REDUCED_COLOR_2,
+    4: cv2.IMREAD_REDUCED_COLOR_4,
+    8: cv2.IMREAD_REDUCED_COLOR_8,
+}
 HEKA_PLOT_UPDATE_MS = 100
 HEKA_PLOT_WINDOW_S = 0.25
 HEKA_MAX_DRAW_POINTS = 2200
@@ -249,7 +260,12 @@ class GuiNode(Node):
         self.live_ump_stamp = None
         self.live_ump2_stamp = None
         self.live_motor_stamp = None
-        self.latest_frame_bgr = None
+        # (frame, scale, count): the newest camera frame decoded `scale` times
+        # smaller than the camera image, and how many frames have arrived, so
+        # the view redraws only when something changed. One tuple, so the GUI
+        # thread never pairs a frame with another frame's scale.
+        self.latest_frame = None
+        self._decode_scale = 1
         self.latest_pressure_mbar = None
         self.latest_pressure_target = None
         self.latest_heka_voltage = None
@@ -328,9 +344,12 @@ class GuiNode(Node):
     def _on_cam_image(self, msg: CompressedImage):
         try:
             data = np.frombuffer(msg.data, dtype=np.uint8)
-            frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            scale = self._decode_scale
+            frame = cv2.imdecode(data, _CAM_DECODE_FLAGS[scale])
             if frame is not None:
-                self.latest_frame_bgr = frame
+                count = self.latest_frame[2] + 1 if self.latest_frame else 1
+                self.latest_frame = (frame, scale, count)
+                self._decode_scale = display_scale(frame.shape[1] * scale)
         except Exception:
             pass
 
@@ -1017,37 +1036,56 @@ class InjectionPanel(QGroupBox):
         self.state_label.setText(text)
 
 
-def draw_scene(frame, scene):
-    """Draw a vision scene (vision/geometry.py) onto a BGR frame of the same size."""
+def display_scale(full_width):
+    """Largest of 1, 2, 4, 8 that keeps `full_width` / scale at least CAM_DISPLAY_MIN_WIDTH."""
+    scale = 1
+    while scale < 8 and full_width / (scale * 2) >= CAM_DISPLAY_MIN_WIDTH:
+        scale *= 2
+    return scale
+
+
+def draw_scene(frame, scene, scale=1):
+    """
+    Draw a vision scene (vision/geometry.py) onto a BGR frame.
+
+    The scene is in full-resolution pixels; `scale` is how many times smaller
+    `frame` is than the camera image.
+    """
+    k = 1.0 / scale
+
+    def pt(x, y):
+        return int(x * k), int(y * k)
+
     target = scene.get("target")
     for i, e in enumerate(scene.get("embryos", [])):
         ch = e["chorion"]
         thick = 4 if i == target else 2
-        cv2.circle(frame, (int(ch["cx"]), int(ch["cy"])), int(ch["r"]), (200, 120, 0), thick)
+        cv2.circle(frame, pt(ch["cx"], ch["cy"]), int(ch["r"] * k), (200, 120, 0), thick)
         if e.get("yolk"):
             y = e["yolk"]
-            cv2.circle(frame, (int(y["cx"]), int(y["cy"])), int(y["r"]), (0, 0, 220), 2)
+            cv2.circle(frame, pt(y["cx"], y["cy"]), int(y["r"] * k), (0, 0, 220), 2)
         if e.get("cell"):
             c = e["cell"]
-            cv2.circle(frame, (int(c["cx"]), int(c["cy"])), 10, (0, 200, 0), -1)
+            cv2.circle(frame, pt(c["cx"], c["cy"]), 10, (0, 200, 0), -1)
         label = f"#{i}"
         if e.get("cell_angle_deg") is not None:
             label += f"  cell {e['cell_angle_deg']:+.0f} deg"
         if e.get("cell_on_face"):
             label += " (on top/under)"
-        cv2.putText(frame, label, (int(ch["cx"] - ch["r"] * 0.6), int(ch["cy"] - ch["r"] - 12)),
+        x, y = pt(ch["cx"] - ch["r"] * 0.6, ch["cy"] - ch["r"])
+        cv2.putText(frame, label, (x, y - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 120, 0), 2, cv2.LINE_AA)
     needle = scene.get("needle")
     if needle:
-        tip = (int(needle["tip"][0]), int(needle["tip"][1]))
-        base = (int(needle["base"][0]), int(needle["base"][1]))
+        tip = pt(*needle["tip"])
+        base = pt(*needle["base"])
         cv2.line(frame, base, tip, (200, 0, 200), 2)
         cv2.circle(frame, tip, 8, (200, 0, 200), 2)
         ray = scene.get("ray")
         if ray and ray.get("hits_cell") and ray.get("cell_near_px") is not None:
             dx, dy = needle["direction"]
             t = ray["cell_near_px"]
-            hit = (int(tip[0] + dx * t), int(tip[1] + dy * t))
+            hit = (int(tip[0] + dx * t * k), int(tip[1] + dy * t * k))
             cv2.line(frame, tip, hit, (0, 200, 255), 2)
             cv2.circle(frame, hit, 7, (0, 200, 255), -1)
             dist = ray.get("cell_near_um")
@@ -1322,6 +1360,7 @@ class UMPGuiApp(QMainWindow):
         self.live_timer.timeout.connect(self._poll_live_to_gui)
         self.live_timer.start(LIVE_POLL_MS)
 
+        self._camera_view_key = None
         self.camera_timer = QTimer(self)
         self.camera_timer.timeout.connect(self._update_camera_view)
         self.camera_timer.start(CAM_UPDATE_MS)
@@ -1677,14 +1716,21 @@ class UMPGuiApp(QMainWindow):
             self.live_resistance.setText(f"{resistance:.2f} MOhm")
 
     def _update_camera_view(self):
-        frame = self.node.latest_frame_bgr
-        if frame is None:
+        latest = self.node.latest_frame
+        if latest is None:
             return
+        frame, scale, count = latest
 
         scene = self.node.latest_scene
-        if (self.show_vision.isChecked() and scene is not None
-                and time.monotonic() - self.node.latest_scene_stamp <= 1.0):
-            frame = draw_scene(frame.copy(), scene)
+        show = (self.show_vision.isChecked() and scene is not None
+                and time.monotonic() - self.node.latest_scene_stamp <= 1.0)
+        key = (count, self.node.latest_scene_stamp if show else None,
+               self.camera_label.width(), self.camera_label.height())
+        if key == self._camera_view_key:
+            return  # nothing new to draw
+        self._camera_view_key = key
+        if show:
+            frame = draw_scene(frame.copy(), scene, scale)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
@@ -1862,6 +1908,9 @@ class UMPGuiApp(QMainWindow):
 def main():
     from .runtime_guard import acquire_process_lock
     acquire_process_lock("gui")
+    # OpenCV starts one worker per core (32 here) for every small call and they
+    # spin: most of a core at 25 fps. Two do the same work.
+    cv2.setNumThreads(2)
 
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
