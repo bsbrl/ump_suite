@@ -66,16 +66,17 @@ SRV_INJECT_START = "/inject/start"
 TOPIC_INJECT_OUTCOME = "/inject/outcome"
 INJECTION_OUTCOMES = ("cell", "yolk", "chorion_space", "no_puncture")
 
-# Orient skill, run by the UMP 1 driver (see orient.py): turns the embryo the
-# needle points at until its cell faces the needle.
-#   /orient/params  <- GUI: latched JSON of OrientParams fields (+ token, seq)
-#   /orient/start   -> std_srvs/Trigger
-#   /orient/status  -> latched JSON {count, active, stage, message, result,
-#                      strokes, angle_deg, gain_deg_per_um, history, params, stamp}
-# /ump/stop aborts a running orient.
-TOPIC_ORIENT_PARAMS = "/orient/params"
+# Orient segments, kept by the UMP 1 driver. Orienting the embryo is done by a
+# person (GUI) or by MicroVLA's orient policy, both through the ordinary
+# targets; these only mark when it starts and ends, so the logger can flag it.
+#   /orient/start   -> std_srvs/Trigger: open a segment
+#   /orient/done    -> std_srvs/Trigger: close it, result "done"
+#   /orient/abort   -> std_srvs/Trigger: close it, result "aborted"
+#   /orient/status  -> latched JSON {count, active, stage, message, result, stamp}
 TOPIC_ORIENT_STATUS = "/orient/status"
 SRV_ORIENT_START = "/orient/start"
+SRV_ORIENT_DONE = "/orient/done"
+SRV_ORIENT_ABORT = "/orient/abort"
 
 # Vision node (vision_node.py): the scene from the segmentation model.
 #   /vision/scene   -> JSON scene (vision/geometry.py) for each processed frame

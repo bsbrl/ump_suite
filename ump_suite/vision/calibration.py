@@ -17,7 +17,7 @@ From those:
                  (micrometres) that moves the tip by `disp` pixels on screen
 
 The result is saved as JSON (default ~/.config/ump_suite/vision_calibration.json)
-and read by the vision node, the orient skill and MicroVLA's vision step.
+and read by the vision node and MicroVLA's measured injection step.
 """
 
 from __future__ import annotations

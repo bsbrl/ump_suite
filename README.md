@@ -2,7 +2,7 @@
 
 A ROS2 (Humble, `ament_python`) package for collecting datasets and running closed-loop VLA policies on a rig built around **two Sensapex UMP micromanipulators**, an **ODrive**-driven focusing knob and a **FLIR Blackfly S BFS-U3-200S6C** camera (20 MP colour, USB3, installed 27 October 2026 in place of the 1.6 MP BFS-U3-16S2C; see [`camera_node`](#camera_node)).
 
-The package wraps every device behind a small ROS2 node, ships a Qt GUI for manual teleop, and a logger that writes synchronized image / video / CSV trials. It also runs the rig's fixed skills: the **injection macro**, the **embryo vision** (segmentation of chorion, yolk, cell and needle) and the **orient skill** that turns an embryo until its cell faces the needle. It is the **robot side** only: the policy client (MicroVLA, in `~/MicroVLA2`) drives this rig over the ROS topics below.
+The package wraps every device behind a small ROS2 node, ships a Qt GUI for manual teleop, and a logger that writes synchronized image / video / CSV trials. It also runs the rig's fixed skills: the **injection macro** and the **embryo vision** (segmentation of chorion, yolk, cell and needle), and it marks **orient segments**, the stretches in which a person or MicroVLA's orient policy turns an embryo until its cell faces the needle. It is the **robot side** only: the policy client (MicroVLA, in `~/MicroVLA2`) drives this rig over the ROS topics below.
 
 ---
 
@@ -35,7 +35,6 @@ ump_suite/
 │   ├── gui_node.py              # PyQt control panel
 │   ├── heka_udp_receiver_node.py # HEKA UDP bridge for voltage/current samples
 │   ├── injection.py             # The injection macro (run by the UMP 1 driver)
-│   ├── orient.py                # The orient skill (run by the UMP 1 driver)
 │   ├── vision_node.py           # YOLO-seg segmentation of the camera -> /vision/scene
 │   ├── calibrate_camera.py      # um/px, image <-> stage axes and D tilt, by moving UMP 1
 │   └── vision/                  # Scene geometry, needle tip, calibration, segmenter (no ROS)
@@ -76,9 +75,9 @@ driver also constructs service names from its configured prefix.
 | `/inject/start` | `std_srvs/Trigger` | service (UMP 1 driver) | Run one injection with the current `/inject/params`; refused with a reason if it cannot start |
 | `/inject/status` | `std_msgs/String` | publish (UMP 1 driver) | Latched JSON `{count, active, stage, message, params, params_token, params_seq, injection_params, stamp}`; `count` rises once per injection that starts; `params` are the values the next trigger will use, `injection_params` the values injection number `count` actually ran with (`null` before the first) |
 | `/inject/outcome` | `std_msgs/String` | subscribe (logger) | JSON `{count, outcome}` from the GUI's Record button; `outcome` is `cell`, `yolk`, `chorion_space` or `no_puncture` |
-| `/orient/params` | `std_msgs/String` | subscribe (UMP 1 driver) | Latched JSON of the orient skill's settings (`OrientParams` in [orient.py](ump_suite/orient.py)) plus `token`, `seq`; published by the GUI's Orient panel; missing keys take defaults |
-| `/orient/start` | `std_srvs/Trigger` | service (UMP 1 driver) | Run the orient skill once on the embryo the needle points at; refused with a reason (no calibration, injection running, stage moving, fault) |
-| `/orient/status` | `std_msgs/String` | publish (UMP 1 driver) | Latched JSON `{count, active, stage, message, result, strokes, angle_deg, gain_deg_per_um, history, params, params_token, params_seq, stamp}`; `result` is `done`, `already_oriented` or `aborted` |
+| `/orient/start` | `std_srvs/Trigger` | service (UMP 1 driver) | Open an orient segment (see [Orient segments](#orient-segments)); refused while one is open, an injection runs, or a fault is latched. Nothing moves |
+| `/orient/done`, `/orient/abort` | `std_srvs/Trigger` | service (UMP 1 driver) | Close the open segment with the result `done` or `aborted`; refused when none is open |
+| `/orient/status` | `std_msgs/String` | publish (UMP 1 driver) | Latched JSON `{count, active, stage, message, result, stamp}`; `count` rises once per segment opened, `result` is `done` or `aborted` once it closes |
 | `/vision/scene` | `std_msgs/String` | publish (vision node) | JSON scene per processed frame: embryos (chorion, yolk, cell, cell angle), needle tip/direction, the embryo the needle points at, distances along the needle line; `stamp` is the camera frame's own timestamp |
 | `/vision/status` | `std_msgs/String` | publish (vision node) | Latched JSON `{ready, message, model, test_only, fps, inference_ms, calibrated, stamp}`, once a second |
 
@@ -453,13 +452,13 @@ The current CSV has **35 columns**. `Injection` was added on 7 October 2026,
 `orient_result` and `injection_outcome` on 24 October 2026; older trials have
 29, 30 or 32 and simply lack them.
 
-**`Orient`** is `1` on the first row written after the orient skill starts.
-**`orient_result`** (`done`, `already_oriented` or `aborted`) is written on the
-first row after it ends. As for an injection, the position, target, pressure
-command and state-stamp columns hold their pre-orient values while it runs, but
-unlike an injection the skill leaves the needle somewhere new, so the result row
-shows a jump in position. The GUI then re-syncs UMP 1's targets to the live
-position (see `gui_node`), so the next logged target is the new position.
+**`Orient`** is `1` on the first row written after an orient segment opens
+(`/orient/start`). **`orient_result`** (`done` or `aborted`) is written on the
+first row after it closes. Unlike an injection, the rows inside a segment are
+logged live, every move included: a person or MicroVLA's orient policy turns the
+embryo, and those moves are demonstrations of orienting. Rows logged before
+3 November 2026 came from the replaced orient controller, which froze them at
+the pre-orient values and could also write `already_oriented`.
 **`injection_outcome`** is the operator's verdict on the last injection,
 written on the next row after it was recorded with the GUI's Record button.
 
@@ -532,15 +531,14 @@ Below the Injection boxes, **Went into** (cell / yolk / chorion space / no
 puncture) and **Record** publish `/inject/outcome` for the latest injection, so
 each trial records whether the injection reached the cell.
 
-The **Orient** panel, under Injection, has the orient skill's settings
-(Tolerance, Strokes, Stroke, Dent, Standoff, Speed; saved in `gui.ini` under
-`orient/`), a **Dry run** box (the skill plans and reports its moves but sends
-none), **Orient** and **Stop**. A line shows the vision node's state (model
-ready or not, test-only, fps, calibrated or not) and the skill's progress. When
-an orient run ends, the panel syncs UMP 1's target boxes to the live position and
-sends it: the skill moved the stage through the SDK, not `/ump/target`, so the
-boxes would otherwise still hold the old target and the next nudge would drive
-the needle back there.
+The **Orient** panel, under Injection, marks orient segments: **Orient** when
+you start turning the embryo (with UMP 1's own controls), **Done** when its cell
+faces the needle, **Cancel** to give up (logged as `aborted`), and **Stop** for
+UMP 1. Nothing moves on its own. A line shows whether a segment is open, and
+another the vision node's state (model ready or not, test-only, fps, calibrated
+or not). When a segment closes, the panel syncs UMP 1's target boxes to the live
+position, without sending anything, so the next nudge starts from where the
+needle is (a rollout's orient policy moves it without the GUI).
 
 The camera view draws the vision scene when **Show vision** is ticked (the
 default): chorion circles (the embryo the needle points at thicker), yolk
@@ -558,7 +556,7 @@ All UMP commands are absolute Sensapex targets. The bump buttons mutate the loca
 
 ---
 
-## Embryo vision and the orient skill (added 24–25 October 2026)
+## Embryo vision and orient segments
 
 ### `vision_node`
 Runs a YOLO-seg model on the newest camera frame (frames that arrive while it
@@ -599,57 +597,31 @@ ultralytics is installed without its dependencies (`pip install --user
 one. The package sets `YOLO_AUTOINSTALL=false` and `YOLO_OFFLINE=true` before
 importing it, so it never pip-installs at run time.
 
-### The orient skill (`orient.py`, run by the UMP 1 driver)
-`/orient/start` turns the embryo the needle points at until its cell faces the
-needle, with a step-and-look loop on the cell angle φ:
+### Orient segments
 
-1. if |φ| is within the tolerance on `confirm_frames` fresh scenes, stop
-   without moving (`already_oriented`);
-2. move sideways so the needle line passes through the chorion's centre;
-3. advance until the tip is `dent_um` inside the chorion's outline;
-4. stroke sideways along the rim by `u = clip(loop_gain · (−φ) / ĝ, ±stroke_max_um)`
-   (at least `stroke_min_um`); a stroke "up" on screen at the needle-side rim
-   turns the embryo counterclockwise;
-5. back off to `backoff_um` outside the chorion and look again;
-6. if the stroke turned the embryo at least 2° the way it was sent, update
-   this embryo's gain ĝ (degrees per µm of stroke):
-   ĝ ← (1 − `gain_blend`)·ĝ + `gain_blend`·(turned / stroke), the measured
-   value clamped to ĝ/10…10ĝ; if it turned less than 2°, deepen the dent by
-   `dent_step_um` up to `dent_max_um` instead; a turn the wrong way is counted
-   but not learned from;
-7. when |φ| is within tolerance on `confirm_frames` scenes, re-centre
-   sideways and stop at the standard standoff.
+Turning an embryo until its cell faces the needle is done by a person (rig GUI)
+or by MicroVLA's orient policy, a separate imitation-learning model that its
+rollout runs when MicroVLA decides to orient (see MicroVLA's
+`docs/microinjection.md`). Either way the needle moves through the ordinary
+`/ump/target` commands. The UMP 1 driver only keeps **segments**, so a
+recording shows where orienting began and ended:
 
-The starting gain is 1 / (2R) rad/µm (R the chorion radius), the value for a
-chorion rolling against a trough wall; the loop then learns the real one. Only
-X and Y move; Z and D never change. Pixel moves become X/Y moves through the
-camera calibration.
+- `/orient/start` opens one (`/orient/status` `active: true`, `count` + 1);
+- `/orient/done` or `/orient/abort` closes it with that result.
 
-It aborts (backing off first if the needle is in the chorion) when: there is no
-calibration, no fresh scene, no needle, the needle points at no embryo, the
-embryo has no cell, the cell is over the yolk's middle (it would need a press
-from above, which this skill does not do), the yolk is leaving the view, the
-needle is more than `approach_max_um` from the chorion or already inside it,
-the tip ends more than 55 µm from where the moves should have put it (needle
-bent or slipped), two strokes in a row turn the embryo the wrong way (check the
-calibration's Y), two strokes in a row do nothing and the dent cannot go
-deeper, `max_strokes` is reached, or `timeout_s` passes. `/ump/stop` aborts it at once, without backing
-off. While it runs the driver ignores `/ump/target` and refuses `/inject/start`;
-an injection running refuses `/orient/start`.
+The GUI's Orient, Done and Cancel buttons call these; a rollout running its
+orient policy calls them itself. While a segment is open `/inject/start` is
+refused; targets, `/ump/stop` and everything else work as usual. MicroVLA learns
+*when* to orient from the logged `Orient` flags; the orient policy learns *how*
+from the moves inside the segments, or from trials recorded for it alone.
 
-Rolling the chorion against a wall moves the embryo along by about half of each
-stroke, so a long turn can carry the yolk out of view; the skill then stops.
-Whether rolling the chorion turns the embryo *inside* it, and which method
-(needle against the trough wall, a second tool on the far side, or a deeper
-dent onto the yolk) works best, has to be found by hand on the rig first. The
-skill implements the single-needle methods; a two-tool version is not written.
-
-Defaults (`OrientParams`): tolerance 15°, confirm 3 frames, 25 strokes, stroke
-15–250 µm, dent 40 µm (max 120, step 20), standoff 60 µm, approach at most
-800 µm, loop gain 0.6, gain blend 0.5, 200 µm/s, settle 0.4 s, timeout 300 s.
+Until 3 November 2026 the driver ran an orient controller here (`orient.py`, a
+step-and-look loop on the cell angle that needed the vision node and the
+camera calibration). It was replaced by the orient policy; it is in this
+repository's history up to commit `4c5cdfa`.
 
 ### Camera calibration (`calibrate_camera`)
-The vision step and the orient skill need micrometres per pixel, which way each
+MicroVLA's measured injection step needs micrometres per pixel, which way each
 stage axis moves the tip on screen, and the D axis's tilt. With the needle tip
 in view, in clear liquid with nothing within a few hundred micrometres:
 
@@ -750,10 +722,10 @@ SAM 2 pre-annotations of 654 frames reached, against those same unchecked labels
 on 4 held-out trials, IoU chorion 0.92, yolk 0.90, cell 0.49, needle 0.46, and
 ran at about 18 ms per frame on the RTX 3080 Ti. Checked live that day without
 moving the needle (it was out of the field, UMP 1 at Z 200): the vision node at
-10 fps, `/orient/start` refused without a calibration, a dry-run orient through
-the real driver aborting on "no needle in view", the 35-column log with an
-outcome, the GUI panels, and a MicroVLA dry run. The orient skill on an
-embryo, the calibration and the measured step have not been run on the rig.
+10 fps, the (since replaced) orient controller refusing without a calibration
+and aborting a dry run on "no needle in view", the 35-column log with an
+outcome, the GUI panels, and a MicroVLA dry run. The calibration and the
+measured step have not been run on the rig.
 
 **For the new camera:**
 - Launch the rig from a new folder so the new trials do not mix with the
@@ -791,7 +763,7 @@ embryo, the calibration and the measured step have not been run on the rig.
 | `/ump/live`, `/ump2/live` | `[x, y, z, d]` absolute micrometres per manipulator → the 4- or 8-value state |
 | `/heka/resistance_mohm`, `/pressure/measured_mbar` | optional sensor inputs |
 | `/vision/scene` | embryos, needle and distances (embryo tokens, the measured step, the prompt check) |
-| `/inject/status`, `/orient/status` | progress and counts of the injection macro and the orient skill |
+| `/inject/status`, `/orient/status` | progress and counts of the injection macro and of orient segments |
 
 ### What the rig accepts (action)
 
@@ -800,7 +772,7 @@ embryo, the calibration and the measured step have not been run on the rig.
 | `/ump/target`, `/ump2/target` | `[x, y, z, d, speed]` absolute micrometres plus speed |
 | `/pressure/mbar` | `Float32` exact pressure in mbar |
 | `/inject/params`, `/inject/start` | run the injection macro (optionally with the client's own step) |
-| `/orient/start` | run the orient skill |
+| `/orient/start`, `/orient/done`, `/orient/abort` | mark an orient segment (the client's orient policy moves the needle through `/ump/target`) |
 | `/ump/stop`, `/ump2/stop` | SDK stop |
 
 A dual-arm client controls **8 motion coordinates and a separate pressure channel**:
@@ -894,9 +866,13 @@ This starts the dual UMP driver (`device_id=1` and `device_id=2` in one process)
 4. Perform the trial. The logger writes one row per `log_interval_ms` (default 333 ms = 3 Hz).
 5. Click **Stop Data Acquisition** — this calls `/acq/stop`, closes the CSV, and stops the mp4.
 
-For microinjection: press **Orient** when the cell does not face the needle,
-**Inject** when the needle is in place, and after each injection choose **Went
-into** and press **Record**. The logger records all three.
+For microinjection: when the cell does not face the needle, press **Orient**,
+turn the embryo with UMP 1's controls and press **Done** once it faces the
+needle; press **Inject** when the needle is in place; after each injection
+choose **Went into** and press **Record**. The logger records all of them. To
+record demonstrations for the orient policy alone, record each as its own trial
+in its own folder: start with the needle near the embryo, not touching it, and
+stop a second after the cell faces the needle.
 
 Output layout (inside the launch folder):
 

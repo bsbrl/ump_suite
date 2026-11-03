@@ -1,9 +1,8 @@
 """
 GUI orient panel, outcome recording and vision overlay.
 
-Offscreen, against the real UMP driver with a simulated stage and a simulated
-embryo publishing vision scenes; isolated localhost-only ROS domain; temporary
-settings and calibration files.
+Offscreen, against the real UMP driver with a simulated stage; isolated
+localhost-only ROS domain; temporary settings.
 """
 
 import json
@@ -28,18 +27,12 @@ from std_msgs.msg import String  # noqa: E402
 from ump_suite import ump_driver_node  # noqa: E402
 from ump_suite.gui_node import GuiNode, UMPGuiApp, draw_scene  # noqa: E402
 from ump_suite.ros_interfaces import TOPIC_INJECT_OUTCOME  # noqa: E402
-from ump_suite.vision import calibration as cal_module  # noqa: E402
-from ump_suite.vision.geometry import wrap_deg  # noqa: E402
 
 from injection_sim import FakePressure, SimStage, SimUMP  # noqa: E402
-from orient_sim import calibration  # noqa: E402
-from test_orient_ros import SceneFeeder  # noqa: E402
 
 
 @pytest.fixture
 def gui(tmp_path, monkeypatch):
-    monkeypatch.setattr(cal_module, "DEFAULT_PATH", tmp_path / "vision_calibration.json")
-    calibration().save()
     SimUMP.stage = SimStage()
     monkeypatch.setattr(ump_driver_node, "UMP", SimUMP)
     app = QApplication.instance() or QApplication([])
@@ -51,8 +44,6 @@ def gui(tmp_path, monkeypatch):
         nodes.append(FakePressure())
         driver = ump_driver_node.UMPDriverNode()
         nodes.append(driver)
-        feeder = SceneFeeder(SimUMP.stage)
-        nodes.append(feeder)
         listener = Node("outcome_listener")
         outcomes = []
         listener.create_subscription(
@@ -64,7 +55,7 @@ def gui(tmp_path, monkeypatch):
             executor.add_node(item)
         thread = threading.Thread(target=executor.spin, daemon=True)
         thread.start()
-        yield app, node, driver, feeder, outcomes, str(tmp_path / "gui.ini")
+        yield app, node, driver, SimUMP.stage, outcomes, str(tmp_path / "gui.ini")
     finally:
         if executor is not None:
             executor.shutdown()
@@ -86,42 +77,40 @@ def wait_until(app, window, predicate, timeout=20.0):
     raise AssertionError("condition not reached")
 
 
-def test_orient_button_runs_the_skill_and_resyncs_ump1(gui):
-    app, node, driver, feeder, _outcomes, path = gui
+def test_orient_done_and_cancel_mark_a_segment_and_resync_ump1(gui):
+    app, node, driver, stage, _outcomes, path = gui
     window = UMPGuiApp(node, settings=QSettings(path, QSettings.IniFormat))
     panel = window.orient_panel
-    assert panel.title() == "Orient" and panel.orient_button.text() == "Orient"
-    # Faster settings for the test, typed into the boxes; they persist.
-    for name, value in (("speed_um_s", 2000), ("stroke_max_um", 250), ("tolerance_deg", 15)):
-        panel.boxes[name].setValue(value)
-    wait_until(
-        app,
-        window,
-        lambda: (node.latest_orient_status or {}).get("params", {}).get("speed_um_s") == 2000,
-    )
-    feeder.gain = 0.15
-    driver._orient_params = driver._orient_params.__class__(
-        **{**driver._orient_params.to_dict(), "gain_deg_per_um": 0.15, "settle_s": 0.05}
-    )
+    assert panel.title() == "Orient"
+    assert [b.text() for b in (panel.orient_button, panel.done_button, panel.cancel_button)] == [
+        "Orient", "Done", "Cancel"]
+    wait_until(app, window, lambda: node.latest_orient_status is not None)
+    window.orient_panel.update_status()
+    assert panel.orient_button.isEnabled() and not panel.done_button.isEnabled()
     panel.orient()
-    wait_until(
-        app,
-        window,
-        lambda: (node.latest_orient_status or {}).get("stage") in ("done", "aborted")
-        and (node.latest_orient_status or {}).get("count") == 1,
-    )
-    assert node.latest_orient_status["result"] == "done", node.latest_orient_status
-    assert abs(wrap_deg(feeder.cell)) <= 16
+    wait_until(app, window, lambda: (node.latest_orient_status or {}).get("active"))
+    window.orient_panel.update_status()
+    assert not panel.orient_button.isEnabled() and panel.done_button.isEnabled()
+    assert "orienting" in panel.state_label.text()
+    # The needle is turned by hand (here: moved by the simulated stage) meanwhile.
+    stage.pos[0] -= 120
+    panel.done_button.click()
+    wait_until(app, window, lambda: (node.latest_orient_status or {}).get("result") == "done")
+    window.orient_panel.update_status()
     wait_until(app, window, lambda: panel.orient_button.isEnabled())
     live = [int(v) for v in node.latest_live_ump]
     targets = [window.panel1.target_spins[a].value() for a in ("X", "Y", "Z", "D")]
     assert targets == live
-    reopened = UMPGuiApp(node, settings=QSettings(path, QSettings.IniFormat))
-    assert reopened.orient_panel.boxes["speed_um_s"].value() == 2000
+    panel.orient()
+    wait_until(app, window, lambda: (node.latest_orient_status or {}).get("count") == 2
+               and (node.latest_orient_status or {}).get("active"))
+    panel.cancel_button.click()
+    wait_until(app, window, lambda: (node.latest_orient_status or {}).get("result") == "aborted")
+    assert not driver._orienting
 
 
 def test_outcome_needs_an_injection_and_is_published(gui):
-    app, node, _driver, _feeder, outcomes, path = gui
+    app, node, _driver, _stage, outcomes, path = gui
     window = UMPGuiApp(node, settings=QSettings(path, QSettings.IniFormat))
     panel = window.injection_panel
     panel.record_outcome()

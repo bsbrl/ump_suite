@@ -13,18 +13,18 @@ When acquisition is running, this node periodically writes one CSV row per
     row whose image does not match its position
   * an `Injection` flag: 1 on the first row after an injection starts, else 0,
     and on that row the axis and step (um) the injection actually ran with
-  * an `Orient` flag: 1 on the first row after the orient skill starts, and
-    `orient_result` (done / already_oriented / aborted) on the first row after
-    it ends
+  * an `Orient` flag: 1 on the first row after an orient segment opens
+    (/orient/start), and `orient_result` (done / aborted) on the first row after
+    it closes
   * `injection_outcome`: the operator's verdict on the last injection (cell,
     yolk, chorion_space or no_puncture) on the row after it was recorded
 
-While an injection or the orient skill runs (see injection.py, orient.py), the
-position, target, pressure command and state-stamp columns keep the values they
-had just before it started. Each is logged as one command, not as the moves
-inside it. Images, resistance and measured pressure stay live. The orient skill
-leaves the needle somewhere new, so the first row after it shows a jump in
-position; `orient_result` marks that row.
+While an injection runs (see injection.py), the position, target, pressure
+command and state-stamp columns keep the values they had just before it started:
+it is logged as one command, not as the moves inside it. Images, resistance and
+measured pressure stay live. An orient segment is logged as it happens, every
+move included: a person or MicroVLA's orient policy turns the embryo, and those
+moves are demonstrations of orienting.
 
 It also forwards a record path to the camera node so that the matching mp4
 video file is captured for the same trial.
@@ -94,9 +94,9 @@ CSV_HEADER = [
     # injection ran with, as the driver reported them; blank on other rows.
     "injection_axis",
     "injection_step_um",
-    # 1 on the first row written after the orient skill started, else 0.
+    # 1 on the first row written after an orient segment opened, else 0.
     "Orient",
-    # On the first row after it finished: done, already_oriented or aborted.
+    # On the first row after it closed: done or aborted.
     "orient_result",
     # The operator's verdict on the last injection, on the row after it was
     # recorded: cell, yolk, chorion_space or no_puncture.
@@ -147,7 +147,6 @@ class LoggerNode(Node):
         # Orient bookkeeping, as for injections.
         self._orient_count = None
         self._orient_active = False
-        self._orient_snapshot = None
         self._orient_pending = False
         self._orient_result_pending = ""
         self._outcome_pending = ""
@@ -291,7 +290,7 @@ class LoggerNode(Node):
             self._injection_snapshot = None
 
     def on_orient_status(self, msg: String):
-        """Freeze the logged state while the orient skill runs; flag its start and result."""
+        """Flag the first row of an orient segment and record its result."""
         try:
             status = json.loads(msg.data)
             count = int(status["count"])
@@ -308,11 +307,9 @@ class LoggerNode(Node):
             count if self._orient_count is None else max(count, self._orient_count))
         if started and self.acquiring:
             self._orient_pending = True
-        if active and self._orient_snapshot is None:
-            self._orient_snapshot = self._logged_state()
+        if active:
             self._orient_active = True
-        elif not active and self._orient_active:
-            self._orient_snapshot = None
+        elif self._orient_active:
             self._orient_active = False
             result = str(status.get("result") or status.get("stage") or "")
             if self.acquiring and result:
@@ -546,7 +543,7 @@ class LoggerNode(Node):
             return
 
         # During an injection these hold their pre-injection values.
-        state = self._injection_snapshot or self._orient_snapshot or self._logged_state()
+        state = self._injection_snapshot or self._logged_state()
         live_ump, live_ump2 = state["live_ump"], state["live_ump2"]
         target_ump, target_ump2 = state["target_ump"], state["target_ump2"]
         state_stamp = state["state_stamp"]

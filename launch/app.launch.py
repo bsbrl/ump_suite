@@ -151,8 +151,8 @@ def generate_launch_description():
 
         gui,
 
-        # Segmentation of the camera feed for the orient skill and MicroVLA's
-        # vision step. Without a model file it stays idle and says so on
+        # Segmentation of the camera feed for MicroVLA's embryo tokens and its
+        # measured injection step. Without a model file it stays idle and says so on
         # /vision/status; the rest of the rig is unaffected.
         Node(
             package="ump_suite",

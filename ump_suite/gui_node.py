@@ -77,19 +77,15 @@ from .injection import (
     encode_params_message,
     validate_params,
 )
-from .orient import (
-    OrientParams,
-    encode_params_message as encode_orient_params,
-    validate_params as validate_orient_params,
-)
 from .ros_interfaces import (
     INJECTION_OUTCOMES,
     SRV_ACQ_START,
     SRV_ACQ_STOP,
     SRV_INJECT_START,
+    SRV_ORIENT_ABORT,
+    SRV_ORIENT_DONE,
     SRV_ORIENT_START,
     TOPIC_INJECT_OUTCOME,
-    TOPIC_ORIENT_PARAMS,
     TOPIC_ORIENT_STATUS,
     TOPIC_VISION_SCENE,
     TOPIC_VISION_STATUS,
@@ -237,14 +233,13 @@ class GuiNode(Node):
         self.latest_inject_status = None
         self.pub_inject_outcome = self.create_publisher(String, TOPIC_INJECT_OUTCOME, 10)
 
-        # Orient skill (UMP 1 driver) and the vision node's scene.
-        self.pub_orient_params = self.create_publisher(
-            String, TOPIC_ORIENT_PARAMS, latched_qos()
-        )
+        # Orient segments (UMP 1 driver) and the vision node's scene.
         self.create_subscription(
             String, TOPIC_ORIENT_STATUS, self._on_orient_status, latched_qos(depth=10)
         )
         self.cli_orient = self.create_client(Trigger, SRV_ORIENT_START)
+        self.cli_orient_done = self.create_client(Trigger, SRV_ORIENT_DONE)
+        self.cli_orient_abort = self.create_client(Trigger, SRV_ORIENT_ABORT)
         self.latest_orient_status = None
         self.create_subscription(String, TOPIC_VISION_SCENE, self._on_vision_scene, 2)
         self.create_subscription(
@@ -1103,141 +1098,74 @@ def draw_scene(frame, scene, scale=1):
 
 class OrientPanel(QGroupBox):
     """
-    Orient button and the orient skill's settings (see orient.py).
+    Marks orient segments: when the embryo was turned, by whom, and how it ended.
 
-    The settings are published on /orient/params whenever they change. The UMP 1
-    driver runs the skill using the vision node's scene; this panel asks it to
-    start and shows its progress. When a run ends, UMP 1's target boxes are
-    synced to where the skill left the needle and that position is sent, so the
-    next nudge starts from there and not from the old target.
+    Press Orient when you start turning the embryo (with UMP 1's controls) and
+    Done when its cell faces the needle, or Cancel to give up. Nothing moves on
+    its own. The UMP 1 driver keeps the segment and the logger flags it: MicroVLA
+    learns when to orient from the flag, and the orient policy's dataset can
+    take the moves inside it. MicroVLA's rollout opens and closes segments itself
+    when it runs its orient policy. When a segment closes, UMP 1's target boxes
+    are synced to where the needle is, so the next nudge starts from there.
     """
-
-    FIELDS = (
-        # name, label, suffix, min, max, decimals
-        ("tolerance_deg", "Tolerance", " deg", 2, 90, 0),
-        ("max_strokes", "Strokes", "", 1, 50, 0),
-        ("stroke_max_um", "Stroke", " \u00b5m", 5, 400, 0),
-        ("dent_um", "Dent", " \u00b5m", 0, 300, 0),
-        ("backoff_um", "Standoff", " \u00b5m", 10, 500, 0),
-        ("speed_um_s", "Speed", " \u00b5m/s", 10, 2000, 0),
-    )
 
     def __init__(self, app, settings):
         super().__init__("Orient")
         self.app = app
         self.settings = settings
-        self._token = uuid.uuid4().hex
-        self._seq = 0
-        self._published = None
         self._was_active = False
-        defaults = OrientParams()
-        self.boxes = {}
-        for name, _label, suffix, vmin, vmax, _dec in self.FIELDS:
-            box = QSpinBox()
-            box.setRange(vmin, vmax)
-            box.setSuffix(suffix)
-            InjectionPanel._style_box(box)
-            try:
-                value = float(self.settings.value(f"orient/{name}", getattr(defaults, name)))
-            except (TypeError, ValueError):
-                value = float(getattr(defaults, name))
-            if not math.isfinite(value) or not vmin <= value <= vmax:
-                value = float(getattr(defaults, name))
-            box.setValue(int(round(value)))
-            box.setMinimumWidth(104 if name == "speed_um_s" else 88)
-            box.setMaximumWidth(104 if name == "speed_um_s" else 88)
-            box.valueChanged.connect(lambda _v, n=name: self._on_value_changed(n))
-            self.boxes[name] = box
-        self.dry_run = QCheckBox("Dry run (plan only, no motion)")
-        self.dry_run.toggled.connect(lambda _c: self.publish_params())
         self.orient_button = QPushButton("Orient")
         self.orient_button.setProperty("kind", "danger")
         self.orient_button.setToolTip(
-            "Turn the embryo the needle points at until its cell faces the needle")
-        self.orient_button.setFixedSize(84, 30)
+            "Start of an orient segment: press it as you begin turning the embryo")
+        self.done_button = QPushButton("Done")
+        self.done_button.setProperty("kind", "primary")
+        self.done_button.setToolTip("The cell faces the needle: close the segment")
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setProperty("kind", "secondary")
+        self.cancel_button.setToolTip("Close the segment as aborted")
+        for button in (self.orient_button, self.done_button, self.cancel_button):
+            button.setFixedSize(84, 30)
         self.orient_button.clicked.connect(self.orient)
+        self.done_button.clicked.connect(lambda: self._end(self.app.node.cli_orient_done))
+        self.cancel_button.clicked.connect(lambda: self._end(self.app.node.cli_orient_abort))
         self.stop_button = QPushButton("Stop")
         self.stop_button.setProperty("kind", "secondary")
-        self.stop_button.setToolTip("Stop UMP 1 now; a running orient halts")
+        self.stop_button.setToolTip("Stop UMP 1 now")
         self.stop_button.clicked.connect(self.stop)
         self.state_label = QLabel("Waiting for the UMP 1 driver")
         self.state_label.setWordWrap(True)
-        self.state_label.setMinimumHeight(40)
+        self.state_label.setMinimumHeight(24)
         self.vision_label = QLabel("Vision: waiting for the vision node")
         self.vision_label.setObjectName("hint")
         self.vision_label.setWordWrap(True)
         self._build()
-        self.publish_params()
+        self._set_active(False)
 
     def _build(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(5)
-        # Six settings in two columns of label + box; the buttons get their own row
-        # so the panel fits the control column.
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(4)
-        for i, (name, label, *_rest) in enumerate(self.FIELDS):
-            row, col = i % 3, 2 * (i // 3)
-            grid.addWidget(QLabel(label), row, col)
-            grid.addWidget(self.boxes[name], row, col + 1)
-        grid.setColumnStretch(4, 1)
-        layout.addLayout(grid)
-        layout.addWidget(self.dry_run)
         buttons = QHBoxLayout()
-        buttons.addWidget(self.orient_button)
-        buttons.addWidget(self.stop_button)
+        for button in (self.orient_button, self.done_button, self.cancel_button,
+                       self.stop_button):
+            buttons.addWidget(button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
-        layout.addWidget(self.vision_label)
         layout.addWidget(self.state_label)
+        layout.addWidget(self.vision_label)
 
-    def _on_value_changed(self, name):
-        self.settings.setValue(f"orient/{name}", self.boxes[name].value())
-        self.settings.sync()
-        self.publish_params()
-
-    def current_params(self):
-        raw = {name: box.value() for name, box in self.boxes.items()}
-        raw["dry_run"] = self.dry_run.isChecked()
-        return validate_orient_params(raw)
-
-    def publish_params(self, force=False):
-        try:
-            params = self.current_params()
-        except ValueError as exc:
-            self.state_label.setText(f"Not published: {exc}")
-            return None
-        if force or self._published is None or self._published[0] != params:
-            self._seq += 1
-            self.app.node.pub_orient_params.publish(
-                String(data=encode_orient_params(params, self._token, self._seq)))
-            self._published = (params, self._seq)
-        return self._published[1]
-
-    def _driver_has(self, seq):
-        status = self.app.node.latest_orient_status
-        return (status is not None and status.get("params_token") == self._token
-                and status.get("params_seq") == seq)
+    def _set_active(self, active):
+        self.orient_button.setEnabled(not active)
+        self.done_button.setEnabled(active)
+        self.cancel_button.setEnabled(active)
 
     def orient(self):
-        for box in self.boxes.values():
-            box.interpretText()
-        seq = self.publish_params()
-        if seq is not None and not self._driver_has(seq):
-            seq = self.publish_params(force=True)
-        if seq is None:
-            self.app.set_status("Orient not started: " + self.state_label.text())
-            return
-        deadline = time.monotonic() + INJECT_PARAMS_ECHO_TIMEOUT_S
-        while not self._driver_has(seq):
-            if time.monotonic() > deadline:
-                self.app.set_status("Orient not started: the UMP 1 driver has not confirmed "
-                                    "the settings (is it running?)")
-                return
-            time.sleep(0.01)
         ok, message = self.app.node.call_trigger(self.app.node.cli_orient)
+        self.app.set_status(message if message else f"Orient: {ok}")
+
+    def _end(self, client):
+        ok, message = self.app.node.call_trigger(client)
         self.app.set_status(message if message else f"Orient: {ok}")
 
     def stop(self):
@@ -1256,25 +1184,21 @@ class OrientPanel(QGroupBox):
             self.vision_label.setText("Vision: " + ", ".join(p for p in parts if p))
         status = self.app.node.latest_orient_status
         if status is None:
-            self.orient_button.setEnabled(True)
+            self._set_active(False)
             self.state_label.setText("Waiting for the UMP 1 driver")
             return
         active = bool(status.get("active"))
-        self.orient_button.setEnabled(not active)
-        stage = str(status.get("stage", ""))
-        message = str(status.get("message", ""))
+        self._set_active(active)
         count = status.get("count", 0)
         if active:
-            text = f"#{count} running ({stage}): {message}"
-        elif stage in ("done", "aborted"):
-            text = f"#{count} {stage}: {message}"
+            text = f"#{count} orienting: press Done when the cell faces the needle"
         else:
-            text = message or "ready"
+            text = str(status.get("message", "")) or "ready"
         self.state_label.setText(text)
         if self._was_active and not active:
-            # The skill moved the needle without /ump/target; hold it where it is.
+            # Whoever turned the embryo left the needle somewhere new; start the
+            # next nudge from there. Nothing is sent.
             self.app.panel1.sync_to_live()
-            self.app.panel1.send_now()
         self._was_active = active
 
 
