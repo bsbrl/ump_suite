@@ -652,13 +652,20 @@ Label by hand; that is what a model you trust is trained on.
    (the logger writes both into the folder the rig was launched from) and can
    be repeated:
    ```bash
-   python3 -m ump_suite.vision.tools.export_frames --trials ~/newcam \
+   python3 -m ump_suite.vision.tools.export_frames --trials ~ --session inject \
        --every 30 --out ~/embryo_labels
    ```
    Every Nth frame (`--every`, default 4) plus every frame an injection or
-   orient was decided on goes to `images/`, listed with its trial in
+   orient was decided on goes to `images/`, named
+   `<session>__t<trial>__f<frame>.png` and listed with its trial in
    `manifest.csv`. Frames of one trial at 3 Hz barely differ, so for labelling
    a large N (30 = one frame per 10 s) gives more variety for the effort.
+   `<session>` is the folder's name unless `--session` gives one. Trial numbers
+   restart when a folder is emptied for a new dataset, so give each dataset
+   recorded in the same folder its own session; a name that already holds a
+   different image stops the export, and exporting the same recording again
+   adds nothing. The frames in `~/embryo_labels` are copies and survive emptying
+   the folder they came from.
 2. **Label** in any polygon tool (CVAT, Label Studio, Roboflow, labelme, µSAM):
    one polygon per object, classes `chorion`, `yolk`, `cell`, `needle`; one
    chorion, yolk and cell per embryo, every embryo in the frame, including
@@ -728,11 +735,14 @@ outcome, the GUI panels, and a MicroVLA dry run. The calibration and the
 measured step have not been run on the rig.
 
 **For the new camera:**
-- Launch the rig from a new folder so the new trials do not mix with the
-  obsolete ones in `~/logs`; the logger numbers trials per folder. The desktop
-  **My Robot** icon starts the rig in the home folder, so start it from a
-  terminal instead: `mkdir -p ~/newcam && cd ~/newcam && ~/start_robot.sh`. Use
-  that folder for `export_frames --trials` and MicroVLA's `--data-root`.
+- Full trials go in the home folder (the desktop **My Robot** icon starts the rig
+  there, so they land in `~/logs`, `~/saved_frames` and `~/saved_videos`); use `~`
+  for `export_frames --trials` and MicroVLA's `--data-root`. Orient-only
+  demonstrations go in their own folder, started from a terminal:
+  `mkdir -p ~/orientcam && cd ~/orientcam && ~/start_robot.sh`. MicroVLA's
+  `docs/microinjection.md` ("Where the datasets live") has the whole plan. The
+  logger numbers trials per folder; trials from before the new camera are in
+  `~/Backup`.
 - The BFS-U3-200S6C runs through `camera_node` as raw Bayer data, binned 2 × 2
   and cropped to the lit 2304 × 1728, at 25 fps (see
   [Frame rate: raw Bayer mode](#frame-rate-raw-bayer-mode)), and the logger
@@ -859,7 +869,7 @@ This starts the dual UMP driver (`device_id=1` and `device_id=2` in one process)
 ### Collect a dataset trial
 
 1. Launch the suite as above, from the folder the trials should go into (the
-   desktop **My Robot** icon uses the home folder).
+   desktop **My Robot** icon uses the home folder, where full trials belong).
 2. Use the GUI (or publish on `/ump/target`, `/ump2/target`, `/motor/target_counts` and `/pressure/mbar` directly) to drive the rig. The CSV logger records UMP state/targets, HEKA resistance and the commanded pressure, but not the ODrive motor.
    Pressure targets populate only while the driver reports ready, and measured pressure requires fresh successful readings; faults leave the relevant cells blank.
 3. Click **Start Data Acquisition** — this calls `/acq/start`, which opens `logs/trial_N.csv`, creates `saved_frames/trial_N/`, and asks the camera to record `saved_videos/trial_N.mp4`.
@@ -871,8 +881,8 @@ turn the embryo with UMP 1's controls and press **Done** once it faces the
 needle; press **Inject** when the needle is in place; after each injection
 choose **Went into** and press **Record**. The logger records all of them. To
 record demonstrations for the orient policy alone, record each as its own trial
-in its own folder: start with the needle near the embryo, not touching it, and
-stop a second after the cell faces the needle.
+in its own folder (`~/orientcam`): start with the needle near the embryo, not
+touching it, and stop a second after the cell faces the needle.
 
 Output layout (inside the launch folder):
 

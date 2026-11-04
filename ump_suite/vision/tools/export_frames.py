@@ -9,13 +9,19 @@ same embryos, so the training split keeps whole trials together and the model
 is always tested on embryos it never saw.
 
     python3 -m ump_suite.vision.tools.export_frames \
-        --trials ~/newcam --every 4 --out ~/embryo_labels
+        --trials ~ --session inject1 --every 30 --out ~/embryo_labels
+
+`<session>` is the folder's name unless --session gives one. Trial numbers
+restart when a folder is emptied for a new dataset, so give each dataset
+recorded in the same folder its own session: frames are kept apart by name, and
+a name that already holds a different image stops the export.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import filecmp
 import re
 import shutil
 from pathlib import Path
@@ -28,7 +34,7 @@ def _session_name(root: Path) -> str:
     return name or "home"
 
 
-def export(roots, out_dir: Path, every=4, overwrite=False):
+def export(roots, out_dir: Path, every=4, overwrite=False, session_name=None):
     import pandas as pd
 
     images = out_dir / "images"
@@ -44,7 +50,7 @@ def export(roots, out_dir: Path, every=4, overwrite=False):
     for root in roots:
         root = Path(root).expanduser().resolve()
         logs = root / "logs" if (root / "logs").is_dir() else root
-        session = _session_name(root)
+        session = session_name or _session_name(root)
         for csv_path in sorted(
             logs.glob("trial_*.csv"), key=lambda q: int(_TRIAL_RE.search(q.name).group(1))
         ):
@@ -65,6 +71,12 @@ def export(roots, out_dir: Path, every=4, overwrite=False):
                     continue
                 name = f"{session}__t{trial}__f{i:06d}"
                 if name in seen and not overwrite:
+                    copied = images / f"{name}.png"
+                    if copied.exists() and not filecmp.cmp(copied, src, shallow=False):
+                        raise ValueError(
+                            f"{name} is already exported from a different recording, with the "
+                            "same trial number; give this dataset its own --session"
+                        )
                     continue
                 shutil.copy2(src, images / f"{name}.png")
                 if name not in seen:
@@ -88,9 +100,14 @@ def main(argv=None):
     )
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--every", type=int, default=4)
+    p.add_argument("--session", default=None,
+                   help="name for these trials (default: the folder's); one --trials only")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args(argv)
-    added, total, groups = export(args.trials, args.out.expanduser(), args.every, args.overwrite)
+    if args.session and len(args.trials) > 1:
+        p.error("--session names one folder's trials; run once per folder")
+    added, total, groups = export(args.trials, args.out.expanduser(), args.every, args.overwrite,
+                                  session_name=args.session)
     print(
         f"[export] {added} frame(s) copied; manifest lists {total} frame(s) from {groups} trial(s)"
     )

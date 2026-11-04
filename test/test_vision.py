@@ -314,3 +314,49 @@ def test_coco_conversion_skips_unlabelled_frames_and_brush_masks(tmp_path):
     assert not (tmp_path / "labels" / "a__t1__f4.txt").exists()
     line = (tmp_path / "labels" / "a__t1__f0.txt").read_text().split()
     assert line[0] == "3" and line[1:3] == ["0.90000", "0.40000"]
+
+
+def _recording(root, trial_pixels):
+    """Write a folder of one-row trials: {trial number: frame pixel value}."""
+    import cv2
+
+    (root / "logs").mkdir(parents=True)
+    (root / "saved_frames").mkdir()
+    for trial, value in trial_pixels.items():
+        rel = f"saved_frames/t{trial}.png"
+        cv2.imwrite(str(root / rel), np.full((8, 8, 3), value, np.uint8))
+        (root / "logs" / f"trial_{trial}.csv").write_text(
+            f"image_path,Injection,Orient\n{rel},0,0\n")
+
+
+def test_export_keeps_datasets_from_one_emptied_folder_apart(tmp_path):
+    import shutil
+
+    from ump_suite.vision.tools.export_frames import export
+
+    home, labels = tmp_path / "home", tmp_path / "labels"
+    _recording(home, {1: 40})
+    assert export([home], labels, every=1, session_name="inject1")[0] == 1
+    # The folder is emptied and refilled: trial 1 again, a different recording.
+    shutil.rmtree(home)
+    _recording(home, {1: 200})
+    # Unnamed, it would collide with an earlier export of this folder ...
+    assert export([home], labels, every=1)[0] == 1
+    shutil.rmtree(home)
+    _recording(home, {1: 90})
+    with pytest.raises(ValueError, match="own --session"):
+        export([home], labels, every=1)
+    # ... and with its own session it stands beside the first dataset.
+    added, total, groups = export([home], labels, every=1, session_name="both1")
+    assert (added, total, groups) == (1, 3, 3)
+    assert (labels / "images" / "inject1__t1__f000000.png").exists()
+    assert (labels / "images" / "both1__t1__f000000.png").exists()
+
+
+def test_export_again_of_the_same_recording_adds_nothing(tmp_path):
+    from ump_suite.vision.tools.export_frames import export
+
+    home, labels = tmp_path / "home", tmp_path / "labels"
+    _recording(home, {1: 40, 2: 80})
+    assert export([home], labels, every=1)[0] == 2
+    assert export([home], labels, every=1)[:2] == (0, 2)
