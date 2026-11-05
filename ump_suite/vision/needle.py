@@ -9,6 +9,12 @@ background beside it.
 `tip_from_difference` finds the needle with no model at all: it compares a frame
 against a background frame taken with the needle out of view. The camera
 calibration uses it, because it has to work before any model is trained.
+
+Comparing brightness alone is not enough. Where the needle crosses the liquid
+surface the meniscus bends the light over hundreds of pixels, by an amount that
+changes from frame to frame at the same position, and it hides the needle for a
+short stretch. So only change that is dark and narrow counts as needle, and the
+pieces on either side of the meniscus are joined.
 """
 
 from __future__ import annotations
@@ -58,31 +64,40 @@ def refine_tip(gray, tip, direction, *, max_extend_px=60, side_px=6, contrast=6.
     return best
 
 
-def needle_mask_from_difference(frame_gray, background_gray, *, threshold=14, min_area=150):
+def needle_mask_from_difference(frame_gray, background_gray, *, threshold=10, min_area=150,
+                                max_width_px=None):
     """
-    Boolean mask of what changed between a background frame and this one.
+    Boolean mask of the needle: what turned dark and narrow since the background.
 
-    Only the largest changed blob that touches the frame edge is kept: the needle
-    enters from outside the view, and anything else that changed (a drifting
-    particle) is not the needle.
+    Only change narrower than `max_width_px` (default 1/28 of the frame width)
+    counts, which leaves out the broad shading around the meniscus. Pieces of at
+    least `min_area` pixels that lie within that distance of each other are joined
+    across the meniscus, and only the largest group that touches the frame edge is
+    kept: the needle enters from outside the view, and anything else that changed
+    (a drifting particle) is not the needle.
     """
     import cv2
 
-    diff = cv2.absdiff(np.asarray(frame_gray, np.uint8), np.asarray(background_gray, np.uint8))
-    diff = cv2.GaussianBlur(diff, (5, 5), 0)
-    mask = (diff >= threshold).astype(np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    background = np.asarray(background_gray, np.float32)
+    darker = cv2.GaussianBlur(background - np.asarray(frame_gray, np.float32), (5, 5), 0)
+    h, w = darker.shape
+    width = max(int(max_width_px or w // 28), 15) | 1
+    kernel = np.ones((width, width), np.uint8)
+    narrow = darker - cv2.morphologyEx(darker, cv2.MORPH_OPEN, kernel)
+    mask = (narrow >= threshold).astype(np.uint8)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    h, w = mask.shape
+    pieces = np.isin(labels, [k for k in range(1, n) if stats[k, cv2.CC_STAT_AREA] >= min_area])
+    joined = cv2.dilate(pieces.astype(np.uint8), kernel)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
     best, best_area = None, 0
     for k in range(1, n):
         x, y, bw, bh, area = stats[k]
         touches = x <= 1 or y <= 1 or x + bw >= w - 1 or y + bh >= h - 1
-        if touches and area >= min_area and area > best_area:
+        if touches and area > best_area:
             best, best_area = k, area
     if best is None:
         return None
-    return labels == best
+    return pieces & (labels == best)
 
 
 def changed_area(a_gray, b_gray, *, threshold=14):
@@ -100,8 +115,9 @@ def tip_from_difference(frame_gray, background_gray, **kwargs):
     """
     (tip_xy, direction) of the needle found by differencing against a background.
 
-    The tip is refined along the needle line in the frame itself. Returns None
-    when no needle-shaped change touches the frame edge.
+    The tip is the far end of the needle, centred on the needle there and refined
+    along its line in the frame itself. Returns None when no needle-shaped change
+    touches the frame edge.
     """
     mask = needle_mask_from_difference(frame_gray, background_gray, **kwargs)
     if mask is None:
@@ -109,11 +125,16 @@ def tip_from_difference(frame_gray, background_gray, **kwargs):
     line = needle_line(mask)
     if line is None or line["length_px"] < 20:
         return None
-    tip = refine_tip(frame_gray, line["tip"], line["direction"])
-    return (float(tip[0]), float(tip[1])), (
-        float(line["direction"][0]),
-        float(line["direction"][1]),
-    )
+    # The line through the whole needle can pass beside the tip: use it only for how
+    # far the needle reaches, and the pixels at that end for where it is across.
+    ys, xs = np.nonzero(mask)
+    points = np.column_stack([xs, ys]).astype(np.float64)
+    direction = line["direction"]
+    from_tip = (line["tip"] - points) @ direction
+    end = points[from_tip <= max(10.0, 0.05 * line["length_px"])].mean(axis=0)
+    tip = end + direction * float((line["tip"] - end) @ direction)
+    tip = refine_tip(frame_gray, tip, direction)
+    return (float(tip[0]), float(tip[1])), (float(direction[0]), float(direction[1]))
 
 
 def extend_needle(instances, gray, **kwargs):

@@ -638,7 +638,11 @@ then returns, moves X and Y by ±`--step` (100 µm) and
 D back by `step` and `2·step` (D only ever retracts), returning to the start
 after each move. The tip is found by differencing each frame against the
 background (no model needed); `--tip-source vision` uses `/vision/scene`
-instead. It fits µm/px (X and Y must agree within 10%), the 2×2 image↔X/Y
+instead. Only change that is dark and narrow counts as needle: where the needle
+crosses the liquid surface the meniscus shades the view for hundreds of pixels,
+by an amount that changes at one and the same position, and breaks the needle
+on screen (a dark blob that stays put while D moves). The pieces on either side
+are joined. It fits µm/px (X and Y must agree within 10%), the 2×2 image↔X/Y
 mapping and the D tilt θ (|vD|·µm/px = cos θ), prints the residuals and the
 return drift, and saves `~/.config/ump_suite/vision_calibration.json`
 (`--dry-run` only prints). The needle always ends where it started, also
@@ -720,7 +724,9 @@ October), which shows more embryos per view and makes each embryo and the
 needle smaller on screen. The test-only
 model trained on the old frames, the exported frames and its training runs
 were deleted on 25 October; the vision node reports "no model" until a model is
-trained on the new camera's frames. No camera calibration exists yet either.
+trained on the new camera's frames. The camera was calibrated on 5 November
+with the 4× objective (2.143 µm/px, D tilt 42.4°). The file does not record the
+objective, so run it again after changing the objective or `binning`.
 The generic starting weights (`yolo11s-seg.pt`, `yolo11n-seg.pt`, `sam2.1_b.pt`)
 are kept in `~/.local/share/ump_suite/models/`.
 

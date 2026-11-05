@@ -254,6 +254,48 @@ def _needle_frames(px_per_um=0.5, tip0=200.0, width=500, start_x=10000.0):
     return goto, grab, state
 
 
+def _needle_at_the_meniscus(tip_x, *, halo=0.0, h=480, w=640, tip_y=240):
+    """Draw a needle from the right edge broken by the meniscus; return (frame, background)."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    background = np.full((h, w), 200.0, np.float32)
+    frame = background.copy()
+    surface = tip_x + 160
+    frame[tip_y - 3:tip_y + 4, tip_x:surface] -= 90  # the thin part, under the surface
+    frame[tip_y - 6:tip_y + 7, surface + 18:] -= 45  # the shaft, out of focus above it
+    # The meniscus's shading: far wider than the needle, off to one side of it, and with a
+    # `halo` strength that changes at one and the same position.
+    dark = (xx - (surface - 70)) ** 2 + (yy - (tip_y - 50)) ** 2
+    bright = (xx - (surface + 110)) ** 2 + (yy - (tip_y + 90)) ** 2
+    frame += halo * (np.exp(-bright / (2 * 80.0 ** 2)) - np.exp(-dark / (2 * 90.0 ** 2)))
+    return np.clip(frame, 0, 255).astype(np.uint8), background.astype(np.uint8)
+
+
+@pytest.mark.parametrize("halo", [0.0, 15.0, 40.0])
+def test_tip_from_difference_stays_on_the_tip_past_the_meniscus(halo):
+    """Neither the broad shading nor the break in the needle may move the tip."""
+    frame, background = _needle_at_the_meniscus(250, halo=halo)
+    found = tip_from_difference(frame, background)
+    assert found is not None
+    assert abs(found[0][0] - 250) <= 4 and abs(found[0][1] - 240) <= 2
+    assert found[1][0] < -0.99  # towards the tip, from the right edge
+
+
+def test_a_change_in_the_meniscus_alone_is_not_taken_for_a_move():
+    """The same tip with strong and with faint shading comes out in the same place."""
+    strong = tip_from_difference(*_needle_at_the_meniscus(250, halo=40.0))[0]
+    faint = tip_from_difference(*_needle_at_the_meniscus(250, halo=5.0))[0]
+    assert math.hypot(strong[0] - faint[0], strong[1] - faint[1]) <= 2
+
+
+def test_broad_shading_on_its_own_is_not_a_needle():
+    """A meniscus reaching the frame edge with no needle in view finds nothing."""
+    h, w = 480, 640
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    background = np.full((h, w), 200, np.uint8)
+    frame = 200.0 - 50.0 * np.exp(-((xx - 620) ** 2 + (yy - 240) ** 2) / (2 * 120.0 ** 2))
+    assert tip_from_difference(frame.astype(np.uint8), background) is None
+
+
 def test_find_background_pulls_back_until_the_needle_is_gone():
     """The first step that changes nothing gives a needle-free background."""
     from ump_suite.calibrate_camera import find_background
